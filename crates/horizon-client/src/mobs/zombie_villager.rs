@@ -214,7 +214,7 @@ mod tests {
             thundering: false,
             nether: false,
             block_tags: &items.block_tags,
-            biomes: &biomes,
+            biomes: std::sync::Arc::new(biomes),
             mob_griefing: true,
             mob_drops: true,
             max_entity_cramming: 24,
