@@ -28,29 +28,39 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// What `sync_data` loaded, with the biome table it was built from.
+type Loaded = (
+    Option<Arc<horizon_client::biome::Biomes>>,
+    std::result::Result<Arc<SyncData>, String>,
+);
+
 /// The registries and tags, loaded once per world (a world open or a
 /// `/reload` forgets them, as `forget_sync_data` does).
-static SYNC: Mutex<Option<std::result::Result<Arc<SyncData>, String>>> = Mutex::new(None);
+static SYNC: Mutex<Option<Loaded>> = Mutex::new(None);
 
 /// The registries and tags a server sends, loaded from `root` the first
 /// time, with the world's data packs' recipes and advancements over them.
 pub(super) fn sync_data(
     root: &std::path::Path,
     overlay: &horizon_world::loot::PackOverlay,
-    biomes: Option<&horizon_client::biome::Biomes>,
+    biomes: Option<&Arc<horizon_client::biome::Biomes>>,
 ) -> std::result::Result<Arc<SyncData>, String> {
     let mut sync = SYNC.lock().unwrap_or_else(|e| e.into_inner());
-    // The preload's registries are not those of a world with biome packs.
-    if let (Some(Ok(s)), Some(b)) = (&*sync, biomes)
-        && !s.dynamic.registries[BIOME_REGISTRY]
-            .iter()
-            .map(|(n, _)| n.as_str())
-            .eq(b.registry_order())
+    // Biome packs make the registry the table's own: rebuild unless the cache
+    // came from this table, or neither table has packs (the vanilla preload
+    // is stored with no table).
+    if let (Some((from, _)), Some(b)) = (&*sync, biomes)
+        && !from.as_ref().is_some_and(|f| Arc::ptr_eq(f, b))
+        && (b.has_packs() || from.as_ref().is_some_and(|f| f.has_packs()))
     {
         *sync = None;
     }
-    sync.get_or_insert_with(|| SyncData::load_with(root, overlay, biomes).map(Arc::new))
-        .clone()
+    sync.get_or_insert_with(|| {
+        let data = SyncData::load_with(root, overlay, biomes.map(|b| &**b)).map(Arc::new);
+        (biomes.cloned(), data)
+    })
+    .1
+    .clone()
 }
 
 /// Let go of what `sync_data` loaded: for a preload no world used
@@ -1238,7 +1248,7 @@ impl Game<'_> {
         let registry: Vec<String> = sync
             .dynamic
             .registries
-            .get("minecraft:worldgen/biome")
+            .get(BIOME_REGISTRY)
             .map(|v| v.iter().map(|(n, _)| n.clone()).collect())
             .unwrap_or_default();
         let mut encoder = ChunkEncoder::new(

@@ -1560,7 +1560,7 @@ impl Game<'_> {
     fn set_registries(&mut self, registries: Arc<Dynamic>) {
         let biomes: Vec<u16> = registries
             .registries
-            .get("minecraft:worldgen/biome")
+            .get(horizon_client::lan::data::BIOME_REGISTRY)
             .map(|list| {
                 list.iter()
                     .map(|(name, _)| self.res.biomes().id(name))

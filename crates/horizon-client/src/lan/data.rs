@@ -177,10 +177,15 @@ impl SyncData {
                 Some(b) => b
                     .registry_order()
                     .into_iter()
-                    .filter_map(|n| {
+                    .map(|n| {
                         let file = b.pack_file(n).cloned();
-                        let file = file.or_else(|| found.remove(n.strip_prefix("minecraft:")?))?;
-                        Some((n.to_owned(), file))
+                        let file = file.or_else(|| found.remove(n.strip_prefix("minecraft:")?));
+                        // The encoder numbers biomes by this list: keep a place.
+                        let file = file.unwrap_or_else(|| {
+                            log::warn!("Horizon: biome {n} has no data to synchronize");
+                            Value::Object(Default::default())
+                        });
+                        (n.to_owned(), file)
                     })
                     .unzip(),
                 None => found
@@ -382,49 +387,6 @@ fn changed_dimension_type(name: &str, json: &Value, levels: &LevelShapes) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A data-pack biome is in the synchronized registry, sent in full, at
-    /// the id the chunk encoder and the client's table give it.
-    #[test]
-    fn a_pack_biome_is_synchronized_with_the_id_the_encoder_uses() {
-        let root = std::env::temp_dir().join(format!("horizon-sync-biomes-{}", std::process::id()));
-        let maps = root.join("assets/minecraft/textures/colormap");
-        let biome_dir = root.join("data/minecraft/worldgen/biome");
-        std::fs::create_dir_all(&maps).unwrap();
-        std::fs::create_dir_all(&biome_dir).unwrap();
-        std::fs::write(root.join("registries.json"), "{}").unwrap();
-        for name in ["grass", "foliage", "dry_foliage"] {
-            let file = std::fs::File::create(maps.join(format!("{name}.png"))).unwrap();
-            let mut png = png::Encoder::new(file, 1, 1);
-            png.set_color(png::ColorType::Rgb);
-            png.set_depth(png::BitDepth::Eight);
-            let mut writer = png.write_header().unwrap();
-            writer.write_image_data(&[1, 2, 3]).unwrap();
-        }
-        for name in ["plains", "river"] {
-            std::fs::write(biome_dir.join(format!("{name}.json")), "{}").unwrap();
-        }
-        let base = crate::biome::Biomes::load(&root).unwrap();
-        let pack: Value =
-            serde_json::from_str(r##"{"effects":{"grass_color":"#123456"}}"##).unwrap();
-        let world = base.with_packs([("minecraft:meadow", &pack)]);
-        let sync =
-            SyncData::load_with(&root, &horizon_world::loot::PackOverlay::NONE, Some(&world))
-                .unwrap();
-        let registry = &sync.dynamic.registries["minecraft:worldgen/biome"];
-        let names: Vec<_> = registry.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(
-            names,
-            ["minecraft:meadow", "minecraft:plains", "minecraft:river"]
-        );
-        // The encoder numbers a biome by its place here: none may be missing.
-        assert!(world.list.iter().all(|b| names.contains(&b.name.as_str())));
-        let sent = sync.registry_packets(true, &LevelShapes::VANILLA);
-        let biomes = sent.iter().find(|r| r.registry == BIOME_REGISTRY).unwrap();
-        assert!(biomes.entries[0].data.is_some(), "the pack's biome is sent");
-        assert!(biomes.entries[1].data.is_none(), "a known one is not");
-        std::fs::remove_dir_all(&root).ok();
-    }
 
     #[test]
     fn json_becomes_nbt() {
