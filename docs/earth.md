@@ -55,8 +55,8 @@ host a line; lines starting with `#` are ignored, and deleting a line takes the 
   that host. Cancel adds nothing.
 - **A world that arrives with downloads on.** Its switch shows off on the page. When you open it, the game runs on
   cached tiles, says in chat which host the world wants and that you have not approved it, and logs it. To approve:
-  Singleplayer, select the world, Edit, and press the Earth tiles button, which names the host and approves it
-  (pressed again it takes the approval back).
+  Singleplayer, select the world, Edit, and press the "Allow tiles from <host>" button, which approves that host
+  (it then reads "Tiles allowed: <host> (stop)", and pressing it again takes the approval back).
 - **Redirects.** A server may redirect a tile request only to another approved host.
 - A dedicated server reads the list from its own folder: its owner edits the file.
 

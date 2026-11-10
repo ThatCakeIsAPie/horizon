@@ -28,13 +28,10 @@ pub(super) fn convert_button(root: &Path, locked: bool) -> (String, bool) {
         let key = if Approved::for_player().contains(&host) {
             (
                 "horizon.cubic.earth.edit.revoke",
-                "Approved: %s (press to take back)",
+                "Tiles allowed: %s (stop)",
             )
         } else {
-            (
-                "horizon.cubic.earth.edit.approve",
-                "Allow Earth tile downloads from %s",
-            )
+            ("horizon.cubic.earth.edit.approve", "Allow tiles from %s")
         };
         return (text(key.0, key.1, &host), true);
     }

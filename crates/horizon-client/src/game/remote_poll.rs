@@ -38,6 +38,15 @@ impl Game<'_> {
         {
             r.status.clear();
         }
+        // An Earth world that wanted tiles from a server the player has not approved says so, once it has loaded.
+        if self.remote.as_ref().is_some_and(|r| r.loaded_sent)
+            && let Some(host) = horizon_client::earth_consent::take_notice()
+        {
+            self.system_message(horizon_client::text::Text::translate(
+                "horizon.cubic.earth.unapproved",
+                &[horizon_client::text::Text::literal(host)],
+            ));
+        }
         // The block events and block changes of a piston clock start and end
         // thousands of moves at once: the collision view and the renderer
         // take them all in one sync, before the tick or frame reads them.

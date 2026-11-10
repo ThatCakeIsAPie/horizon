@@ -255,13 +255,6 @@ impl Game<'_> {
         force: bool,
     ) -> horizon_client::Result<Range> {
         self.enter_level(None, LevelId::shard(Dim::Overworld, shard))?;
-        // An Earth world that wanted tiles from a server the player has not approved says so, once.
-        if let Some(host) = horizon_client::earth_consent::take_notice() {
-            self.system_message(horizon_client::text::Text::translate(
-                "horizon.cubic.earth.unapproved",
-                &[horizon_client::text::Text::literal(host)],
-            ));
-        }
         let due = force || cubic::needs_new_window(self.world.shape, wanted);
         self.cubic_slide.since_retarget += 1;
         if !due {
