@@ -2,17 +2,19 @@
 //! and the tile cache it keeps on disk.
 //!
 //! The address is the world's `tileUrl` setting, a template with `{z}`, `{x}` and `{y}`, and nothing else:
-//! the game has no built-in tile server (docs/layers.md, "Built-in addresses"). Nothing is downloaded unless
-//! the world's `allowDownloads` is true and the template is an `https://` address (or `http://` to
-//! `127.0.0.1`, `localhost` or `[::1]`, for testing). Otherwise every fetch fails with a message that says why,
-//! and the world runs on the tiles already cached.
+//! the engine has no built-in tile server (docs/layers.md, "Built-in addresses"). Nothing is downloaded unless
+//! the world's `allowDownloads` is true, the template is an `https://` address (or `http://` to `127.0.0.1`,
+//! `localhost` or `[::1]`, for testing) **and its host is on the player's approved list** (`earth_consent`):
+//! the world is someone else's file, the consent is the player's. Otherwise every fetch fails with a message
+//! that says why, and the world runs on the tiles already cached.
 //!
 //! A request carries only a neutral `User-Agent` (`Horizon/<version>`): no cookies, no identifiers of the
 //! player, no referrer. A redirect is followed (up to three hops) only to an address the same rules allow, so
-//! an `https://` address never leads to plain `http://`.
+//! an `https://` address never leads to plain `http://`, and only to an approved host.
 //!
 //! Tiles are cached under `.horizon-cache/earth-tiles/<hash of the address>/{z}/{x}/{y}.png`, in the game
 //! folder like the other game-wide caches, so worlds share what they download and two servers never mix tiles.
+use crate::earth_consent::Approved;
 use horizon_earth::{FetchError, TileFetcher, TileId, TileStore};
 use horizon_world::cubic::earth::EarthSettings;
 use sha2::{Digest, Sha256};
@@ -41,18 +43,77 @@ pub fn tile_url(template: &str, id: TileId) -> String {
         .replace("{y}", &id.y.to_string())
 }
 
+/// What is wrong with a tile address. [`std::fmt::Display`] says it in English for the log; the settings page
+/// shows [`AddressProblem::key`]'s translation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressProblem {
+    /// `{z}`, `{x}` or `{y}` is missing (the placeholder is held).
+    Placeholder(&'static str),
+    /// A `{...}` other than `{z}`, `{x}` and `{y}`.
+    Extra,
+    /// A placeholder in the host.
+    HostPlaceholder,
+    Spaces,
+    /// No scheme, or one that is not http(s).
+    Scheme,
+    Credentials,
+    NoHost,
+    /// `http://` to a host other than this machine.
+    Insecure,
+}
+
+impl AddressProblem {
+    /// The language key of the message; the missing placeholder is its argument.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Placeholder(_) => "horizon.cubic.earth.err.placeholder",
+            Self::Extra => "horizon.cubic.earth.err.extra",
+            Self::HostPlaceholder => "horizon.cubic.earth.err.host_placeholder",
+            Self::Spaces => "horizon.cubic.earth.err.spaces",
+            Self::Scheme => "horizon.cubic.earth.err.scheme",
+            Self::Credentials => "horizon.cubic.earth.err.credentials",
+            Self::NoHost => "horizon.cubic.earth.err.no_host",
+            Self::Insecure => "horizon.cubic.earth.err.insecure",
+        }
+    }
+    /// The placeholder a [`Self::Placeholder`] misses.
+    pub fn placeholder(self) -> Option<&'static str> {
+        match self {
+            Self::Placeholder(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for AddressProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Placeholder(p) => write!(f, "the tile address needs {p} in it"),
+            Self::Extra => f.write_str("the tile address has a {...} other than {z}, {x} and {y}"),
+            Self::HostPlaceholder => {
+                f.write_str("the host of the tile address cannot hold {z}, {x} or {y}")
+            }
+            Self::Spaces => f.write_str("the address has spaces or control characters"),
+            Self::Scheme => f.write_str("the address must start with https://"),
+            Self::Credentials => f.write_str("the address must not hold a user name or password"),
+            Self::NoHost => f.write_str("the address has no host"),
+            Self::Insecure => f.write_str(
+                "only https:// addresses are allowed (http:// only to 127.0.0.1 or localhost)",
+            ),
+        }
+    }
+}
+
 /// The `scheme://authority` of `url`, split into the scheme and the host (without port), when the shape is
 /// plausible: no spaces or control characters, no user name or password.
-fn origin_of(url: &str) -> Result<(&str, &str), String> {
+fn origin_of(url: &str) -> Result<(&str, &str), AddressProblem> {
     if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("the address has spaces or control characters".into());
+        return Err(AddressProblem::Spaces);
     }
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or("the address must start with https://")?;
+    let (scheme, rest) = url.split_once("://").ok_or(AddressProblem::Scheme)?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.contains('@') {
-        return Err("the address must not hold a user name or password".into());
+        return Err(AddressProblem::Credentials);
     }
     let host = if authority.starts_with('[') {
         authority
@@ -62,30 +123,40 @@ fn origin_of(url: &str) -> Result<(&str, &str), String> {
         authority.split(':').next().unwrap_or_default()
     };
     if host.is_empty() {
-        return Err("the address has no host".into());
+        return Err(AddressProblem::NoHost);
     }
     Ok((scheme, host))
 }
 
+/// The host of `url`, lower case and without port: what the player approves.
+pub fn host_of(url: &str) -> Result<String, String> {
+    origin_of(url)
+        .map(|(_, host)| host.to_ascii_lowercase())
+        .map_err(|why| why.to_string())
+}
+
 /// Whether the game may download from `url`: `https://` anywhere, plain `http://` only to this machine.
-fn allowed(url: &str) -> Result<(), String> {
+fn allowed(url: &str) -> Result<(), AddressProblem> {
     let (scheme, host) = origin_of(url)?;
     match scheme {
         "https" => Ok(()),
         "http" if matches!(host, "127.0.0.1" | "localhost" | "[::1]") => Ok(()),
-        "http" => Err(
-            "only https:// addresses are allowed (http:// only to 127.0.0.1 or localhost)".into(),
-        ),
-        _ => Err("the address must start with https://".into()),
+        "http" => Err(AddressProblem::Insecure),
+        _ => Err(AddressProblem::Scheme),
     }
 }
 
 /// Checks a tile address template: one the game may download from, with `{z}`, `{x}` and `{y}` in the path
 /// or query (not in the host) and no other `{...}`. The error says what is wrong.
 pub fn check_template(template: &str) -> Result<(), String> {
+    check_address(template).map_err(|why| why.to_string())
+}
+
+/// [`check_template`] with the problem as a value, for a screen to translate.
+pub fn check_address(template: &str) -> Result<(), AddressProblem> {
     for placeholder in ["{z}", "{x}", "{y}"] {
         if !template.contains(placeholder) {
-            return Err(format!("the tile address needs {placeholder} in it"));
+            return Err(AddressProblem::Placeholder(placeholder));
         }
     }
     let rest = template
@@ -93,13 +164,13 @@ pub fn check_template(template: &str) -> Result<(), String> {
         .replace("{x}", "")
         .replace("{y}", "");
     if rest.contains(['{', '}']) {
-        return Err("the tile address has a {...} other than {z}, {x} and {y}".into());
+        return Err(AddressProblem::Extra);
     }
     let authority_end = template.split_once("://").map_or(0, |(scheme, rest)| {
         scheme.len() + 3 + rest.find(['/', '?', '#']).unwrap_or(rest.len())
     });
     if template[..authority_end].contains('{') {
-        return Err("the host of the tile address cannot hold {z}, {x} or {y}".into());
+        return Err(AddressProblem::HostPlaceholder);
     }
     allowed(template)
 }
@@ -110,23 +181,35 @@ pub struct HttpTileFetcher {
     source: Result<String, String>,
     agent: ureq::Agent,
     max_bytes: usize,
+    /// The hosts the player approved when the fetcher was made: a redirect may lead only to one of them.
+    approved: Approved,
 }
 
 impl HttpTileFetcher {
-    /// A fetcher for the world's `tileUrl` and `allowDownloads`.
-    pub fn new(settings: &EarthSettings) -> Self {
+    /// A fetcher for the world's `tileUrl` and `allowDownloads`, for the hosts `approved`.
+    pub fn new(settings: &EarthSettings, approved: &Approved) -> Self {
         let source = if !settings.allow_downloads {
             Err("tile downloads are turned off for this world (allowDownloads is false)".to_owned())
         } else if settings.tile_url.trim().is_empty() {
             Err("this world names no tile server (tileUrl is empty)".to_owned())
         } else {
             let template = settings.tile_url.trim();
-            check_template(template)
-                .map(|()| template.to_owned())
-                .map_err(|why| format!("tileUrl is not usable: {why}"))
+            match check_template(template) {
+                Err(why) => Err(format!("tileUrl is not usable: {why}")),
+                Ok(()) => match host_of(template) {
+                    Ok(host) if approved.contains(&host) => Ok(template.to_owned()),
+                    Ok(host) => Err(format!(
+                        "you have not approved downloads from {host} (the world's tile server): \
+                         turn on \"Allow downloads\" for it in Create World's Earth settings, or from the \
+                         world's Edit screen"
+                    )),
+                    Err(why) => Err(format!("tileUrl is not usable: {why}")),
+                },
+            }
         };
         Self::over(
             source,
+            approved.clone(),
             CONNECT_TIMEOUT,
             READ_TIMEOUT,
             TOTAL_TIMEOUT,
@@ -136,6 +219,7 @@ impl HttpTileFetcher {
 
     fn over(
         source: Result<String, String>,
+        approved: Approved,
         connect: Duration,
         read: Duration,
         total: Duration,
@@ -153,13 +237,21 @@ impl HttpTileFetcher {
             source,
             agent,
             max_bytes,
+            approved,
         }
     }
 
     /// The same fetcher with other timeouts and size cap, for tests.
     #[cfg(test)]
     fn limits(self, timeout: Duration, max_bytes: usize) -> Self {
-        Self::over(self.source, timeout, timeout, timeout, max_bytes)
+        Self::over(
+            self.source,
+            self.approved,
+            timeout,
+            timeout,
+            timeout,
+            max_bytes,
+        )
     }
 
     /// Whether this fetcher downloads at all; when not, [`Self::refusal`] says why.
@@ -197,6 +289,14 @@ impl HttpTileFetcher {
                             "the server redirected to an address not allowed: {why}"
                         ))
                     })?;
+                    // Approval is of a host: a redirect elsewhere is a request the player never allowed.
+                    if let Ok(host) = host_of(&url)
+                        && !self.approved.contains(&host)
+                    {
+                        return Err(FetchError::Other(format!(
+                            "the server redirected to {host}, which is not approved"
+                        )));
+                    }
                 }
                 other => return Err(status_error(other)),
             }
@@ -312,10 +412,21 @@ pub struct EarthTiles {
     pub dir: PathBuf,
 }
 
-/// The tile store of a world with `settings`, caching under `root` (see [`cache_root`]). Says in the log
-/// whether tiles are downloaded.
+/// The tile store of a world with `settings`, caching under `root` (see [`cache_root`]), downloading from
+/// the hosts this player approved. Says in the log whether tiles are downloaded.
 pub fn open(settings: &EarthSettings, root: &Path) -> EarthTiles {
-    let fetcher = HttpTileFetcher::new(settings);
+    open_with(settings, root, &Approved::for_player())
+}
+
+/// [`open`] for the hosts `approved`.
+pub fn open_with(settings: &EarthSettings, root: &Path, approved: &Approved) -> EarthTiles {
+    let fetcher = HttpTileFetcher::new(settings, approved);
+    if let Some(host) = crate::earth_consent::pending_host_of(settings, approved) {
+        log::warn!(
+            "Horizon: this Earth world wants tiles from {host}, which the player has not approved"
+        );
+        crate::earth_consent::note_unapproved(&host);
+    }
     let downloads = fetcher.downloads();
     match fetcher.refusal() {
         None => log::info!("Horizon: Earth tiles are downloaded as needed"),

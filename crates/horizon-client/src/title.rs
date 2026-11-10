@@ -22,6 +22,7 @@ mod create_world;
 mod cubic_customize;
 mod cubic_map;
 mod cubic_preview;
+mod earth_edit;
 mod experiments;
 mod flat;
 mod onboarding;
@@ -1086,12 +1087,12 @@ impl Title {
             creative,
             focus,
             mut options,
-            cubic,
+            mut cubic,
         } = mode
         {
             if apply {
                 options.cubic = Some(cubic.kind());
-                options.cubic_json = cubic.json();
+                options.cubic_json = cubic.finish();
             }
             self.mode = Mode::Create {
                 name,
@@ -2286,15 +2287,11 @@ impl Title {
                         true,
                         34,
                     ),
-                    b(
-                        x,
-                        top + 189.0,
-                        200.0,
-                        &lang::get_or("horizon.cubic.convert.button", "Convert to Cubic Chunks..."),
-                        !world.locked
-                            && !crate::cubic::is_cubic_world(&self.saves.join(&world.folder)),
-                        160,
-                    ),
+                    {
+                        let root = self.saves.join(&world.folder);
+                        let (label, on) = earth_edit::convert_button(&root, world.locked);
+                        b(x, top + 189.0, 200.0, &label, on, 160)
+                    },
                     b(
                         x,
                         top + 214.0,
@@ -4159,6 +4156,9 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 Action::None
             }
             (Mode::Edit { world, name, .. }, Some(160)) => {
+                if earth_edit::press(&self.saves.join(&world.folder)) {
+                    return Action::None;
+                }
                 self.mode = Mode::ConvertConfirm {
                     world: world.clone(),
                     name: name.clone(),

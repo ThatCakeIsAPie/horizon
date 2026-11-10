@@ -377,7 +377,7 @@ impl State {
     /// ones; an error leaves them as they were.
     pub(super) fn load_json(&mut self, text: &str) -> Result<(), String> {
         if self.kind == CubicKind::Earth {
-            self.earth = earth::Draft::from_json(text)?;
+            self.earth = self.earth.reload(text)?;
         } else if self.kind.has_terrain_settings() {
             let settings = CustomGeneratorSettings::from_json(text)?;
             settings.validate()?;
@@ -672,7 +672,7 @@ impl State {
     }
     /// Escape: closes an overlay and says so; false when none was open.
     pub(super) fn escape(&mut self) -> bool {
-        let open = self.overlay_open() || self.earth.focus.take().is_some();
+        let open = self.overlay_open() | self.earth.escape();
         self.overlay = Overlay::None;
         open
     }
@@ -2449,7 +2449,7 @@ pub(super) fn draw(
         Overlay::None => {}
     }
     let title_text = match state.page_id() {
-        Some(PageId::Earth) => tr("horizon.cubic.earth.title"),
+        Some(PageId::Earth) => earth::title(&state.earth),
         Some(id) => Text::translate(
             "horizon.cubic.page.title",
             &[
@@ -3527,15 +3527,25 @@ mod tests {
             .enabled
     }
     /// The middle of Earth's box `n` on the screen.
-    fn box_centre(state: &State, n: usize) -> (f32, f32) {
-        let (top, _, left) = list_area(state, SIZE);
+    fn box_centre(state: &mut State, n: usize) -> (f32, f32) {
+        let (top, bottom, left) = list_area(state, SIZE);
         let widgets = page(state);
         let widget = widgets
             .widgets
             .iter()
             .find(|w| w.item.kind == Kind::Field(n))
             .unwrap();
-        let (x, y, w, h) = absolute(widget.rect, 0.0, (left, top));
+        // The page is taller than the list: scroll the box into the middle of it.
+        wheel(state, 1000.0, (240.0, 100.0), SIZE);
+        for _ in 0..100 {
+            let (_, y, _, h) = absolute(widget.rect, state.scroll.amount.trunc(), (left, top));
+            if y + h <= bottom {
+                break;
+            }
+            wheel(state, -1.0, (240.0, 100.0), SIZE);
+        }
+        let (x, y, w, h) = absolute(widget.rect, state.scroll.amount.trunc(), (left, top));
+        assert!(y >= top && y + h <= bottom, "box {n} is in view");
         (x + w / 2.0, y + h / 2.0)
     }
 
@@ -3566,8 +3576,7 @@ mod tests {
         type_into(&mut s, 1, " 139.69 ");
         type_into(&mut s, 2, "8");
         type_into(&mut s, 3, "https://tiles.example.com/{z}/{x}/{y}.png");
-        let toggle = buttons_of(&s)[0].clone();
-        toggle(&mut s, 0.0);
+        press_button(&mut s, "horizon.cubic.earth.downloads");
         assert!(done_enabled(&s));
         assert_eq!(press(&mut s, DONE), Exit::Apply);
         let returned = EarthSettings::from_json(&s.json()).unwrap();
@@ -3584,6 +3593,8 @@ mod tests {
         with_more.sea_level_y = 40;
         with_more.vertical_exaggeration = 3.0;
         let again = state(CubicKind::Earth, &with_more.to_json_compact());
+        // A world file's allowDownloads is not consent: read back, the switch shows off until the host is approved.
+        with_more.allow_downloads = false;
         assert_eq!(earth_settings(&again).unwrap(), with_more);
         assert!(s.json().contains('\n'), "Done hands back the pretty form");
     }
@@ -3621,7 +3632,7 @@ mod tests {
     fn a_click_gives_earths_box_the_keys_and_a_click_elsewhere_or_escape_takes_them_back() {
         let mut s = state(CubicKind::Earth, "");
         assert!(s.focused_text().is_none());
-        let at = box_centre(&s, 1);
+        let at = box_centre(&mut s, 1);
         assert!(click(&mut s, at, SIZE), "a click on a box is a hit");
         assert_eq!(s.earth.focus, Some(1));
         let (id, _, max) = s.focused_text().unwrap();
@@ -3630,12 +3641,13 @@ mod tests {
         let frame = s.focused_box(SIZE).expect("the box the pointer edits");
         assert!(ui::hovered(at, frame[0], frame[1], frame[2], frame[3]));
         // Another box takes them; the empty part of the page releases them.
-        let other = box_centre(&s, 3);
+        let other = box_centre(&mut s, 3);
         click(&mut s, other, SIZE);
         assert_eq!(s.earth.focus, Some(3));
         click(&mut s, (2.0, 2.0), SIZE);
         assert_eq!(s.earth.focus, None);
         // Escape closes the box first, then the screen.
+        let at = box_centre(&mut s, 1);
         click(&mut s, at, SIZE);
         assert!(s.escape());
         assert_eq!(s.earth.focus, None);
@@ -3687,6 +3699,288 @@ mod tests {
         );
     }
 
+    /// Presses the page's button whose label starts with `label` (a language key, as the tests' language
+    /// has none).
+    fn press_button(state: &mut State, label: &str) {
+        let (found, _) = button_labelled(state, label);
+        let set = found.unwrap_or_else(|| panic!("a button {label}"));
+        set(state, 0.0);
+    }
+    /// The page's button whose English label starts with the English of `key`, and whether it is enabled.
+    fn button_labelled(state: &State, key: &str) -> (Option<Set>, bool) {
+        english(|| {
+            let wanted = tr(key);
+            page(state)
+                .widgets
+                .iter()
+                .find(|w| w.item.kind == Kind::Button && w.item.label.starts_with(&wanted))
+                .map_or((None, false), |w| (w.item.set.clone(), w.item.enabled))
+        })
+    }
+    /// The page's text lines (headings, notes, warnings), in the player's English.
+    fn earth_lines(state: &State) -> Vec<String> {
+        use crate::lang::{Language, scoped};
+        scoped(Language::load(&[&VanillaStrings], "en_us"), || {
+            page(state)
+                .widgets
+                .iter()
+                .filter(|w| matches!(w.item.kind, Kind::Heading | Kind::Note | Kind::Warning))
+                .map(|w| w.item.label.clone())
+                .collect()
+        })
+        .0
+    }
+    fn english<R>(f: impl FnOnce() -> R) -> R {
+        use crate::lang::{Language, scoped};
+        scoped(Language::load(&[&VanillaStrings], "en_us"), f).0
+    }
+    fn earth_with(approved: crate::earth_consent::Approved, url: Option<&str>) -> State {
+        let mut s = state(CubicKind::Earth, "");
+        s.earth = earth::Draft::with(url, approved);
+        s
+    }
+    const OFFER: &str = "https://tiles.example.com/dem/{z}/{x}/{y}.png";
+
+    #[test]
+    fn the_offered_address_fills_the_box_with_downloads_still_off() {
+        let s = earth_with(crate::earth_consent::Approved::of(&[]), Some(OFFER));
+        let settings = earth_settings(&s).unwrap();
+        assert_eq!(settings.tile_url, OFFER);
+        assert!(
+            !settings.allow_downloads,
+            "an offered address is not consent"
+        );
+        // Nothing offered (the game built alone): the box starts empty.
+        let none = earth_with(crate::earth_consent::Approved::of(&[]), None);
+        assert_eq!(earth_settings(&none).unwrap().tile_url, "");
+        // Reading back what Done handed over keeps the box as it was.
+        let again = s.earth.reload(&s.json()).unwrap();
+        assert_eq!(again.url(), OFFER);
+    }
+
+    #[test]
+    fn a_place_fills_the_origin_and_each_is_a_valid_one() {
+        assert_eq!(earth::PLACES.len(), 8);
+        let mut s = earth_with(crate::earth_consent::Approved::of(&[]), None);
+        for (key, lat, lon) in earth::PLACES {
+            press_button(&mut s, key);
+            let settings = earth_settings(&s).unwrap_or_else(|e| panic!("{key}: {e}"));
+            assert_eq!(
+                (settings.origin_latitude, settings.origin_longitude),
+                (lat, lon)
+            );
+            assert_eq!(settings.metres_per_block, 1.0, "a place keeps the scale");
+        }
+        // Manual entry still works after a place.
+        type_into(&mut s, 0, "1.5");
+        assert_eq!(earth_settings(&s).unwrap().origin_latitude, 1.5);
+        // The mouse reaches a place button.
+        let (top, _, left) = list_area(&s, SIZE);
+        let widgets = page(&s);
+        let everest = english(|| tr("horizon.cubic.earth.place.everest"));
+        let at = widgets
+            .widgets
+            .iter()
+            .find(|w| {
+                w.item.label == everest || w.item.label == "horizon.cubic.earth.place.everest"
+            })
+            .unwrap();
+        let (x, y, w, h) = absolute(at.rect, 0.0, (left, top));
+        assert!(click(&mut s, (x + w / 2.0, y + h / 2.0), SIZE));
+        assert_eq!(earth_settings(&s).unwrap().origin_latitude, 27.9881);
+    }
+
+    #[test]
+    fn the_scale_reads_as_blocks_to_metres_with_what_the_earth_needs() {
+        let mut s = earth_with(crate::earth_consent::Approved::of(&[]), None);
+        let lines = earth_lines(&s);
+        assert!(
+            lines.contains(&"1 block = 1 metres".to_owned()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("y -11000 to 8849")),
+            "{lines:?}"
+        );
+        type_into(&mut s, 2, "0,5");
+        assert!(earth_lines(&s).contains(&"1 block = 0.5 metres".to_owned()));
+        // A scale that is not one has no hint.
+        type_into(&mut s, 2, "far");
+        assert!(!earth_lines(&s).iter().any(|l| l.starts_with("1 block =")));
+        // It fits the world's height range at any scale the page takes, so there is no warning...
+        type_into(&mut s, 2, "0.25");
+        assert!(!earth_lines(&s).iter().any(|l| l.contains("does not fit")));
+        // ...until a sea level the settings carry (Presets) pushes the summits past the top.
+        presets_text(
+            &mut s,
+            r#"{"originLatitude":0,"originLongitude":0,"metresPerBlock":1,"seaLevelY":8388000}"#,
+        );
+        assert_eq!(press(&mut s, DONE), Exit::Stay);
+        assert!(
+            earth_lines(&s).iter().any(|l| l.contains("does not fit")),
+            "{:?}",
+            earth_lines(&s)
+        );
+    }
+
+    #[test]
+    fn what_is_wrong_is_said_in_a_translatable_sentence_not_the_generators_words() {
+        let mut s = earth_with(crate::earth_consent::Approved::of(&[]), None);
+        for (n, bad, key) in [
+            (0, "91", "horizon.cubic.earth.err.latitude"),
+            (0, "north", "horizon.cubic.earth.err.number"),
+            (1, "200", "horizon.cubic.earth.err.longitude"),
+            (2, "-3", "horizon.cubic.earth.err.scale"),
+            (
+                3,
+                "https://example.com/{z}/{x}.png",
+                "horizon.cubic.earth.err.placeholder",
+            ),
+            (
+                3,
+                "http://example.com/{z}/{x}/{y}",
+                "horizon.cubic.earth.err.insecure",
+            ),
+            (
+                3,
+                "https://a b.com/{z}/{x}/{y}",
+                "horizon.cubic.earth.err.spaces",
+            ),
+        ] {
+            let mut s = s.clone();
+            type_into(&mut s, n, bad);
+            let problem = s.earth.settings().unwrap_err();
+            let lines = earth_lines(&s).join(" ");
+            assert!(
+                !problem.contains("originLatitude") && !problem.contains("tileUrl"),
+                "{bad}: {problem}"
+            );
+            // The key is the sentence's own: it is in the language file, and the page shows its English.
+            let strings: std::collections::HashMap<String, String> =
+                serde_json::from_str(include_str!("../../assets/horizon/lang/en_us.json")).unwrap();
+            assert!(strings.contains_key(key), "{key}");
+            let english = english(|| s.earth.settings().unwrap_err());
+            assert!(lines.contains(&english), "{bad}: {english} not in {lines}");
+            assert!(english.chars().next().unwrap().is_uppercase(), "{english}");
+        }
+        type_into(&mut s, 0, "46");
+        assert!(done_enabled(&s));
+    }
+
+    #[test]
+    fn turning_downloads_on_shows_the_host_and_done_approves_it() {
+        let dir = horizon_earth::testing::TempDir::new();
+        let approved = crate::earth_consent::Approved::load(dir.path());
+        let mut s = earth_with(approved, Some(OFFER));
+        let host_line = |s: &State| {
+            earth_lines(s)
+                .into_iter()
+                .find(|l| l.starts_with("Tile server:"))
+        };
+        assert_eq!(
+            host_line(&s).as_deref(),
+            Some("Tile server: tiles.example.com")
+        );
+        assert!(!earth_settings(&s).unwrap().allow_downloads);
+        press_button(&mut s, "horizon.cubic.earth.downloads");
+        assert!(earth_settings(&s).unwrap().allow_downloads);
+        assert!(
+            earth_lines(&s)
+                .iter()
+                .any(|l| l.contains("approves this server")),
+            "the page says what Done does"
+        );
+        // Not approved until Done: cancelling Create World leaves the list alone.
+        assert!(!crate::earth_consent::Approved::load(dir.path()).contains("tiles.example.com"));
+        let json = s.finish();
+        assert!(EarthSettings::from_json(&json).unwrap().allow_downloads);
+        // The player's list has it, and a new game reads it from the file.
+        assert!(crate::earth_consent::Approved::load(dir.path()).contains("tiles.example.com"));
+        assert!(s.earth.approved().contains("tiles.example.com"));
+        // Turned off again, the world does not download.
+        press_button(&mut s, "horizon.cubic.earth.downloads");
+        assert!(!earth_settings(&s).unwrap().allow_downloads);
+    }
+
+    #[test]
+    fn a_world_files_allow_downloads_is_not_consent_and_a_changed_host_needs_it_again() {
+        let dir = horizon_earth::testing::TempDir::new();
+        let mut world = EarthSettings::at(1.0, 2.0);
+        world.tile_url = OFFER.to_owned();
+        world.allow_downloads = true;
+        // Someone else's world: the switch shows off and Done approves nothing.
+        let mut s = earth_with(crate::earth_consent::Approved::load(dir.path()), None);
+        s.load_json(&world.to_json_compact()).unwrap();
+        assert!(!earth_settings(&s).unwrap().allow_downloads);
+        s.finish();
+        assert!(!crate::earth_consent::Approved::load(dir.path()).contains("tiles.example.com"));
+        // The same world once the player approved the host: on.
+        let mut list = crate::earth_consent::Approved::load(dir.path());
+        list.approve("tiles.example.com").unwrap();
+        s.earth = earth::Draft::with(None, list);
+        s.load_json(&world.to_json_compact()).unwrap();
+        assert!(earth_settings(&s).unwrap().allow_downloads);
+        // Another host in the box is another approval.
+        type_into(&mut s, 3, "https://elsewhere.example.org/{z}/{x}/{y}.png");
+        assert!(!earth_settings(&s).unwrap().allow_downloads);
+        press_button(&mut s, "horizon.cubic.earth.downloads");
+        s.finish();
+        assert!(crate::earth_consent::Approved::load(dir.path()).contains("elsewhere.example.org"));
+    }
+
+    #[test]
+    fn the_switch_is_unavailable_without_a_usable_address() {
+        let mut s = earth_with(crate::earth_consent::Approved::of(&[]), None);
+        let switch = |s: &State| match button_labelled(s, "horizon.cubic.earth.downloads") {
+            (Some(_), enabled) => Some(enabled),
+            _ => None,
+        };
+        assert_eq!(switch(&s), Some(false));
+        type_into(&mut s, 3, OFFER);
+        assert_eq!(switch(&s), Some(true));
+        type_into(&mut s, 3, "http://example.com/{z}/{x}/{y}");
+        assert_eq!(switch(&s), Some(false));
+    }
+
+    #[test]
+    fn the_credits_are_one_press_away_say_who_made_the_data_and_close_with_escape() {
+        let mut s = earth_with(crate::earth_consent::Approved::of(&[]), None);
+        let short = english(|| {
+            page(&s)
+                .widgets
+                .iter()
+                .filter(|w| w.item.kind == Kind::Note)
+                .map(|w| w.item.label.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            short.iter().any(|l| l.contains("Terrain Tiles")),
+            "{short:?}"
+        );
+        press_button(&mut s, "horizon.cubic.earth.credits.open");
+        assert!(s.earth.credits_open());
+        // Everything the publisher requires is on the page, word for word.
+        let shown: String = earth_lines(&s).join("");
+        let squeeze = |t: &str| t.split_whitespace().collect::<String>();
+        assert!(squeeze(&shown).contains(&squeeze(earth::attribution())));
+        assert!(squeeze(&shown).contains(&squeeze("U.S. Geological Survey")));
+        assert!(shown.contains("Kartverket"));
+        // The credits scroll, and the screen's Done and Cancel still work.
+        let (top, bottom, _) = list_area(&s, SIZE);
+        assert!(content_height(&page(&s)) > bottom - top);
+        wheel(&mut s, -1000.0, (240.0, 100.0), SIZE);
+        assert!(s.scroll.amount > 0.0);
+        assert!(done_enabled(&s));
+        // Escape closes the credits first, then the screen.
+        assert!(s.escape());
+        assert!(!s.earth.credits_open());
+        assert!(!s.escape());
+        // Back does the same.
+        press_button(&mut s, "horizon.cubic.earth.credits.open");
+        press_button(&mut s, "horizon.cubic.earth.credits.back");
+        assert!(!s.earth.credits_open());
+    }
+
     #[test]
     fn earths_strings_are_in_the_language_file() {
         let strings: std::collections::HashMap<String, String> =
@@ -3707,7 +4001,28 @@ mod tests {
             "horizon.cubic.earth.downloads",
             "horizon.cubic.earth.no_url",
             "horizon.cubic.earth.invalid",
-        ] {
+            "horizon.cubic.earth.places",
+            "horizon.cubic.earth.scale.is",
+            "horizon.cubic.earth.scale.needs",
+            "horizon.cubic.earth.scale.too_tall",
+            "horizon.cubic.earth.server_is",
+            "horizon.cubic.earth.downloads.on",
+            "horizon.cubic.earth.downloads.off",
+            "horizon.cubic.earth.credits.heading",
+            "horizon.cubic.earth.credits.short",
+            "horizon.cubic.earth.credits.open",
+            "horizon.cubic.earth.credits.back",
+            "horizon.cubic.earth.credits.title",
+            "horizon.cubic.earth.credits.about",
+            "horizon.cubic.earth.credits.required",
+            "horizon.cubic.earth.credits.idea",
+            "horizon.cubic.earth.unapproved",
+            "horizon.cubic.earth.edit.approve",
+            "horizon.cubic.earth.edit.revoke",
+        ]
+        .into_iter()
+        .chain(super::earth::PLACES.iter().map(|p| p.0))
+        {
             assert!(strings.contains_key(key), "{key}");
         }
         assert_eq!(CubicKind::Earth.label(), "horizon.cubic.type.earth");

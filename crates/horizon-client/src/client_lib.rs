@@ -66,6 +66,7 @@ pub mod debug_overlay;
 pub mod debugworld;
 pub mod dialog;
 pub mod dialog_screen;
+pub mod earth_consent;
 pub mod earth_net;
 pub mod earth_prefetch;
 pub mod end_crystal;

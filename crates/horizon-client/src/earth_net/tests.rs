@@ -120,12 +120,21 @@ fn settings(template: &str, allow: bool) -> EarthSettings {
     s
 }
 
+/// The player has approved this machine's address and nothing else.
+fn local() -> Approved {
+    Approved::of(&["127.0.0.1"])
+}
+
+fn fetcher_for(settings: &EarthSettings) -> HttpTileFetcher {
+    HttpTileFetcher::new(settings, &local())
+}
+
 const ID: TileId = TileId { z: 5, x: 17, y: 11 };
 
 #[test]
 fn a_tile_is_downloaded_from_the_address_with_its_numbers_in_place() {
     let server = Server::start(|_| Reply::Ok(b"png bytes".to_vec()));
-    let fetcher = HttpTileFetcher::new(&settings(&server.template("/tiles/{z}/{x}/{y}.png"), true));
+    let fetcher = fetcher_for(&settings(&server.template("/tiles/{z}/{x}/{y}.png"), true));
     assert_eq!(fetcher.fetch(ID).unwrap(), b"png bytes");
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
@@ -155,7 +164,7 @@ fn the_address_template_replaces_every_placeholder_wherever_it_stands() {
 #[test]
 fn a_request_says_only_that_it_is_horizon() {
     let server = Server::start(|_| Reply::Ok(vec![1, 2, 3]));
-    let fetcher = HttpTileFetcher::new(&settings(&server.template("/{z}/{x}/{y}"), true));
+    let fetcher = fetcher_for(&settings(&server.template("/{z}/{x}/{y}"), true));
     fetcher.fetch(ID).unwrap();
     let headers: Vec<String> = server.requests()[0]
         .1
@@ -186,7 +195,7 @@ fn a_missing_tile_is_not_found_and_a_busy_server_is_temporary() {
         _ => Reply::Status(418),
     });
     let get = |path: &str| {
-        HttpTileFetcher::new(&settings(
+        fetcher_for(&settings(
             &server.template(&format!("{path}?{{z}}{{x}}{{y}}")),
             true,
         ))
@@ -205,7 +214,7 @@ fn a_missing_tile_is_not_found_and_a_busy_server_is_temporary() {
 #[test]
 fn a_server_that_does_not_answer_is_a_timeout_that_can_be_retried() {
     let server = Server::start(|_| Reply::Stall(Duration::from_secs(5)));
-    let fetcher = HttpTileFetcher::new(&settings(&server.template("/{z}/{x}/{y}"), true))
+    let fetcher = fetcher_for(&settings(&server.template("/{z}/{x}/{y}"), true))
         .limits(Duration::from_millis(250), MAX_TILE_BYTES);
     let started = Instant::now();
     let error = fetcher.fetch(ID).unwrap_err();
@@ -225,7 +234,7 @@ fn nothing_listening_is_temporary_too() {
         .local_addr()
         .unwrap()
         .port();
-    let fetcher = HttpTileFetcher::new(&settings(
+    let fetcher = fetcher_for(&settings(
         &format!("http://127.0.0.1:{port}/{{z}}/{{x}}/{{y}}"),
         true,
     ));
@@ -244,7 +253,7 @@ fn a_response_over_the_size_cap_is_refused_however_it_is_sent() {
         }
     });
     let capped = |path: &str, cap: usize| {
-        HttpTileFetcher::new(&settings(
+        fetcher_for(&settings(
             &server.template(&format!("{path}/{{z}}/{{x}}/{{y}}")),
             true,
         ))
@@ -268,10 +277,10 @@ fn a_response_over_the_size_cap_is_refused_however_it_is_sent() {
 fn nothing_is_downloaded_unless_the_world_allows_it() {
     let server = Server::start(|_| Reply::Ok(vec![1]));
     let template = server.template("/{z}/{x}/{y}");
-    let off = HttpTileFetcher::new(&settings(&template, false));
+    let off = fetcher_for(&settings(&template, false));
     assert!(!off.downloads());
     assert!(matches!(off.fetch(ID), Err(FetchError::Other(why)) if why.contains("allowDownloads")));
-    let none = HttpTileFetcher::new(&settings("", true));
+    let none = fetcher_for(&settings("", true));
     assert!(!none.downloads());
     assert!(matches!(none.fetch(ID), Err(FetchError::Other(why)) if why.contains("tileUrl")));
     assert!(
@@ -301,7 +310,7 @@ fn addresses_the_game_may_not_download_from_are_refused() {
     ] {
         let error = check_template(template).expect_err(template);
         assert!(error.contains(why), "{template}: {error}");
-        let fetcher = HttpTileFetcher::new(&settings(template, true));
+        let fetcher = fetcher_for(&settings(template, true));
         assert!(!fetcher.downloads(), "{template}");
         assert!(
             matches!(fetcher.fetch(ID), Err(FetchError::Other(_))),
@@ -328,7 +337,7 @@ fn a_redirect_is_followed_only_to_an_address_that_is_allowed() {
         _ => Reply::Redirect("/loop".into()),
     });
     let get = |path: &str| {
-        HttpTileFetcher::new(&settings(
+        fetcher_for(&settings(
             &server.template(&format!("{path}?{{z}}{{x}}{{y}}")),
             true,
         ))
@@ -360,13 +369,15 @@ fn tiles_of_different_addresses_are_cached_apart() {
         "{a}"
     );
     let root = TempDir::new();
-    let one = open(
+    let one = open_with(
         &settings("https://one.example.com/{z}/{x}/{y}.png", false),
         root.path(),
+        &local(),
     );
-    let two = open(
+    let two = open_with(
         &settings("https://two.example.com/{z}/{x}/{y}.png", false),
         root.path(),
+        &local(),
     );
     assert_eq!(one.dir, root.path().join(&a));
     assert_ne!(one.dir, two.dir);
@@ -381,7 +392,7 @@ fn a_store_over_the_downloader_saves_what_it_gets_where_the_address_says() {
     let server = Server::start(move |_| Reply::Ok(encode_tile(ID, &hills)));
     let root = TempDir::new();
     let template = server.template("/dem/{z}/{x}/{y}.png");
-    let tiles = open(&settings(&template, true), root.path());
+    let tiles = open_with(&settings(&template, true), root.path(), &local());
     assert!(tiles.downloads);
     let tile = tiles.store.load(ID).unwrap();
     assert!(tile.max() > 100.0);
@@ -390,9 +401,89 @@ fn a_store_over_the_downloader_saves_what_it_gets_where_the_address_says() {
     tiles.store.load(ID).unwrap();
     assert_eq!(server.requests().len(), 1);
     // Another world with downloads off, over the same address, finds the cached tile without the server.
-    let offline = open(&settings(&template, false), root.path());
+    let offline = open_with(&settings(&template, false), root.path(), &local());
     assert!(!offline.downloads);
     assert!(offline.store.cached(ID).is_some());
     assert!(offline.store.load(TileId { z: 5, x: 18, y: 11 }).is_err());
     assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn an_unapproved_host_never_gets_a_request_even_when_the_world_allows_downloads() {
+    let server = Server::start(|_| Reply::Ok(vec![1]));
+    let world = settings(&server.template("/{z}/{x}/{y}"), true);
+    assert!(world.allow_downloads);
+    let nobody = Approved::of(&[]);
+    let fetcher = HttpTileFetcher::new(&world, &nobody);
+    assert!(!fetcher.downloads());
+    let refusal = fetcher.refusal().unwrap().to_owned();
+    assert!(
+        refusal.contains("127.0.0.1") && refusal.contains("approved"),
+        "{refusal}"
+    );
+    assert!(matches!(fetcher.fetch(ID), Err(FetchError::Other(_))));
+    // The same through a store, which is what a world reads tiles with.
+    let root = TempDir::new();
+    let tiles = open_with(&world, root.path(), &nobody);
+    assert!(!tiles.downloads);
+    assert!(tiles.store.load(ID).is_err());
+    // Another host's approval does not help.
+    let other = Approved::of(&["tiles.example.com"]);
+    assert!(!HttpTileFetcher::new(&world, &other).downloads());
+    assert!(
+        server.requests().is_empty(),
+        "an unapproved host was contacted: {:?}",
+        server.requests()
+    );
+}
+
+#[test]
+fn approving_the_host_turns_downloads_on() {
+    let server = Server::start(|_| Reply::Ok(b"png".to_vec()));
+    let world = settings(&server.template("/{z}/{x}/{y}"), true);
+    let dir = TempDir::new();
+    let mut list = Approved::load(dir.path());
+    assert!(!HttpTileFetcher::new(&world, &list).downloads());
+    list.approve("127.0.0.1").unwrap();
+    // After a restart, from the file.
+    let fetcher = HttpTileFetcher::new(&world, &Approved::load(dir.path()));
+    assert!(fetcher.downloads());
+    assert_eq!(fetcher.fetch(ID).unwrap(), b"png");
+    // Approval does not override the world: with downloads off, nothing is fetched.
+    let off = settings(&server.template("/{z}/{x}/{y}"), false);
+    assert!(!HttpTileFetcher::new(&off, &list).downloads());
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn an_approved_host_cannot_send_the_game_to_an_unapproved_one() {
+    let other = Server::start(|_| Reply::Ok(b"other".to_vec()));
+    // `localhost` is a second name for this machine: a different host, not approved.
+    let target = format!("http://localhost:{}/tile", other.port);
+    let first = Server::start(move |_| Reply::Redirect(target.clone()));
+    let world = settings(&first.template("/{z}/{x}/{y}"), true);
+    let error = HttpTileFetcher::new(&world, &local())
+        .fetch(ID)
+        .unwrap_err();
+    assert!(
+        matches!(&error, FetchError::Other(why) if why.contains("localhost") && why.contains("not approved")),
+        "{error:?}"
+    );
+    assert!(other.requests().is_empty(), "the redirect was followed");
+    // Approved, it is followed.
+    let both = Approved::of(&["127.0.0.1", "localhost"]);
+    assert_eq!(
+        HttpTileFetcher::new(&world, &both).fetch(ID).unwrap(),
+        b"other"
+    );
+}
+
+#[test]
+fn the_host_is_what_the_player_approves() {
+    assert_eq!(
+        host_of("https://S3.Amazonaws.com:443/a/{z}/{x}/{y}.png").unwrap(),
+        "s3.amazonaws.com"
+    );
+    assert_eq!(host_of("http://[::1]:9/{z}").unwrap(), "[::1]");
+    assert!(host_of("https://u:p@x.example.com/").is_err());
 }
