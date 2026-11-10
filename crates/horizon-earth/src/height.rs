@@ -116,7 +116,7 @@ impl ElevationField {
         depth: usize,
         zoom: u8,
     ) -> Option<Vec<f32>> {
-        self.grid_with(x0, z0, width, depth, zoom, &mut |id| {
+        self.grid_with(x0, z0, width, depth, 1.0, zoom, &mut |id| {
             Ok::<_, std::convert::Infallible>(self.store.cached(id))
         })
         .unwrap_or(None)
@@ -131,7 +131,7 @@ impl ElevationField {
         depth: usize,
         zoom: u8,
     ) -> Result<Option<Vec<f32>>, LoadError> {
-        self.grid_with(x0, z0, width, depth, zoom, &mut |id| {
+        self.grid_with(x0, z0, width, depth, 1.0, zoom, &mut |id| {
             self.store.load(id).map(Some)
         })
     }
@@ -161,6 +161,27 @@ impl ElevationField {
     ) -> Result<Option<Vec<i32>>, LoadError> {
         let heights = self.heights_m_blocking(x0, z0, width, depth, zoom)?;
         Ok(heights.map(|hs| hs.into_iter().map(|h| self.block_y_of(h)).collect()))
+    }
+
+    /// [`ElevationField::surface_ys`] for samples `stride` blocks apart: `width` by `depth` of them, the one at
+    /// `(i, j)` exactly what [`ElevationField::surface_y`] gives at block `(x0 + i * stride, z0 + j * stride)`.
+    /// This is how a far node of the octree reads its 16 by 16 columns in one go. `None` when a tile is not in the
+    /// store (nothing is fetched).
+    pub fn surface_ys_strided(
+        &self,
+        x0: i32,
+        z0: i32,
+        width: usize,
+        depth: usize,
+        stride: i32,
+        zoom: u8,
+    ) -> Option<Vec<i32>> {
+        let heights = self
+            .grid_with(x0, z0, width, depth, f64::from(stride), zoom, &mut |id| {
+                Ok::<_, std::convert::Infallible>(self.store.cached(id))
+            })
+            .unwrap_or(None)?;
+        Some(heights.into_iter().map(|h| self.block_y_of(h)).collect())
     }
 
     fn block_y_of(&self, height_m: f32) -> i32 {
@@ -292,6 +313,7 @@ impl ElevationField {
         z0: i32,
         width: usize,
         depth: usize,
+        stride: f64,
         zoom: u8,
         get: &mut dyn FnMut(TileId) -> Result<Option<Arc<Tile>>, E>,
     ) -> Result<Option<Vec<f32>>, E> {
@@ -310,8 +332,8 @@ impl ElevationField {
         let mut out = Vec::with_capacity(width.saturating_mul(depth));
         for dz in 0..depth {
             for dx in 0..width {
-                let x = f64::from(x0) + dx as f64 + 0.5;
-                let z = f64::from(z0) + dz as f64 + 0.5;
+                let x = f64::from(x0) + (dx as f64) * stride + 0.5;
+                let z = f64::from(z0) + (dz as f64) * stride + 0.5;
                 match self.sample(x, z, zoom, &mut cached_get)? {
                     Some(h) => out.push(h),
                     None => return Ok(None),
@@ -531,6 +553,37 @@ mod tests {
                 .surface_ys_blocking(x0, z0, width, depth, 8)
                 .unwrap(),
             Some(ys)
+        );
+    }
+
+    #[test]
+    fn a_strided_read_matches_the_single_reads_and_needs_every_tile() {
+        let rig = build(0.0, 0.0, 100.0, smooth);
+        let (x0, z0, n, stride) = (-70, -50, 16, 9);
+        // Nothing local yet: no answer, and nothing fetched.
+        assert_eq!(rig.field.surface_ys_strided(x0, z0, n, n, stride, 8), None);
+        assert_eq!(rig.fetcher.fetch_count(), 0);
+        for id in rig
+            .field
+            .tiles_for(x0, z0, x0 + stride * n as i32, z0 + stride * n as i32, 8)
+        {
+            rig.field.store().load(id).unwrap();
+        }
+        let ys = rig
+            .field
+            .surface_ys_strided(x0, z0, n, n, stride, 8)
+            .unwrap();
+        assert_eq!(ys.len(), n * n);
+        for j in 0..n {
+            for i in 0..n {
+                let (x, z) = (x0 + i as i32 * stride, z0 + j as i32 * stride);
+                assert_eq!(Some(ys[j * n + i]), rig.field.surface_y(x, z, 8), "{x},{z}");
+            }
+        }
+        // A stride of one is the plain batch.
+        assert_eq!(
+            rig.field.surface_ys_strided(x0, z0, 5, 4, 1, 8),
+            rig.field.surface_ys(x0, z0, 5, 4, 8)
         );
     }
 

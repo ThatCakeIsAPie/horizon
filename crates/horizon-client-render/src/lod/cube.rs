@@ -357,6 +357,16 @@ pub trait CubeSampler: Send {
     fn classify(&mut self, _key: CubeKey) -> NodeClass {
         NodeClass::Mixed
     }
+    /// Whether [`CubeSampler::classify`] knows something worth asking: a sampler on the CPU path that does
+    /// gets the classifier thread the GPU path always has. The default does not (it always says `Mixed`).
+    fn classifies(&self) -> bool {
+        false
+    }
+    /// [`CubeSampler::classify`], or `None` when the sampler cannot tell yet (the data it reads has not
+    /// arrived): the node is then asked about again at a later plan instead of being filed as unknown.
+    fn classify_ready(&mut self, key: CubeKey) -> Option<NodeClass> {
+        Some(self.classify(key))
+    }
     /// The GPU descent behind this sampler (`gfx::cube_descent`), if it has
     /// one: it proves whole subtrees of the octree uniform from the density
     /// bound, in place of [`CubeSampler::classify`] node by node
@@ -1878,48 +1888,8 @@ struct Classes {
     queued: FxHashSet<CubeKey>,
 }
 
-/// Classes kept in each generation of [`KnownClasses`].
-const CLASS_NODES: usize = 1 << 18;
-
-/// The classes found so far, in two generations of at most [`CLASS_NODES`]:
-/// a full one becomes the older and a new one starts, so the classes of the
-/// last answers are always all there. Emptied whole when full, as it was, it
-/// kept only the newest descent's at Ultra (one answer holds 150,000 or so),
-/// and the plan swung between that one's detail and the union's: a still
-/// camera's far view went back and forth between levels, the descent asked
-/// again at each plan's detail, for good.
-#[derive(Default)]
-struct KnownClasses {
-    newer: FxHashMap<CubeKey, NodeClass>,
-    older: FxHashMap<CubeKey, NodeClass>,
-}
-
-impl KnownClasses {
-    fn get(&self, key: &CubeKey) -> Option<NodeClass> {
-        self.newer.get(key).or_else(|| self.older.get(key)).copied()
-    }
-
-    /// Files `found`, starting a new generation first when they would not
-    /// fit in this one.
-    fn extend(&mut self, found: impl ExactSizeIterator<Item = (CubeKey, NodeClass)>) {
-        if self.newer.len() + found.len() > CLASS_NODES {
-            self.older = std::mem::take(&mut self.newer);
-        }
-        self.newer.extend(found);
-    }
-
-    fn insert(&mut self, key: CubeKey, class: NodeClass) {
-        if self.newer.len() >= CLASS_NODES {
-            self.older = std::mem::take(&mut self.newer);
-        }
-        self.newer.insert(key, class);
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.newer.len() + self.older.len()
-    }
-}
+mod known_classes;
+use known_classes::KnownClasses;
 
 impl Shared {
     fn new() -> Self {
@@ -2516,7 +2486,9 @@ impl CubeLod {
         let surface_allowed = sampler.surface();
         let late = sampler.late();
         // One more fork classifies nodes for the planner, on a thread of its own.
-        let classifier = backend.is_some().then(|| sampler.fork()).flatten();
+        let classifier = (backend.is_some() || sampler.classifies())
+            .then(|| sampler.fork())
+            .flatten();
         let descent = sampler.descent();
         let mut samplers = Vec::new();
         while samplers.len() + 1 < wanted_threads
@@ -4052,10 +4024,12 @@ fn classify_loop(shared: &Shared, sampler: &mut dyn CubeSampler) {
                 classes = shared.classes_wake.wait(classes).unwrap();
             }
         };
-        let class = sampler.classify(key);
+        let class = sampler.classify_ready(key);
         let mut classes = shared.classes.lock().unwrap();
         classes.queued.remove(&key);
-        classes.known.insert(key, class);
+        if let Some(class) = class {
+            classes.known.insert(key, class);
+        }
     }
 }
 
@@ -4921,6 +4895,57 @@ mod tests {
         assert!(node(&shared, &mut OnlyCubes, key(6, 0, 0, 0), AIR, &kind).is_none());
         // The children are cached for the next parent.
         assert!(shared.cache.lock().unwrap().nodes.len() >= 8);
+    }
+
+    /// A sampler whose data has not arrived says so (`None`): the classifier thread does not file the node as
+    /// unknown for good, it is asked about again at a later plan.
+    #[test]
+    fn a_classification_that_cannot_be_made_yet_is_asked_for_again_not_remembered() {
+        struct Waits(u32);
+        impl CubeSampler for Waits {
+            fn node(&mut self, _: CubeKey) -> Option<CubeNode> {
+                None
+            }
+            fn fork(&self) -> Option<Box<dyn CubeSampler>> {
+                None
+            }
+            fn classifies(&self) -> bool {
+                true
+            }
+            fn classify_ready(&mut self, _: CubeKey) -> Option<NodeClass> {
+                self.0 += 1;
+                (self.0 > 1).then_some(NodeClass::Air)
+            }
+        }
+        assert!(Waits(0).classifies() && !Flat.classifies());
+        let shared = Arc::new(Shared::new());
+        let k = key(3, 0, 0, 0);
+        assert_eq!(classify_cached(&shared, k), NodeClass::Mixed);
+        let worker = {
+            let shared = shared.clone();
+            std::thread::spawn(move || classify_loop(&shared, &mut Waits(0)))
+        };
+        let settled = |want: Option<NodeClass>| {
+            for _ in 0..500 {
+                {
+                    let classes = shared.classes.lock().unwrap();
+                    if classes.queued.is_empty() && classes.known.get(&k) == want {
+                        return true;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+        // The first answer was "not yet": nothing is known, and the node is not waiting either.
+        assert!(settled(None));
+        // The next plan asks again, and now the answer is kept.
+        assert_eq!(classify_cached(&shared, k), NodeClass::Mixed);
+        assert!(settled(Some(NodeClass::Air)));
+        assert_eq!(classify_cached(&shared, k), NodeClass::Air);
+        shared.stop.store(true, Ordering::Relaxed);
+        shared.classes_wake.notify_all();
+        worker.join().unwrap();
     }
 
     /// Late content (structures found after the terrain) has the drawn

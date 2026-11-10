@@ -30,6 +30,14 @@ impl Game<'_> {
     /// back what follows it.
     pub(in crate::game) fn poll_remote(&mut self) -> Result<()> {
         let polled = self.poll_remote_events();
+        // Joined and loaded: the join's "Loading terrain..." is over, and the status line (`status`'s
+        // `server.status`) goes with it. It was never rewritten, so a world that played said it still loaded.
+        if let Some(r) = self.remote.as_mut()
+            && r.loaded_sent
+            && !r.status.is_empty()
+        {
+            r.status.clear();
+        }
         // The block events and block changes of a piston clock start and end
         // thousands of moves at once: the collision view and the renderer
         // take them all in one sync, before the tick or frame reads them.

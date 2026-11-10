@@ -24,6 +24,10 @@
 //!   nodes above and below it); a node straddling the band's edge is sampled
 //!   per voxel from both.
 //!
+//! - An Earth world's nodes (`earth`) are made from the elevation tiles by the generator's classification and one
+//!   batched read of the node's surfaces, never per voxel and never waiting for a download: a node whose tiles are
+//!   missing is "later" and the tiles are requested.
+//!
 //! What was seen is kept (`lod::cube_cache`, `<dimension>/horizon_cube_lod/`):
 //! a node of level 1 made of saved cubes (the player's edits, vanilla's
 //! decorated terrain), or sampled outside vanilla's range where the generator
@@ -57,6 +61,8 @@ use horizon_core::position::SectionPos;
 use horizon_world::registry::{BlockRegistry, BlockStateId};
 use std::collections::VecDeque;
 use std::sync::Arc;
+
+mod earth;
 
 /// Node columns of vanilla far terrain kept per sampler.
 const KEPT_GRIDS: usize = 64;
@@ -479,6 +485,17 @@ impl CubicLodSampler {
     /// ([`COVER_LOOKS`]): terrain, overhangs, floating land. Coarse nodes
     /// are not shaded.
     fn cover_of(&mut self, key: CubeKey) -> (Option<Box<CoverMask>>, bool) {
+        if self.is_earth() {
+            // From the surfaces the node's columns read; without them the node is not kept.
+            let generator = self.wg.generator.clone();
+            let found = generator
+                .earth_generator()
+                .and_then(|earth| earth::cover(earth, key).ok());
+            return match found {
+                Some(mask) => (mask, true),
+                None => (None, false),
+            };
+        }
         let hybrid = self.wg.kind == CubicKind::Hybrid;
         let origin = key.origin();
         let top = origin[1].saturating_add(key.size());
@@ -887,6 +904,9 @@ impl CubeSampler for CubicLodSampler {
     }
 
     fn classify(&mut self, key: CubeKey) -> NodeClass {
+        if self.is_earth() {
+            return self.earth_class(key).unwrap_or(NodeClass::Mixed);
+        }
         if self.far_makes(key) {
             return self
                 .far
@@ -894,6 +914,20 @@ impl CubeSampler for CubicLodSampler {
                 .map_or(NodeClass::Mixed, |far| far.classify(key));
         }
         NodeClass::Mixed
+    }
+
+    /// An Earth world's nodes are classified from the elevation bounds, with no GPU.
+    fn classifies(&self) -> bool {
+        self.is_earth()
+    }
+
+    /// An Earth node whose tiles are missing is not classified yet (and its tiles are asked for), rather than
+    /// filed as unknown for good.
+    fn classify_ready(&mut self, key: CubeKey) -> Option<NodeClass> {
+        if self.is_earth() {
+            return self.earth_class(key);
+        }
+        Some(self.classify(key))
     }
 
     fn gpu(&self) -> Option<GpuBackend> {
@@ -985,7 +1019,13 @@ impl CubicLodSampler {
         if crate::lod::cube::profile::on() {
             crate::lod::cube::profile::add(&crate::lod::cube::profile::S_SAMPLE, started);
         }
-        let node = self.covered(node?);
+        let node = if self.is_earth() {
+            // Its sky cover reads the same tiles: a node without it is later.
+            let node = node?;
+            self.earth_covered(key, node)?
+        } else {
+            self.covered(node?)
+        };
         // Likewise its sky cover, which probes the generator too.
         (!self.level.generation_cancelled()).then_some(node)
     }
@@ -1015,6 +1055,9 @@ impl CubicLodSampler {
 
     /// [`Self::sampled`] without the sky cover.
     fn sampled_plain(&mut self, key: CubeKey) -> Option<CubeNode> {
+        if self.is_earth() {
+            return self.earth_plain(key);
+        }
         // Levels 2 and up outside the band: the far generator.
         if self.far_makes(key)
             && let Some(node) = self.far.as_mut().and_then(|far| far.node(key))

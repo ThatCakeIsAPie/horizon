@@ -126,6 +126,17 @@ impl EarthSettings {
     pub fn to_json_compact(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
+
+    /// A text that changes with whatever decides what the terrain is made of: these settings and the version of
+    /// the surface rule ([`super::surface::RULES`]). Far-view caches are keyed by it, so nodes built under an
+    /// older rule are not shown.
+    pub fn terrain_key(&self) -> String {
+        format!(
+            "{}#surface{}",
+            self.to_json_compact(),
+            super::surface::RULES
+        )
+    }
 }
 
 #[cfg(test)]

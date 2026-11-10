@@ -1792,7 +1792,7 @@ fn earth_terrain_text(settings: &horizon_world::cubic::earth::EarthSettings) -> 
     let mut terrain = settings.clone();
     terrain.tile_url.clear();
     terrain.allow_downloads = false;
-    terrain.to_json_compact()
+    terrain.terrain_key()
 }
 
 /// The writer thread: cubes to disk in the order they were queued, until

@@ -3,8 +3,15 @@
 //! With `s` the surface block height of a column and `sea` the sea level:
 //!
 //! * `y <= s - 4`: stone;
-//! * on land (`s >= sea`): dirt for `s - 3 <= y < s`, a grass block at `y == s`, air above;
+//! * on land (`s >= sea`), by the column's [`SurfaceKind`] (see [`super::surface`] for the snow line and the
+//!   alpine band): grass over three dirt (`s - 3 <= y < s` dirt, a grass block at `y == s`); bare stone up to
+//!   `s`; or snow for `s - 1 <= y <= s` over stone; air above;
 //! * under water (`s < sea`): sand for `s - 3 <= y <= s`, water for `s < y < sea`, air above.
+//!
+//! A far voxel (a sample `step > 1` blocks tall, from `lo` to `lo + step - 1`) that holds the surface block is
+//! the surface block, so distant terrain shows one material per column and does not stripe with the height of
+//! the voxel grid; the voxels above and below it are what the rule gives at their own top (below the ground) and
+//! bottom (above it) block.
 //!
 //! Every query comes in two forms. The plain one reads only tiles the store already holds and gives
 //! [`NotReady`], naming the tiles it lacks, when one is missing: it never invents a height, because a cube that
@@ -25,6 +32,7 @@ use horizon_earth::{
 };
 
 use super::settings::EarthSettings;
+use super::surface::{SNOW_DEPTH, SOIL_DEPTH, SurfaceKind};
 use crate::cubic::custom::replacers::resolve_block;
 use crate::cubic::custom::settings::BlockStateDesc;
 use crate::registry::BlockRegistry;
@@ -41,6 +49,7 @@ pub struct EarthBlocks {
     pub grass_block: u32,
     pub sand: u32,
     pub water: u32,
+    pub snow_block: u32,
 }
 
 impl EarthBlocks {
@@ -54,6 +63,7 @@ impl EarthBlocks {
             grass_block: get("grass_block")?,
             sand: get("sand")?,
             water: get("water")?,
+            snow_block: get("snow_block")?,
         })
     }
 }
@@ -145,6 +155,8 @@ pub struct EarthGenerator {
     pub(super) retry: Retry,
     /// Whether the last blocking read failed, so a streak of failures logs once.
     pub(super) failing: AtomicBool,
+    /// Tiles far-view workers found missing, for whatever fetches tiles in the background.
+    pub(super) requests: super::far::Requests,
 }
 
 impl EarthGenerator {
@@ -176,6 +188,7 @@ impl EarthGenerator {
                 cap: Duration::from_secs(5),
             },
             failing: AtomicBool::new(false),
+            requests: super::far::Requests::default(),
         })
     }
 
@@ -239,26 +252,67 @@ impl EarthGenerator {
         self.field.zoom_for(metres)
     }
 
-    /// The block at height `y` of a column whose surface is `s`.
-    pub fn block_for(&self, y: i32, s: i32) -> u32 {
+    /// The block at height `y` of a column whose surface is `s` and whose top is of `kind`.
+    pub fn block_for(&self, y: i32, s: i32, kind: SurfaceKind) -> u32 {
         let (y, s) = (i64::from(y), i64::from(s));
         let sea = i64::from(self.sea_level);
         let b = &self.blocks;
-        if y <= s - 4 {
-            b.stone
-        } else if s >= sea {
-            match y.cmp(&s) {
-                std::cmp::Ordering::Less => b.dirt,
-                std::cmp::Ordering::Equal => b.grass_block,
-                std::cmp::Ordering::Greater => b.air,
-            }
-        } else if y <= s {
-            b.sand
-        } else if y < sea {
-            b.water
-        } else {
-            b.air
+        if y < s - SOIL_DEPTH {
+            return b.stone;
         }
+        if y > s {
+            return if s < sea && y < sea { b.water } else { b.air };
+        }
+        match kind {
+            SurfaceKind::Sand => b.sand,
+            SurfaceKind::Grass if y == s => b.grass_block,
+            SurfaceKind::Grass => b.dirt,
+            SurfaceKind::Alpine => b.stone,
+            SurfaceKind::Snow if y > s - SNOW_DEPTH => b.snow_block,
+            SurfaceKind::Snow => b.stone,
+        }
+    }
+
+    /// The block of the far voxel whose lowest block is `lo` and which is `step` blocks tall, in a column whose
+    /// surface is `s` and top of `kind`. A voxel holding the surface block is the surface block; one wholly
+    /// below it is what its top block is, one wholly above it is what its bottom block is (water up to the sea
+    /// level over a sunken column, else air). `step` 1 is [`EarthGenerator::block_for`].
+    pub fn voxel_block(&self, lo: i32, step: i32, s: i32, kind: SurfaceKind) -> u32 {
+        if step <= 1 {
+            return self.block_for(lo, s, kind);
+        }
+        let top = i64::from(lo) + i64::from(step) - 1;
+        let surface = i64::from(s);
+        if i64::from(lo) <= surface && surface <= top {
+            self.block_for(s, s, kind)
+        } else if top < surface {
+            self.block_for(top as i32, s, kind)
+        } else {
+            self.block_for(lo, s, kind)
+        }
+    }
+
+    /// The voxel of a step-`step` sample containing height `y` (`y` itself for step 1) starts here.
+    pub fn voxel_floor(y: i32, step: i32) -> i32 {
+        if step <= 1 {
+            y
+        } else {
+            y.div_euclid(step) * step
+        }
+    }
+
+    /// The kind of top of the column at the point `(x, z)` whose surface block is `s`: by its elevation and the
+    /// latitude of the point itself (not of the world's origin).
+    pub fn surface_kind(&self, x: i32, z: i32, s: i32) -> SurfaceKind {
+        if s < self.sea_level {
+            return SurfaceKind::Sand;
+        }
+        let latitude = self
+            .field
+            .projection()
+            .to_lat_lon(f64::from(x) + 0.5, f64::from(z) + 0.5)
+            .lat;
+        SurfaceKind::of_column(s, latitude, self.sea_level, self.field.vertical())
     }
 
     /// The block a [`Fill`] stands for; `None` for `Mixed`.
@@ -276,7 +330,7 @@ impl EarthGenerator {
         let (ymin, ymax) = (i64::from(ymin), i64::from(ymax));
         let (s_lo, s_hi) = (i64::from(s_lo), i64::from(s_hi));
         let sea = i64::from(self.sea_level);
-        if ymax <= s_lo - 4 {
+        if ymax < s_lo - SOIL_DEPTH {
             Fill::Stone
         } else if ymin > s_hi && ymin >= sea {
             Fill::Air
@@ -404,7 +458,13 @@ impl EarthGenerator {
     }
 
     pub(super) fn block_core(&self, a: Access, [x, y, z]: [i32; 3], step: i32) -> Result<u32, Gap> {
-        Ok(self.block_for(y, self.surface_core(a, x, z, step)?))
+        let s = self.surface_core(a, x, z, step)?;
+        Ok(self.voxel_block(
+            Self::voxel_floor(y, step),
+            step,
+            s,
+            self.surface_kind(x, z, s),
+        ))
     }
 
     pub(super) fn column_core(
@@ -420,8 +480,9 @@ impl EarthGenerator {
             return Ok(None);
         }
         let s = self.surface_core(a, x, z, step)?;
+        let kind = self.surface_kind(x, z, s);
         for (i, &y) in ys.iter().enumerate() {
-            let block = self.block_for(y, s);
+            let block = self.voxel_block(Self::voxel_floor(y, step), step, s, kind);
             if stop(block) {
                 return Ok(Some((i, block)));
             }
@@ -444,12 +505,11 @@ impl EarthGenerator {
             zoom: self.zoom_for_step(step),
         };
         let (lo, hi) = self.range_of(a, r)?;
-        Ok(self.classify_heights(
-            min[1].min(max[1]),
-            min[1].max(max[1]),
-            self.vertical_block(lo),
-            self.vertical_block(hi),
-        ))
+        // The voxels the box touches, whole: a voxel is one block, whatever part of it the box holds.
+        let step = step.max(1);
+        let ymin = Self::voxel_floor(min[1].min(max[1]), step);
+        let ymax = Self::voxel_floor(min[1].max(max[1]), step).saturating_add(step - 1);
+        Ok(self.classify_heights(ymin, ymax, self.vertical_block(lo), self.vertical_block(hi)))
     }
 
     pub(super) fn node_core(
@@ -458,7 +518,9 @@ impl EarthGenerator {
         level: u32,
         [x, y, z]: [i32; 3],
     ) -> Result<Fill, Gap> {
-        let (min, max) = node_box(level, [x, y, z]);
+        let (min, mut max) = node_box(level, [x, y, z]);
+        // Its voxels are the `16 << level` blocks from `min`; the far face is only read for the columns.
+        max[1] = min[1].saturating_add((16_i32 << level.min(24)) - 1);
         self.box_core(a, min, max, 1 << level.min(24))
     }
 
@@ -482,9 +544,14 @@ impl EarthGenerator {
             return Ok(Some(id));
         }
         let surfaces = self.surfaces_of(a, r)?;
+        let kinds: Vec<SurfaceKind> = surfaces
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| self.surface_kind(r.x0 + (i & 15) as i32, r.z0 + (i >> 4) as i32, s))
+            .collect();
         for dy in 0..16 {
-            for (column, &s) in surfaces.iter().enumerate() {
-                out[dy << 8 | column] = self.block_for(y0 + dy as i32, s);
+            for (column, (&s, &kind)) in surfaces.iter().zip(&kinds).enumerate() {
+                out[dy << 8 | column] = self.block_for(y0 + dy as i32, s, kind);
             }
         }
         let first = out[0];
@@ -623,7 +690,7 @@ fn cube_rect(cube: SectionPos, zoom: u8) -> Rect {
 }
 
 /// The blocks of a far node, `min` to `max` inclusive of its far faces.
-fn node_box(level: u32, [x, y, z]: [i32; 3]) -> ([i32; 3], [i32; 3]) {
+pub(super) fn node_box(level: u32, [x, y, z]: [i32; 3]) -> ([i32; 3], [i32; 3]) {
     let side = 16_i64 << level.min(24);
     let at = |v: i32| -> i32 { (i64::from(v) * side).clamp(-(1 << 30), 1 << 30) as i32 };
     let min = [at(x), at(y), at(z)];

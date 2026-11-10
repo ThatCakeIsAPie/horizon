@@ -10,12 +10,15 @@
 //!   the far view reads at each level (it reads zoom `zoom_for_step(1 << level)` for nodes of that level),
 //!   ring by ring.
 //!
+//! * Tiles the far view found missing (`EarthGenerator::request_tiles`: its workers answer "later" and ask, and
+//!   never wait) are fetched first, ahead of the plan.
+//!
 //! A tile that fails is left alone for a while (doubling up to five minutes) so a dead server is not hammered;
 //! the generator's own blocking reads keep retrying what they need.
 use horizon_earth::{FetchError, LoadError, TileId};
 use horizon_world::cubic::custom::CustomCubicGenerator;
 use horizon_world::cubic::earth::EarthGenerator;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -137,6 +140,16 @@ impl Prefetcher {
         });
         let weak = Arc::downgrade(generator);
         let theirs = shared.clone();
+        // A request wakes the thread (taking the lock first, so a thread about to wait does not miss it).
+        let waking = Arc::downgrade(&shared);
+        generator
+            .earth_generator()?
+            .set_request_waker(Arc::new(move || {
+                if let Some(shared) = waking.upgrade() {
+                    let _wanted = lock(&shared.wanted);
+                    shared.wake.notify_all();
+                }
+            }));
         std::thread::Builder::new()
             .name("Earth tiles".into())
             .spawn(move || run(&theirs, &weak, gap))
@@ -205,12 +218,25 @@ fn run(shared: &Shared, generator: &Weak<CustomCubicGenerator>, gap: Duration) {
             return;
         }
         let now = Instant::now();
-        let todo: Vec<TileId> = plan(earth, &target)
+        let due = |id: &TileId| failures.get(id).is_none_or(|f| f.retry_at <= now);
+        let mut todo: VecDeque<TileId> = plan(earth, &target)
             .into_iter()
-            .filter(|id| failures.get(id).is_none_or(|f| f.retry_at <= now))
+            .filter(|id| due(id))
             .collect();
         let mut interrupted = false;
-        for id in todo {
+        loop {
+            // What the far view asked for since goes first.
+            let now = Instant::now();
+            for id in earth.take_requests().into_iter().rev() {
+                if earth.field().store().cached(id).is_none()
+                    && failures.get(&id).is_none_or(|f| f.retry_at <= now)
+                {
+                    todo.push_front(id);
+                }
+            }
+            let Some(id) = todo.pop_front() else {
+                break;
+            };
             if shared.stop.load(Ordering::SeqCst)
                 || earth.is_cancelled()
                 || lock(&shared.wanted).epoch != epoch

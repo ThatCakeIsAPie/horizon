@@ -16,6 +16,19 @@ use crate::cubic::custom::{BoxClass, CustomCubicGenerator};
 const LAT0: f64 = 45.0;
 const LON0: f64 = 7.0;
 
+/// The permanent snow line in metres, restated from the rule: 5,500 m to 30 degrees, then straight down to 0 m at
+/// 80 degrees.
+fn snow_line(latitude: f64) -> f64 {
+    let lat = latitude.abs();
+    if lat <= 30.0 {
+        5500.0
+    } else if lat >= 80.0 {
+        0.0
+    } else {
+        5500.0 - (lat - 30.0) * 110.0
+    }
+}
+
 /// A coast along `east = 0` (sea to the west, a long slope up to the east), ripples, and a 7 km spire 2.5 km
 /// east of the origin whose flanks are far steeper than one block per block.
 fn terrain(lat: f64, lon: f64) -> f64 {
@@ -65,27 +78,48 @@ impl Rig {
         field.surface_y_blocking(x, z, zoom).unwrap().unwrap()
     }
 
-    /// The terrain rule, restated.
-    fn expected(&self, y: i32, s: i32) -> u32 {
+    /// The latitude of the column at block row `z`, from the projection's own definition.
+    fn latitude(&self, z: i32) -> f64 {
+        LAT0 - ((f64::from(z) + 0.5) * self.settings.metres_per_block / EARTH_RADIUS_M).to_degrees()
+    }
+
+    /// The terrain rule, restated: what the column at row `z` whose surface is `s` has at height `y` (one-block
+    /// samples).
+    fn expected(&self, y: i32, s: i32, z: i32) -> u32 {
         let sea = self.settings.sea_level_y;
         let b = &self.blocks;
+        let elevation = f64::from(s - sea) * self.settings.metres_per_block
+            / self.settings.vertical_exaggeration;
+        let line = snow_line(self.latitude(z));
         if y <= s - 4 {
             b.stone
-        } else if s >= sea {
-            if y < s {
-                b.dirt
-            } else if y == s {
-                b.grass_block
-            } else {
-                b.air
-            }
-        } else if y <= s {
+        } else if y > s {
+            if s < sea && y < sea { b.water } else { b.air }
+        } else if s < sea {
             b.sand
-        } else if y < sea {
-            b.water
+        } else if elevation >= line {
+            if y >= s - 1 { b.snow_block } else { b.stone }
+        } else if elevation >= line - 1500.0 {
+            b.stone
+        } else if y == s {
+            b.grass_block
         } else {
-            b.air
+            b.dirt
         }
+    }
+
+    /// The far voxel from `lo` to `lo + step - 1` of the column at row `z`: the surface block when the voxel
+    /// holds the surface, else the block at its top (below the ground) or bottom (above it).
+    fn expected_voxel(&self, lo: i32, step: i32, s: i32, z: i32) -> u32 {
+        let top = lo + step - 1;
+        let at = if lo <= s && s <= top {
+            s
+        } else if top < s {
+            top
+        } else {
+            lo
+        };
+        self.expected(at, s, z)
     }
 
     fn expected_cube(&self, cube: SectionPos) -> Box<[u32; 4096]> {
@@ -94,7 +128,8 @@ impl Rig {
             for x in 0..16 {
                 let s = self.surface(cube.x * 16 + x, cube.z * 16 + z, 1);
                 for y in 0..16 {
-                    out[(y << 8 | z << 4 | x) as usize] = self.expected(cube.y * 16 + y, s);
+                    out[(y << 8 | z << 4 | x) as usize] =
+                        self.expected(cube.y * 16 + y, s, cube.z * 16 + z);
                 }
             }
         }
@@ -158,7 +193,15 @@ fn a_cube_follows_the_terrain_rule_at_the_coast_on_a_slope_and_deep_underground(
     assert_eq!(rig.check_cube(cube(3, -400, -7)), Some(rig.blocks.stone));
     assert_eq!(rig.check_cube(cube(3, 700, -7)), Some(rig.blocks.air));
     let b = rig.blocks;
-    for id in [b.air, b.stone, b.dirt, b.grass_block, b.sand, b.water] {
+    for id in [
+        b.air,
+        b.stone,
+        b.dirt,
+        b.grass_block,
+        b.sand,
+        b.water,
+        b.snow_block,
+    ] {
         assert!(seen.contains(&id), "no block {id} among the cubes tested");
     }
 }
@@ -247,7 +290,7 @@ fn blocks_in(
         for x in min[0]..=max[0] {
             let s = rig.surface(x, z, step);
             for y in min[1]..=max[1] {
-                set.insert(rig.expected(y, s));
+                set.insert(rig.expected(y, s, z));
             }
         }
     }
@@ -361,8 +404,9 @@ fn a_far_node_is_never_called_uniform_when_its_voxels_are_not() {
                         let (wx, wz) = (x0 + vx * step + step / 2, z0 + vz * step + step / 2);
                         let s = rig.surface(wx, wz, step);
                         for vy in 0..16 {
-                            let wy = y * side + vy * step + step / 2;
-                            let want = rig.expected(wy, s);
+                            let lo = y * side + vy * step;
+                            let wy = lo + step / 2;
+                            let want = rig.expected_voxel(lo, step, s, wz);
                             blocks.insert(want);
                             if (vx + vy + vz) % 7 == 0 {
                                 assert_eq!(
@@ -452,10 +496,11 @@ fn the_surface_is_exact_however_far_above_the_hint_it_is() {
     for hint in [0, -9000, 100, s, 20_000] {
         assert_eq!(custom.surface_y(x, z, hint), Some(s), "hint {hint}");
     }
-    // The generated column agrees: grass at the top, air above, soil below.
-    assert_eq!(custom.block_at(x, s, z, 1), rig.blocks.grass_block);
+    // The generated column agrees: snow at the top (7 km is above the snow line), air above, snow then stone below.
+    assert_eq!(custom.block_at(x, s, z, 1), rig.blocks.snow_block);
     assert_eq!(custom.block_at(x, s + 1, z, 1), rig.blocks.air);
-    assert_eq!(custom.block_at(x, s - 1, z, 1), rig.blocks.dirt);
+    assert_eq!(custom.block_at(x, s - 1, z, 1), rig.blocks.snow_block);
+    assert_eq!(custom.block_at(x, s - 2, z, 1), rig.blocks.stone);
 }
 
 #[test]
@@ -626,12 +671,12 @@ fn the_earth_kind_of_the_custom_generator_delegates_to_the_earth_generator() {
     assert_eq!(out[..], want[..]);
     assert_eq!(
         custom.block_at(-5, -20, 3, 1),
-        rig.expected(-20, rig.surface(-5, 3, 1))
+        rig.expected(-20, rig.surface(-5, 3, 1), 3)
     );
     // Coarse samples read their own zoom.
     assert_eq!(
         custom.block_at(500, 100, -64, 8),
-        rig.expected(100, rig.surface(500, -64, 8))
+        rig.expected_voxel(96, 8, rig.surface(500, -64, 8), -64)
     );
     // The ground at x = 500 is about 200 up: the first of these heights that is not rock is the sky.
     let found = custom.first_at_column(500, 3, &[-9000, 0, 100, 9000], 1, |blk| blk != b.stone);
@@ -721,4 +766,340 @@ fn settings_shape_the_world() {
         1,
     ));
     assert!(EarthGenerator::new(&settings, store, blocks).is_err());
+}
+
+// --- The surface: snow line, alpine band, far voxels -----------------------------------------------------------
+
+/// A generator over terrain whose elevation is `elevation(lat)` metres, with the origin at `lat0` degrees north,
+/// `metres_per_block` metres to a block and the sea at block 0.
+fn flat(
+    lat0: f64,
+    metres_per_block: f64,
+    elevation: impl Fn(f64) -> f64 + Send + Sync + 'static,
+) -> (EarthGenerator, EarthBlocks, TempDir) {
+    let mut settings = EarthSettings::at(lat0, LON0);
+    settings.metres_per_block = metres_per_block;
+    let dir = TempDir::new();
+    let store = Arc::new(TileStore::new(
+        dir.path(),
+        Arc::new(MemoryFetcher::new(move |lat, _| elevation(lat))),
+        4096,
+    ));
+    let blocks = EarthBlocks::from_registry(default_registry()).unwrap();
+    let g = EarthGenerator::new(&settings, store, blocks).unwrap();
+    (g, blocks, dir)
+}
+
+/// The blocks of the column at `(0, z)` from `s - 5` to `s + 2`, at one-block samples.
+fn column(g: &EarthGenerator, z: i32) -> (i32, Vec<u32>) {
+    let s = g.surface_y_blocking(0, z).unwrap();
+    let blocks = (s - 5..=s + 2)
+        .map(|y| g.block_at_blocking(0, y, z, 1))
+        .collect();
+    (s, blocks)
+}
+
+#[test]
+fn the_snow_line_falls_with_latitude_from_5500_m_at_30_to_nothing_at_80() {
+    use super::surface::{SurfaceKind, snow_line_m};
+    for (lat, line) in [
+        (0.0, 5500.0),
+        (30.0, 5500.0),
+        (-30.0, 5500.0),
+        (55.0, 2750.0),
+        (-55.0, 2750.0),
+        (45.0, 3850.0),
+        (80.0, 0.0),
+        (-85.0, 0.0),
+    ] {
+        assert!(
+            (snow_line_m(lat) - line).abs() < 1e-9,
+            "{lat}: {}",
+            snow_line_m(lat)
+        );
+        assert_eq!(snow_line(lat), line);
+    }
+    // At 45 degrees: grass to 2,350 m, bare stone to 3,850 m, snow from there.
+    let kind = |m| SurfaceKind::on_land(m, 45.0);
+    assert_eq!(kind(0.0), SurfaceKind::Grass);
+    assert_eq!(kind(2349.0), SurfaceKind::Grass);
+    assert_eq!(kind(2350.0), SurfaceKind::Alpine);
+    assert_eq!(kind(3849.0), SurfaceKind::Alpine);
+    assert_eq!(kind(3850.0), SurfaceKind::Snow);
+    assert_eq!(kind(8800.0), SurfaceKind::Snow);
+}
+
+#[test]
+fn a_column_is_grass_bare_stone_or_snow_by_elevation_and_latitude_and_sand_under_the_sea() {
+    // (origin latitude, elevation in metres, the top two blocks of the column from the surface down, and the one
+    // under them)
+    let cases = [
+        // Tropics: the line is 5,500 m, the band 4,000 to 5,500.
+        (10.0, 3999.0, "grass"),
+        (10.0, 4000.0, "alpine"),
+        (-10.0, 5499.0, "alpine"),
+        (-10.0, 5500.0, "snow"),
+        // 45 degrees: the line is 3,850 m.
+        (45.0, 100.0, "grass"),
+        (45.0, 2349.0, "grass"),
+        (45.0, 3000.0, "alpine"),
+        (45.0, 4000.0, "snow"),
+        // 70 degrees: the line is 1,100 m, the band from -400 m: all land above sea level is bare or snowy.
+        (70.0, 50.0, "alpine"),
+        (70.0, 1200.0, "snow"),
+        // Past 80 degrees there is snow down to the sea.
+        (82.0, 5.0, "snow"),
+        // Under the sea it is sand, whatever the latitude.
+        (45.0, -30.0, "sand"),
+        (82.0, -30.0, "sand"),
+    ];
+    for (lat, metres, want) in cases {
+        let (g, b, _dir) = flat(lat, 1.0, move |_| metres);
+        let (s, col) = column(&g, 0);
+        assert_eq!(s, metres.floor() as i32);
+        // From s - 5 to s + 2.
+        let at = |dy: i32| col[(dy + 5) as usize];
+        let (top, below) = match want {
+            "grass" => (b.grass_block, b.dirt),
+            "alpine" => (b.stone, b.stone),
+            "snow" => (b.snow_block, b.snow_block),
+            "sand" => (b.sand, b.sand),
+            _ => unreachable!(),
+        };
+        assert_eq!(at(0), top, "{lat} {metres}: top");
+        assert_eq!(at(-1), below, "{lat} {metres}: one under");
+        match want {
+            "grass" | "sand" => {
+                assert_eq!((at(-2), at(-3)), (below, below), "{lat} {metres}");
+                assert_eq!(at(-4), b.stone, "{lat} {metres}");
+            }
+            // Two blocks of snow, then stone.
+            "snow" => {
+                assert_eq!((at(-2), at(-3), at(-5)), (b.stone, b.stone, b.stone));
+            }
+            _ => assert!((-5..=0).all(|d| at(d) == b.stone)),
+        }
+        // Above the ground: air, or water up to the sea level over a sunken column.
+        assert_eq!(at(1), if s < 0 { b.water } else { b.air }, "{lat} {metres}");
+        assert_eq!(at(2), if s < -1 { b.water } else { b.air });
+    }
+}
+
+#[test]
+fn a_column_uses_its_own_latitude_not_the_origins() {
+    // 1,000 m to a block: a degree of latitude is about 111 blocks. Land 3,000 m high is block 3. At the origin
+    // (40 degrees north: line 4,400 m, band from 2,900 m) it is bare stone; 1,200 blocks south of it (about 29.2
+    // degrees: line 5,500 m, band from 4,000 m) it is grass; 400 blocks north (43.6 degrees) it is still bare.
+    let (g, b, _dir) = flat(40.0, 1000.0, |_| 3000.0);
+    assert_eq!(g.surface_y_blocking(0, 0), Some(3));
+    assert_eq!(g.block_at_blocking(0, 3, 0, 1), b.stone);
+    assert_eq!(g.block_at_blocking(0, 3, -400, 1), b.stone);
+    assert_eq!(g.block_at_blocking(0, 3, 1200, 1), b.grass_block);
+    // The far view reads the same: a voxel of 8 holding the surface.
+    assert_eq!(g.block_at_blocking(0, 0, 0, 8), b.stone);
+    assert_eq!(g.block_at_blocking(0, 0, 1200, 8), b.grass_block);
+    // And a cube agrees with the point queries across the change.
+    let mut out = Box::new([0; 4096]);
+    g.generate_blocking(cube(0, 0, 75), &mut out);
+    assert_eq!(out[3 << 8], b.grass_block);
+    g.generate_blocking(cube(0, 0, 0), &mut out);
+    assert_eq!(out[3 << 8], b.stone);
+}
+
+#[test]
+fn a_far_voxel_holding_the_surface_is_the_surface_block_of_each_kind_at_every_step() {
+    // Grass, sand, snow and bare stone, each from its own latitude and elevation.
+    let cases: [(f64, f64, fn(&EarthBlocks) -> u32); 4] = [
+        (45.0, 120.5, |b| b.grass_block),
+        (45.0, -37.5, |b| b.sand),
+        (20.0, 6100.5, |b| b.snow_block),
+        (45.0, 3000.5, |b| b.stone),
+    ];
+    for (lat, metres, surface_block) in cases {
+        let (g, b, _dir) = flat(lat, 1.0, move |_| metres);
+        let s = g.surface_y_blocking(5, 9).unwrap();
+        let want = surface_block(&b);
+        for step in [2, 8, 64] {
+            let lo = s.div_euclid(step) * step;
+            // Every height of the voxel that holds the surface asks for the same voxel.
+            for y in lo..lo + step {
+                assert_eq!(
+                    g.block_at_blocking(5, y, 9, step),
+                    want,
+                    "lat {lat}, {metres} m, step {step}, y {y} (surface {s})"
+                );
+            }
+            // Above it is air or water, below it ground, never the surface block's neighbour by accident.
+            let above = g.block_at_blocking(5, lo + step, 9, step);
+            assert_eq!(
+                above,
+                if s < 0 && lo + step < 0 {
+                    b.water
+                } else {
+                    b.air
+                }
+            );
+            let below = g.block_at_blocking(5, lo - step, 9, step);
+            assert_ne!(below, b.air);
+        }
+    }
+}
+
+#[test]
+fn the_far_blocks_along_a_smooth_slope_are_all_the_surface_material() {
+    // The old rule took the block at a voxel's own height, so grass, dirt and stone alternated along a slope.
+    // A gentle slope through the grass zone (up to about 700 m at 45 degrees, short of the spire: all below the alpine band at 2,350 m), seen at three steps.
+    let rig = rig();
+    let g = &rig.generator;
+    let mut seen_heights = std::collections::BTreeSet::new();
+    for step in [2, 8, 64] {
+        let zoom_step = step;
+        // The voxel columns of a row across the slope, from the coast eastwards, each at its own middle block.
+        for column in 0..(1000 / step) {
+            let x = 40 + column * step + step / 2;
+            let z = 16 + step / 2;
+            let s = rig.surface(x, z, zoom_step);
+            assert!(s > 0, "the slope starts above the sea");
+            // From well above the ground down to well below, a voxel at a time: the first that is not air.
+            let top = (s.div_euclid(step) + 3) * step;
+            let found = (0..8).find_map(|i| {
+                let lo = top - i * step;
+                let block = g.block_at_blocking(x, lo, z, step);
+                (block != rig.blocks.air).then_some((lo, block))
+            });
+            let (lo, block) = found.expect("the ground is within reach");
+            assert_eq!(
+                block, rig.blocks.grass_block,
+                "step {step}, column {x},{z}: the top voxel (from {lo}) over surface {s}"
+            );
+            assert!(lo <= s && s < lo + step, "the top voxel holds the surface");
+            seen_heights.insert(s.rem_euclid(step));
+        }
+    }
+    // The surface sat at many heights within its voxel, so the grid's phase was not what made it come out right.
+    assert!(seen_heights.len() > 8, "{seen_heights:?}");
+}
+
+#[test]
+fn step_one_is_the_old_rule_for_columns_below_the_alpine_band() {
+    // The rule before the surface depended on elevation: stone to s - 4, three dirt, grass, air; sand and water
+    // under the sea. Every column here is below 2,350 m at 45 degrees.
+    let rig = rig();
+    let g = &rig.generator;
+    let b = rig.blocks;
+    let old = |y: i32, s: i32| {
+        if y <= s - 4 {
+            b.stone
+        } else if s >= 0 {
+            match y.cmp(&s) {
+                std::cmp::Ordering::Less => b.dirt,
+                std::cmp::Ordering::Equal => b.grass_block,
+                std::cmp::Ordering::Greater => b.air,
+            }
+        } else if y <= s {
+            b.sand
+        } else if y < 0 {
+            b.water
+        } else {
+            b.air
+        }
+    };
+    let mut checked = 0;
+    for x in (-3000..=5000).step_by(97) {
+        for z in [-60, 5, 70] {
+            let s = rig.surface(x, z, 1);
+            if s as f64 >= 2349.0 {
+                continue;
+            }
+            for y in s - 6..=s + 3 {
+                assert_eq!(g.block_at_blocking(x, y, z, 1), old(y, s), "{x},{y},{z}");
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 150, "{checked} columns");
+}
+
+#[test]
+fn the_spire_has_every_kind_of_top_and_a_far_node_over_it_agrees_with_the_blocks() {
+    use super::surface::SurfaceKind;
+    let rig = rig();
+    let g = &rig.generator;
+    let mut kinds = std::collections::BTreeSet::new();
+    for x in (-2000..2600).step_by(20) {
+        let s = rig.surface(x, 0, 1);
+        kinds.insert(format!("{:?}", g.surface_kind(x, 0, s)));
+    }
+    for k in [
+        SurfaceKind::Grass,
+        SurfaceKind::Alpine,
+        SurfaceKind::Snow,
+        SurfaceKind::Sand,
+    ] {
+        assert!(
+            kinds.contains(&format!("{k:?}")),
+            "no {k:?} among {kinds:?}"
+        );
+    }
+    // A far node's columns, read at once, give each voxel the block a point query gives.
+    for level in [2u32, 4, 6] {
+        let step = 1i32 << level;
+        let side = 16 * step;
+        for x in [-3000 / side, 2200 / side, 2500 / side] {
+            let cols = loop {
+                match g.node_columns(level, x, -1) {
+                    Ok(c) => break c,
+                    Err(n) => n.tiles.iter().for_each(|&t| {
+                        rig.store.load(t).unwrap();
+                    }),
+                }
+            };
+            for i in (0..256).step_by(7) {
+                let (wx, wz) = (
+                    x * side + (i & 15) as i32 * step + step / 2,
+                    -side + (i >> 4) as i32 * step + step / 2,
+                );
+                let s = cols.surfaces[i];
+                assert_eq!(s, rig.surface(wx, wz, step));
+                for lo in [
+                    (s.div_euclid(step) - 1) * step,
+                    s.div_euclid(step) * step,
+                    (s.div_euclid(step) + 1) * step,
+                ] {
+                    assert_eq!(
+                        g.far_voxel(&cols, i, lo),
+                        g.block_at_blocking(wx, lo + step / 2, wz, step),
+                        "level {level} column {wx},{wz} voxel {lo}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_far_node_that_lacks_tiles_says_which_and_they_can_be_requested_once() {
+    let rig = rig();
+    let g = &rig.generator;
+    let err = g.node_columns(3, 0, 0).unwrap_err();
+    assert!(!err.tiles.is_empty());
+    assert_eq!(err.tiles, g.missing_tiles_for_node(3, 0, 0));
+    assert_eq!(rig.fetcher.fetch_count(), 0);
+    // Requests are listed once, in order, and taken once; only the first wakes the taker.
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let w = woken.clone();
+    g.set_request_waker(Arc::new(move || {
+        w.fetch_add(1, Ordering::SeqCst);
+    }));
+    g.request_tiles(&err.tiles);
+    g.request_tiles(&err.tiles);
+    g.request_tiles(&[]);
+    assert_eq!(woken.load(Ordering::SeqCst), 1);
+    assert_eq!(g.take_requests(), err.tiles);
+    assert!(g.take_requests().is_empty());
+    // With the tiles in, the same read answers.
+    for &t in &err.tiles {
+        rig.store.load(t).unwrap();
+    }
+    assert!(g.node_columns(3, 0, 0).is_ok());
 }
