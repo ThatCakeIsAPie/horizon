@@ -38,3 +38,10 @@ pub const STUN_SERVERS: &[&str] = &["stun.cloudflare.com:3478", "stun.l.google.c
 /// Play with Friends' troubleshooting page, shown to hosts nobody can reach.
 pub const FRIENDS_HELP: &str =
     "https://github.com/horizon-rust/horizon/blob/main/docs/play-with-friends.md#troubleshooting";
+
+/// The public elevation tile source Earth's settings page offers as the tile address (AWS Terrain
+/// Tiles, Mapzen's open dataset, terrarium format; docs/earth.md). A template: `{z}`, `{x}` and
+/// `{y}` stand for the tile. Offering it downloads nothing: the player turns downloads on, which
+/// approves its host.
+pub const EARTH_TILES: &str =
+    "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";

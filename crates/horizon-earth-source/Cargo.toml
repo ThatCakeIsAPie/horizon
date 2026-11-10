@@ -1,0 +1,14 @@
+[package]
+name = "horizon-earth-source"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The elevation tile server Earth's settings page offers, from the list of built-in addresses (docs/earth.md)"
+
+[dependencies]
+horizon-addresses = { path = "../horizon-addresses" }
+horizon-platform = { path = "../horizon-platform" }
+
+[lints]
+workspace = true

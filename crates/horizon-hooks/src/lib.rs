@@ -92,6 +92,15 @@ pub trait Hooks: Sync {
     /// automated ones included ([`Client::automated`]); never for a dedicated server.
     fn client_started(&self, _client: &Client) {}
 
+    /// The address template of an elevation tile server for Earth worlds (`{z}`, `{x}`, `{y}` stand
+    /// for the tile), which Create World's Earth page offers as the world's tile address. It only
+    /// fills the box: nothing is downloaded until the player turns downloads on, which approves
+    /// the address's host. The first hook that offers one is used; without one the box starts
+    /// empty (the engine holds no built-in address, docs/layers.md#built-in-addresses).
+    fn earth_tile_address(&self) -> Option<&'static str> {
+        None
+    }
+
     /// What the player is doing, for a status shown outside the game (Discord's): called when it
     /// changes, not every frame. Splitscreen: the first player's only.
     fn activity(&self, _now: Activity) {}
@@ -269,6 +278,11 @@ pub mod engine {
                 h.activity(now);
             }
         }
+    }
+
+    /// [`Hooks::earth_tile_address`]: the first hook that offers one.
+    pub fn earth_tile_address() -> Option<&'static str> {
+        all().iter().find_map(|h| h.earth_tile_address())
     }
 
     /// [`Hooks::shutdown`].

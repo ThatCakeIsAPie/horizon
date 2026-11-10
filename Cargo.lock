@@ -1679,6 +1679,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-earth-source"
+version = "0.1.0"
+dependencies = [
+ "horizon-addresses",
+ "horizon-platform",
+]
+
+[[package]]
 name = "horizon-friends"
 version = "0.1.0"
 dependencies = [
@@ -1813,6 +1821,7 @@ name = "horizon-official"
 version = "0.1.0"
 dependencies = [
  "horizon-discord",
+ "horizon-earth-source",
  "horizon-friends",
  "horizon-game",
  "horizon-heartbeat",
