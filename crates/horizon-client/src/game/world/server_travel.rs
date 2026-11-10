@@ -417,7 +417,8 @@ impl Game<'_> {
 
     /// `EntityTravelToDimensionEvent`: whether the entity `id` (the network
     /// id its handle names) may travel to the level `to`, asked before
-    /// anything of it moves. Only a server asks, and only when a mod listens.
+    /// anything of it moves. A Horizon-only level refuses a vanilla client's
+    /// player first; then only a server asks, and only when a mod listens.
     pub(super) fn entity_may_travel(&mut self, id: u32, to: Dim, cause: TravelCause) -> bool {
         self.entity_tree_may_travel(id, to, cause, &mut Vec::new())
     }
@@ -429,6 +430,9 @@ impl Game<'_> {
         cause: TravelCause,
         visited: &mut Vec<u32>,
     ) -> bool {
+        if self.refuse_level(id, to) {
+            return false;
+        }
         if !self.native_authoritative()
             || !mod_api::__private::listened(mod_api::HookId::EntityTravelToDimension)
         {
@@ -2105,6 +2109,7 @@ mod credits_respawn_tests {
                 properties: Vec::new(),
                 info: ClientInformation::new(2),
                 brand: "test".into(),
+                wide_positions: false,
                 sender: PlayerSender::new(tx, Arc::default()),
                 latency: Arc::new(AtomicI32::new(0)),
                 address: "127.0.0.1:25565".parse().unwrap(),

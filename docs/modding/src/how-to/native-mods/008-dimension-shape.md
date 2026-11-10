@@ -127,6 +127,24 @@ It is false for an unregistered dimension and for an entity that cannot change l
 orb, a projectile); a fake player stays where it is. Nothing builds a platform at the destination, so look for the
 ground first, or place one.
 
+### Horizon-only levels
+
+Set `DimensionSettings::horizon_only` for a level that only Horizon clients may enter. When a client
+connects to a Horizon server, the two agree on wide positions; a vanilla client, or a Horizon client
+too old to agree, does not. Such a client's player is refused the level and told why in their chat:
+
+- A portal or a teleport (`/tp`, `entity.teleport_to_level`) leaves them where they are. The
+  teleport still answers that it was taken, as a teleport a mod cancels does.
+- A respawn point in the level (a bed, an anchor or a forced point) can't be used: they respawn
+  at the world spawn, as vanilla does when a respawn point can't be used, and keep the point. A
+  respawn a mod moves into the level stays at the point the server found.
+- A player saved in the level is disconnected as they join, with the same message. Their save
+  keeps the level, so they return to it with a client that may enter.
+
+The refusal comes before `entity_travel_to_dimension`, which is not asked for a refused player.
+Ask first with `player.can_enter(host, level)`: `Err(LevelRefusal::HorizonOnly)` is a refusal,
+`Err(LevelRefusal::Unavailable)` a player or level that is gone.
+
 ### Sea level
 
 `level.sea_level(host)` reads `Level.getSeaLevel`: 63 in the Overworld, 32 in the Nether, 0 in the End. For a level of

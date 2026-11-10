@@ -1235,7 +1235,7 @@ pub(super) fn make_streaming(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// A world whose level.dat does not read but whose level.dat_old does: only the
@@ -1287,6 +1287,7 @@ mod tests {
             stem: stem.into(),
             dimension_type: "{}".into(),
             sea_level,
+            horizon_only: false,
         };
         let mods = [
             level(
@@ -1540,6 +1541,7 @@ mod tests {
                 r#"{"min_y":-128,"height":448,"logical_height":320,"has_skylight":false,"has_ceiling":true}"#
                     .into(),
             sea_level: None,
+            horizon_only: false,
         };
         let (overrides, _) = worldgen_overrides_over(&[pocket], &[], |_| true);
         let shapes = shapes_of(&overrides);
@@ -1550,6 +1552,24 @@ mod tests {
         );
         assert_eq!(shapes.dimension_type("test:pocket"), "test:pocket");
         assert_eq!(shapes.overworld, LevelShape::OVERWORLD);
+    }
+
+    /// The process-wide mod levels the ignored tests share, installed once:
+    /// `test:pocket` on `test:floor` terrain, and `test:wide`, Horizon-only.
+    pub(in crate::game) fn install_test_levels() {
+        use horizon_world::worldgen::overrides::{ModDimension, install_mod_dimensions};
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let level = |id: &str, horizon_only| ModDimension {
+                id: id.into(),
+                stem: format!(r#"{{"type":"{id}","generator":{{"type":"test:floor"}}}}"#),
+                dimension_type: r#"{"min_y":-128,"height":448,"logical_height":448}"#.into(),
+                sea_level: None,
+                horizon_only,
+            };
+            install_mod_dimensions(vec![level("test:pocket", false), level("test:wide", true)])
+                .unwrap();
+        });
     }
 
     /// A registered level's stem finds its generator through the world's
@@ -1563,7 +1583,6 @@ mod tests {
             mod_generators::{
                 ChunkAccess, ModChunkGenerator, ModChunkGenerators, install_mod_chunk_generators,
             },
-            overrides::{ModDimension, install_mod_dimensions},
         };
         struct Floor;
         impl ModChunkGenerator for Floor {
@@ -1572,13 +1591,7 @@ mod tests {
                 chunk.set_block([0, chunk.min_y(), 0], stone);
             }
         }
-        install_mod_dimensions(vec![ModDimension {
-            id: "test:pocket".into(),
-            stem: r#"{"type":"test:pocket","generator":{"type":"test:floor"}}"#.into(),
-            dimension_type: r#"{"min_y":-128,"height":448,"logical_height":448}"#.into(),
-            sea_level: None,
-        }])
-        .unwrap();
+        install_test_levels();
         let floor: Arc<dyn ModChunkGenerator> = Arc::new(Floor);
         install_mod_chunk_generators(ModChunkGenerators::from([("test:floor".to_owned(), floor)]))
             .map_err(|_| "installed twice")

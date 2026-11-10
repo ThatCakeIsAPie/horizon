@@ -1323,6 +1323,7 @@ mod tests {
                 r#"{"min_y":-128,"height":448,"attributes":{"minecraft:gameplay/fast_lava":true}}"#
                     .into(),
             sea_level: None,
+            horizon_only: false,
         };
         mod_dimension_types(
             &[dimension("test:pocket"), dimension("test:packed")],

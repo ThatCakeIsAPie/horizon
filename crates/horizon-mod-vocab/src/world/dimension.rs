@@ -82,6 +82,26 @@ impl BiomePoint {
     }
 }
 
+/// Why a player may not enter a level, as `PlayerRef::can_enter` answers. A
+/// portal, a teleport or a mod's respawn into it leaves a refused player where
+/// they are, told why in their chat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum LevelRefusal {
+    /// The level is [`DimensionSettings::horizon_only`] and the player's
+    /// client did not agree on wide positions: vanilla's, or an older Horizon.
+    HorizonOnly,
+    /// The player or the level is gone, or this side cannot tell.
+    Unavailable,
+}
+
+impl crate::NoBackend for LevelRefusal {
+    fn no_backend() -> Self {
+        Self::Unavailable
+    }
+}
+
 /// What a mod's dimension is made of. The default is the Overworld's shape
 /// and terrain over plains; the parts of a dimension type not named here are
 /// the Overworld's.
@@ -190,6 +210,10 @@ pub struct DimensionSettings {
     /// schedule only, no clock), `end` (the End's timeline and clock) or `none`. They set the
     /// level's sky over the day, whether monsters burn in daylight, and the clock `/time` reads.
     pub day_cycle: String,
+    /// Only Horizon clients that agreed on wide positions may enter the level: a vanilla
+    /// client's player is refused with a message, as [`LevelRefusal::HorizonOnly`] says.
+    /// Set it for a level whose blocks a vanilla client could not be sent.
+    pub horizon_only: bool,
 }
 
 impl Default for DimensionSettings {
@@ -238,6 +262,7 @@ impl Default for DimensionSettings {
             fog_color: None,
             cloud_height: None,
             day_cycle: "overworld".into(),
+            horizon_only: false,
         }
     }
 }

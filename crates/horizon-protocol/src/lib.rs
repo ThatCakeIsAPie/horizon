@@ -28,6 +28,7 @@ pub mod secure_chat;
 pub mod server_status;
 pub mod servers;
 pub mod text;
+pub mod wide_positions;
 
 /// SharedConstants.getProtocolVersion().
 pub const PROTOCOL_VERSION: i32 = horizon_core::version::PROTOCOL_VERSION;

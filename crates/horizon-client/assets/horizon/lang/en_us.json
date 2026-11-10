@@ -492,6 +492,7 @@
   "horizon.friends.title": "Play with Friends",
   "horizon.friends.troubleshooting": "Troubleshooting...",
   "horizon.friends.wrong_code": "Someone tried a wrong code.",
+  "horizon.level.horizon_only": "Only Horizon can enter %s: this game can't show its blocks.",
   "horizon.moderation.chat_filter": "the chat filter",
   "horizon.moderation.duration.day": "%s day",
   "horizon.moderation.duration.days": "%s days",

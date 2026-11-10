@@ -288,6 +288,12 @@ pub trait PlayersBackend {
     /// no known connection has an empty one. None for a stale or unavailable player.
     #[access(WorldOnly)]
     fn player_client_brand(&self, player: PlayerRef) -> Option<String>;
+    /// Side: server.
+    /// Whether the player may enter `level`: a [`DimensionSettings::horizon_only`] level
+    /// refuses a player whose client did not agree on wide positions. The acting player
+    /// with no known connection may enter. A stale player or level is `Unavailable`.
+    #[access(WorldOnly)]
+    fn player_can_enter(&self, player: PlayerRef, level: LevelRef) -> Result<(), LevelRefusal>;
 }
 /// The handles' client reads of the `players` area, implemented by the game and reached through [`Backend`].
 // hidden: a handle's backend, reached through `Backend`; mods call the handle, never this trait

@@ -28,6 +28,7 @@ pub mod forwarding;
 pub mod guest;
 pub mod guest_list;
 pub mod handoff;
+pub mod horizon_only;
 pub mod hub;
 pub mod import;
 mod io_pool;
@@ -85,6 +86,8 @@ pub struct Joined {
     pub properties: Vec<horizon_protocol::packets::login::Property>,
     pub info: ClientInformation,
     pub brand: String,
+    /// The client agreed on wide positions (horizon_protocol::wide_positions).
+    pub wide_positions: bool,
     pub sender: PlayerSender,
     /// Smoothed keep-alive round trip in milliseconds.
     pub latency: Arc<AtomicI32>,

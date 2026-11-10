@@ -201,6 +201,7 @@ mod tests {
                 r#"{"min_y":-128,"height":448,"logical_height":448,"has_skylight":true,"has_ceiling":false}"#
                     .into(),
             sea_level: None,
+            horizon_only: false,
         };
         let (overrides, _) = crate::datapack::worldgen_overrides_over(&[pocket], &[], |_| true);
         let height = overrides.level_height("test:pocket").unwrap();

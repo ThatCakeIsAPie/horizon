@@ -14,7 +14,16 @@ impl Game<'_> {
         if !host.hub.guests[i].dead {
             return;
         }
-        let uuid = host.hub.guests[i].uuid;
+        let (uuid, entity) = (host.hub.guests[i].uuid, host.hub.guests[i].entity_id as u32);
+        let server = self.options.dedicated.is_some();
+        // A point in a Horizon-only level the player's client may not enter is
+        // unusable: the world spawn, as for a point vanilla can't use. The
+        // point stays theirs for a client that may.
+        let saved_level = host.hub.guests[i]
+            .respawn_elsewhere
+            .as_ref()
+            .map(|saved| RespawnConfig::from_saved(saved).dim);
+        let refused = server && saved_level.is_some_and(|dim| self.refuse_level(entity, dim));
         // PlayerList.respawn replaces the player, retaining only opted-in data.
         if let Some(attachments) = self
             .lan
@@ -46,12 +55,11 @@ impl Game<'_> {
         // point's level: the Overworld, where the world spawn and beds are,
         // or another one's anchor or forced point, which its block resolves
         // once the level has loaded around it.
-        let server = self.options.dedicated.is_some();
         let own = host.hub.guests[i]
             .respawn_elsewhere
             .as_ref()
             .map(RespawnConfig::from_saved);
-        let elsewhere = own.filter(|_| server);
+        let elsewhere = own.filter(|_| server && !refused);
         // In the window's world a guest has no level of its own to wait in:
         // its bed is resolved at once when its chunk is there, else it
         // comes back on the bed.

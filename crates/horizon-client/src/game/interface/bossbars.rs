@@ -807,6 +807,7 @@ pub(super) mod audience_tests {
                 properties: Vec::new(),
                 info: ClientInformation::new(8),
                 brand: String::new(),
+                wide_positions: false,
                 sender: PlayerSender::new(tx, Arc::default()),
                 latency: Arc::default(),
                 address: ([127, 0, 0, 1], 1).into(),

@@ -1145,6 +1145,13 @@ fn configure(
                             data,
                         }))?;
                     }
+                    // And offer the wide-position forms; the server answers when it agrees.
+                    reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                        channel: horizon_protocol::wide_positions::CHANNEL.into(),
+                        data: horizon_protocol::wide_positions::encode(
+                            horizon_protocol::wide_positions::VERSION,
+                        ),
+                    }))?;
                 }
                 receive_brand(&p, send);
             }
@@ -1560,6 +1567,7 @@ mod tests {
                 )
                 .unwrap();
             let mut declared_mods = false;
+            let mut offered = None;
             loop {
                 let (id, body) = server.recv().unwrap();
                 match cfg::Serverbound::decode(id, &body).unwrap() {
@@ -1568,11 +1576,21 @@ mod tests {
                     {
                         declared_mods = true;
                     }
+                    cfg::Serverbound::CustomPayload(p)
+                        if p.channel == horizon_protocol::wide_positions::CHANNEL =>
+                    {
+                        offered = horizon_protocol::wide_positions::decode(&p.data);
+                    }
                     cfg::Serverbound::SelectKnownPacks(_) => break,
                     _ => {}
                 }
             }
             assert_eq!(declared_mods, server_brand == "horizon");
+            // Wide positions are offered only to a Horizon server, at this build's version.
+            assert_eq!(
+                offered,
+                (server_brand == "horizon").then_some(horizon_protocol::wide_positions::VERSION)
+            );
             server
                 .send(&cfg::Clientbound::FinishConfiguration(Empty).encode())
                 .unwrap();

@@ -1199,6 +1199,7 @@ mod tests {
             stem: r#"{"type":"test:pocket"}"#.into(),
             dimension_type: r#"{"min_y":-128,"height":448,"logical_height":448}"#.into(),
             sea_level: None,
+            horizon_only: false,
         }];
         let height = |packs: &[&DataPack]| {
             let (o, _) = worldgen_overrides_over(&mods, packs, |_| true);

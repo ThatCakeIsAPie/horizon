@@ -128,6 +128,7 @@ struct GuestInit {
     properties: Vec<horizon_protocol::packets::login::Property>,
     info: ClientInformation,
     brand: String,
+    wide_positions: bool,
     sender: PlayerSender,
     latency: Arc<AtomicI32>,
     address: std::net::SocketAddr,
@@ -168,6 +169,9 @@ pub struct Guest {
     pub latency: Arc<AtomicI32>,
     pub info: ClientInformation,
     pub brand: String,
+    /// Its client agreed on wide positions (horizon_protocol::wide_positions):
+    /// it may enter a Horizon-only level.
+    pub wide_positions: bool,
     /// The chunk radius this client is sent.
     pub view_distance: i32,
     pub position: [f64; 3],
@@ -500,6 +504,7 @@ impl Guest {
             properties,
             info,
             brand,
+            wide_positions,
             sender,
             latency,
             address,
@@ -514,6 +519,7 @@ impl Guest {
                 properties,
                 info,
                 brand,
+                wide_positions,
                 sender,
                 latency,
                 address,
@@ -540,6 +546,7 @@ impl Guest {
             properties: Vec::new(),
             info: ClientInformation::new(2),
             brand: String::new(),
+            wide_positions: false,
             sender: PlayerSender::disabled(),
             latency: Arc::default(),
             address: ([0, 0, 0, 0], 0).into(),
@@ -618,6 +625,7 @@ impl Guest {
             view_distance: i32::from(j.info.view_distance).max(2).min(view_distance),
             info: j.info,
             brand: j.brand,
+            wide_positions: j.wide_positions,
             position,
             previous_position: position,
             yaw: 0.0,
@@ -895,6 +903,16 @@ impl Guest {
     /// extensions, such as a native mod's particle (`Particle::horizon_only`).
     pub fn is_horizon(&self) -> bool {
         self.brand == "horizon"
+    }
+    /// Whether the player may be sent into the level `id`: a Horizon-only one
+    /// (`overrides::horizon_only`) takes only a client that agreed on wide
+    /// positions, or a fake player, which has no client to show it.
+    pub fn may_enter(&self, id: &str) -> bool {
+        self.may_enter_level(horizon_world::worldgen::overrides::horizon_only(id))
+    }
+    /// [`Self::may_enter`] for a level that is `horizon_only` or not.
+    fn may_enter_level(&self, horizon_only: bool) -> bool {
+        !horizon_only || self.wide_positions || self.kind == GuestKind::Fake
     }
     /// `Player.getDesiredPose`: sleeping, gliding, then the body's own pose
     /// (swimming, crawling, crouching) once its server tick has run.
@@ -2235,6 +2253,7 @@ mod tests {
                 properties: Vec::new(),
                 info: ClientInformation::new(8),
                 brand: String::new(),
+                wide_positions: false,
                 sender: PlayerSender::new(tx, Arc::new(std::sync::atomic::AtomicUsize::new(0))),
                 latency: Arc::new(AtomicI32::new(0)),
                 address: "127.0.0.1:1".parse().unwrap(),
@@ -2244,6 +2263,22 @@ mod tests {
             position,
             10,
         )
+    }
+
+    #[test]
+    fn a_horizon_only_level_takes_only_wide_clients_and_fake_players() {
+        let mut vanilla = guest_at([0.0; 3]);
+        assert!(vanilla.may_enter_level(false));
+        assert!(!vanilla.may_enter_level(true));
+        vanilla.wide_positions = true;
+        assert!(vanilla.may_enter_level(true));
+        let mut fake = guest_at([0.0; 3]);
+        fake.kind = GuestKind::Fake;
+        assert!(fake.may_enter_level(true));
+        // The vanilla levels are never Horizon-only.
+        assert!(!horizon_world::worldgen::overrides::horizon_only(
+            "minecraft:the_nether"
+        ));
     }
 
     #[test]

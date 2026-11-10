@@ -3538,7 +3538,7 @@ impl Game<'_> {
         let Some(host) = self.lan.as_mut() else {
             return;
         };
-        host.hub.place_new_player(conn, &mut ctx);
+        host.hub.place_joining_player(conn, &mut ctx);
         self.bind_player_attachments(conn, false);
         if elsewhere && let Err(e) = self.enter_level(back) {
             log::error!("could not reopen {}: {e}", back.id());
@@ -4318,6 +4318,7 @@ mod tests {
                 properties: Vec::new(),
                 info: horizon_protocol::packets::configuration::ClientInformation::new(8),
                 brand: String::new(),
+                wide_positions: false,
                 sender: PlayerSender::new(tx, Arc::default()),
                 latency: Arc::new(AtomicI32::new(0)),
                 address: "127.0.0.1:1".parse().unwrap(),
@@ -5130,6 +5131,7 @@ mod tests {
                             properties: Vec::new(),
                             info: ClientInformation::new(8),
                             brand: String::new(),
+                            wide_positions: false,
                             sender: PlayerSender::new(tx, Arc::default()),
                             latency: Arc::new(AtomicI32::new(0)),
                             address: "127.0.0.1:1".parse().unwrap(),
@@ -5360,6 +5362,7 @@ mod tests {
                     properties: Vec::new(),
                     info: ClientInformation::new(8),
                     brand: String::new(),
+                    wide_positions: false,
                     sender: PlayerSender::new(tx, Arc::new(AtomicUsize::new(0))),
                     latency: Arc::new(AtomicI32::new(0)),
                     address: "127.0.0.1:1".parse().unwrap(),
@@ -5637,6 +5640,7 @@ pub(crate) mod world_spawn_sync_tests {
                 properties: Vec::new(),
                 info: horizon_protocol::packets::configuration::ClientInformation::new(2),
                 brand: String::new(),
+                wide_positions: false,
                 sender: PlayerSender::new(tx, Arc::default()),
                 latency: Arc::new(AtomicI32::new(0)),
                 address: "127.0.0.1:1".parse().unwrap(),
@@ -5888,6 +5892,7 @@ mod mob_pickup_sync_tests {
                 properties: Vec::new(),
                 info: horizon_protocol::packets::configuration::ClientInformation::new(2),
                 brand: String::new(),
+                wide_positions: false,
                 sender: PlayerSender::new(tx, Arc::default()),
                 latency: Arc::new(AtomicI32::new(0)),
                 address: "127.0.0.1:1".parse().unwrap(),
@@ -5993,6 +5998,7 @@ mod mob_swing_sync_tests {
                 properties: Vec::new(),
                 info: horizon_protocol::packets::configuration::ClientInformation::new(2),
                 brand: String::new(),
+                wide_positions: false,
                 sender: PlayerSender::new(tx, Arc::default()),
                 latency: Arc::new(AtomicI32::new(0)),
                 address: "127.0.0.1:1".parse().unwrap(),

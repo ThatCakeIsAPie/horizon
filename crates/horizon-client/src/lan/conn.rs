@@ -976,6 +976,8 @@ struct Parts {
     info: ClientInformation,
     brand: String,
     datapack_offer: Option<Vec<u8>>,
+    /// The client agreed on wide positions (horizon_protocol::wide_positions).
+    wide_positions: bool,
 }
 
 fn login_and_configure(
@@ -1068,6 +1070,7 @@ fn login_and_configure(
     )?;
     let mut info = ClientInformation::new(10);
     let mut brand = String::from("vanilla");
+    let mut wide_positions = false;
     let known_pack = loop {
         let (id, payload) = c.recv().map_err(e)?;
         match cfg::Serverbound::decode(id, &payload).map_err(e)? {
@@ -1108,6 +1111,28 @@ fn login_and_configure(
                 if p.channel == crate::datapack_net::OFFER_CHANNEL =>
             {
                 datapack_offer = Some(p.data);
+            }
+            // A Horizon client offers its wide-position forms after our brand;
+            // agreeing is answering (horizon_protocol::wide_positions).
+            cfg::Serverbound::CustomPayload(p)
+                if p.channel == horizon_protocol::wide_positions::CHANNEL =>
+            {
+                if brand == "horizon"
+                    && !wide_positions
+                    && horizon_protocol::wide_positions::decode(&p.data)
+                        .is_some_and(horizon_protocol::wide_positions::accepts)
+                {
+                    wide_positions = true;
+                    send(
+                        c,
+                        cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                            channel: horizon_protocol::wide_positions::CHANNEL.into(),
+                            data: horizon_protocol::wide_positions::encode(
+                                horizon_protocol::wide_positions::VERSION,
+                            ),
+                        }),
+                    )?;
+                }
             }
             cfg::Serverbound::SelectKnownPacks(p) => break p.packs == vec![core.clone()],
             _ => {}
@@ -1289,6 +1314,7 @@ fn login_and_configure(
         info,
         brand,
         datapack_offer,
+        wide_positions,
     }))
 }
 
@@ -1548,6 +1574,7 @@ fn play(
         properties: parts.properties,
         info: parts.info,
         brand: parts.brand,
+        wide_positions: parts.wide_positions,
         sender,
         latency,
         address,
@@ -2108,6 +2135,15 @@ mod tests {
 
     #[test]
     fn vanilla_configuration_does_not_disclose_horizon_mods() {
+        // The mod list is checked on every payload the client hears.
+        assert_eq!(wide_positions_after("vanilla", None), (false, false));
+    }
+
+    /// Configures one client that says `brand` and sends `offer` on the wide-position channel:
+    /// whether the server answered it, and whether the joined player has the capability. Only a
+    /// Horizon client hears the server's mod list.
+    fn wide_positions_after(brand: &str, offer: Option<Vec<u8>>) -> (bool, bool) {
+        use horizon_protocol::{mod_list, wide_positions};
         let config = crate::lan::NetConfig {
             announce: false,
             listen: false,
@@ -2122,20 +2158,31 @@ mod tests {
         c.send(&login::Serverbound::LoginAcknowledged(horizon_protocol::packets::Empty).encode())
             .unwrap();
         let mut data = horizon_protocol::buf::Writer::new();
-        data.string("vanilla");
-        c.send(
-            &cfg::Serverbound::CustomPayload(cfg::CustomPayload {
-                channel: "minecraft:brand".into(),
-                data: data.data,
+        data.string(brand);
+        let payload = |channel: &str, data: Vec<u8>| {
+            cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                channel: channel.into(),
+                data,
             })
-            .encode(),
-        )
-        .unwrap();
+            .encode()
+        };
+        c.send(&payload("minecraft:brand", data.data)).unwrap();
+        if let Some(offer) = offer {
+            c.send(&payload(wide_positions::CHANNEL, offer)).unwrap();
+        }
+        let mut answered = false;
         loop {
             let (id, payload) = c.recv().unwrap();
             match cfg::Clientbound::decode(id, &payload).unwrap() {
-                cfg::Clientbound::CustomPayload(p) => {
-                    assert_ne!(p.channel, horizon_protocol::mod_list::CHANNEL);
+                cfg::Clientbound::CustomPayload(p) if p.channel == mod_list::CHANNEL => {
+                    assert_eq!(brand, "horizon", "a mod list reached a {brand} client");
+                }
+                cfg::Clientbound::CustomPayload(p) if p.channel == wide_positions::CHANNEL => {
+                    assert_eq!(
+                        wide_positions::decode(&p.data),
+                        Some(wide_positions::VERSION)
+                    );
+                    answered = true;
                 }
                 cfg::Clientbound::SelectKnownPacks(p) => {
                     c.send(&cfg::Serverbound::SelectKnownPacks(p).encode())
@@ -2152,6 +2199,36 @@ mod tests {
                 }
                 _ => {}
             }
+        }
+        loop {
+            let event = lan.events.recv_timeout(Duration::from_secs(10));
+            if let crate::lan::NetEvent::Joined(j) = event.expect("the player joins") {
+                return (answered, j.wide_positions);
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_horizon_client_offering_this_version_gets_wide_positions() {
+        use horizon_protocol::wide_positions::{VERSION, encode};
+        assert_eq!(
+            wide_positions_after("horizon", Some(encode(VERSION))),
+            (true, true)
+        );
+        // Unanswered, and not disconnected: a vanilla client (it never offers, and its offer
+        // would not count), a version this build doesn't read, a Horizon client that never
+        // offers, and an offer that isn't exactly a version.
+        for (brand, offer) in [
+            ("vanilla", Some(encode(VERSION))),
+            ("horizon", Some(encode(VERSION + 1))),
+            ("horizon", None),
+            ("horizon", Some(vec![])),
+        ] {
+            assert_eq!(
+                wide_positions_after(brand, offer),
+                (false, false),
+                "{brand}"
+            );
         }
     }
 

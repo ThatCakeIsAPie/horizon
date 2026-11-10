@@ -20,7 +20,9 @@ pub trait Hooks {
     /// with its own passengers; it does not veto the vehicle's travel. An entity
     /// discarded during a callback never travels. A falling block is held out of the level while it
     /// ticks, so its handle reads nothing yet. A respawn and a world's join
-    /// are not travel; the return from the End credits is `end_portal`.
+    /// are not travel; the return from the End credits is `end_portal`. A
+    /// Horizon-only level refuses a vanilla client's player before this is
+    /// asked (`LevelRefusal::HorizonOnly`).
     /// Server-side. Diverges
     /// from upstream: replaces `player_portal`, which covered only server
     /// players through portals.

@@ -61,14 +61,14 @@ impl Game<'_> {
         if !mod_api::__private::listened(mod_api::HookId::PlayerRespawnPosition) {
             return None;
         }
-        let uuid = self
+        let (uuid, entity) = self
             .lan
             .as_ref()?
             .hub
             .guests
             .iter()
-            .find(|g| g.conn == conn)?
-            .uuid;
+            .find(|g| g.conn == conn)
+            .map(|g| (g.uuid, g.entity_id as u32))?;
         let player = self.player(uuid)?;
         let original = [found.at.x, found.at.y, found.at.z];
         let (mut level, mut position) = (found.dim.level(), original);
@@ -85,9 +85,10 @@ impl Game<'_> {
             pitch: &mut pitch,
             copy_original_spawn_position: &mut copy,
         });
-        // A level the world lacks leaves the player at the whole found point: the mod's
-        // coordinates are for that level.
+        // A level the world lacks, or one that refuses the player's client, leaves the
+        // player at the whole found point: the mod's coordinates are for that level.
         let to = match Dim::from_level(level) {
+            Some(dim) if dim != found.dim && self.refuse_level(entity, dim) => found,
             Some(dim) => Respawn {
                 dim,
                 at: Vec3::new(position[0], position[1], position[2]),

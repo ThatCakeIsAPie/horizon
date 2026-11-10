@@ -135,6 +135,7 @@ pub(in crate::game) fn installed_dimensions() -> Vec<ModDimension> {
                 stem: stem.to_string(),
                 dimension_type: dimension_type(&settings).to_string(),
                 sea_level: settings.sea_level,
+                horizon_only: settings.horizon_only,
             }
         })
         .collect()

@@ -69,6 +69,7 @@ fn scene<'a>(
             properties: Vec::new(),
             info: ClientInformation::new(2),
             brand: "unit".into(),
+            wide_positions: false,
             sender: PlayerSender::new(tx, Arc::default()),
             latency: Arc::new(AtomicI32::new(0)),
             address: "127.0.0.1:1".parse().unwrap(),

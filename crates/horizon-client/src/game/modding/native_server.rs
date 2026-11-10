@@ -1357,6 +1357,32 @@ impl Game<'_> {
         (self.native_acting_player() == Some(player)).then(String::new)
     }
 
+    /// Whether the player may enter `level`: a Horizon-only level refuses a
+    /// player whose client did not agree on wide positions. The acting player
+    /// with no known connection may enter; a stale player or level is
+    /// `Unavailable`.
+    pub(super) fn player_can_enter(
+        &self,
+        player: PlayerRef,
+        level: LevelRef,
+    ) -> Result<(), mod_api::LevelRefusal> {
+        // A level nobody has entered yet is not open, and still may be entered.
+        if !self.is_logical_server()
+            || self.native_lifecycle.epoch() != Some(level.epoch())
+            || !Dim::exists(level.dimension_id())
+        {
+            return Err(mod_api::LevelRefusal::Unavailable);
+        }
+        match self.online_player_record(player) {
+            Some(guest) if !guest.may_enter(level.dimension_id()) => {
+                Err(mod_api::LevelRefusal::HorizonOnly)
+            }
+            Some(_) => Ok(()),
+            None if self.native_acting_player() == Some(player) => Ok(()),
+            None => Err(mod_api::LevelRefusal::Unavailable),
+        }
+    }
+
     /// Validate identity without requiring a live body: sending to an online
     /// displaced player still works, as it did through the UUID send path.
     fn message_player_uuid(&self, player: PlayerRef) -> Option<u128> {
@@ -1928,7 +1954,7 @@ impl Game<'_> {
     }
 }
 
-fn system_chat(line: &Text) -> C {
+pub(super) fn system_chat(line: &Text) -> C {
     C::SystemChat(play::SystemChat {
         content: component_nbt(&line.component()),
         overlay: false,
@@ -2733,6 +2759,7 @@ mod tests {
                 properties: Vec::new(),
                 info: ClientInformation::new(8),
                 brand: String::new(),
+                wide_positions: false,
                 sender: PlayerSender::new(tx, Arc::new(AtomicUsize::new(0))),
                 latency: Arc::new(AtomicI32::new(0)),
                 address: "127.0.0.1:1".parse().unwrap(),

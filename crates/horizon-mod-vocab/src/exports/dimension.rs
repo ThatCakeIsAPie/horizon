@@ -1,4 +1,4 @@
-pub use world::dimension::{BiomePoint, BiomeSourceKind, DimensionSettings, LevelDimensionType};
+pub use world::dimension::{BiomePoint, BiomeSourceKind, DimensionSettings, LevelDimensionType, LevelRefusal};
 mod __private {
     /// The levels the mods registered, for the executable to hand to the
     /// engine before any world opens.

@@ -1888,6 +1888,26 @@ mod tests {
         });
     }
 
+    /// A Horizon-only level refuses a vanilla client's player before any mod
+    /// hears the travel; a client that agreed on wide positions travels as
+    /// any player does.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_horizon_only_level_refuses_a_vanilla_client_before_the_mods_hear_it() {
+        crate::game::world_loading::tests::install_test_levels();
+        with_gate(|game, _, heard| {
+            let wide = Dim::Extra(mod_api::__private::dimension_key("test:wide"));
+            assert!(!game.entity_may_travel(12, wide, TravelCause::Teleport));
+            assert!(heard.lock().unwrap().is_empty());
+            let hub = &mut game.lan.as_mut().unwrap().hub;
+            hub.update_guest(13, |g| g.wide_positions = true);
+            assert!(game.entity_may_travel(13, wide, TravelCause::Teleport));
+            let heard = heard.lock().unwrap();
+            assert_eq!(heard.len(), 1);
+            assert_eq!(heard[0].0, 13);
+        });
+    }
+
     /// The same for two dropped items at a Nether portal: the spared one is
     /// still in the level and waits for no arrival, the other has left it for
     /// one.

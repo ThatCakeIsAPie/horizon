@@ -71,6 +71,9 @@ pub struct ModDimension {
     /// The sea level the mod gives the level, for a chunk generator whose terrain has none to
     /// read (`stem_sea_level`); the noise settings' win for the noise generator.
     pub sea_level: Option<i32>,
+    /// Only a connection that agreed on wide positions may enter the level
+    /// (`horizon_protocol::wide_positions`): a vanilla client is refused.
+    pub horizon_only: bool,
 }
 
 static MOD_DIMENSIONS: OnceLock<Vec<ModDimension>> = OnceLock::new();
@@ -84,6 +87,15 @@ pub fn install_mod_dimensions(dimensions: Vec<ModDimension>) -> Result<(), Vec<M
 /// The levels the mods registered; empty before they are installed.
 pub fn mod_dimensions() -> &'static [ModDimension] {
     MOD_DIMENSIONS.get().map_or(&[], Vec::as_slice)
+}
+
+/// Whether a mod registered the level `id` as Horizon-only. A data pack that
+/// replaces the level's stem or dimension type keeps the mark: it is the mod's
+/// level the clients would enter.
+pub fn horizon_only(id: &str) -> bool {
+    mod_dimensions()
+        .iter()
+        .any(|dimension| dimension.horizon_only && dimension.id == id)
 }
 
 /// The sea level a level stem's noise generator builds its terrain at: its `settings`
@@ -753,6 +765,7 @@ mod level_facts_tests {
                 "attributes":{"minecraft:gameplay/water_evaporates":true}}"#
                 .into(),
             sea_level: None,
+            horizon_only: false,
         });
         let facts = o.level_facts("test:pocket").unwrap().unwrap();
         assert_eq!(facts.coordinate_scale, 2.0);
@@ -784,6 +797,7 @@ mod level_facts_tests {
             stem: r#"{"type":"test:bad"}"#.into(),
             dimension_type: r#"{"min_y":0,"height":64,"skybox":"moon"}"#.into(),
             sea_level: None,
+            horizon_only: false,
         });
         assert!(o.level_facts("test:bad").unwrap().is_err());
     }
