@@ -411,6 +411,35 @@ fn a_coarse_level_reads_the_zoom_of_its_step() {
 }
 
 #[test]
+fn the_tiles_missing_for_a_step_are_those_of_that_steps_zoom() {
+    let rig = rig();
+    let g = &rig.generator;
+    // Step 1 is the plain call; coarser steps list tiles of their own zoom, and the same area needs no more of them.
+    assert_eq!(
+        g.missing_tiles_for_step(-500, -300, 700, 900, 1),
+        g.missing_tiles(-500, -300, 700, 900)
+    );
+    let base = g.missing_tiles(-500, -300, 700, 900);
+    for level in 2..=6 {
+        let step = 1 << level;
+        let tiles = g.missing_tiles_for_step(700, 900, -500, -300, step);
+        assert!(!tiles.is_empty());
+        assert!(
+            tiles.iter().all(|t| t.z == g.zoom_for_step(step)),
+            "{tiles:?}"
+        );
+        assert!(tiles.len() <= base.len());
+    }
+    // A local tile is left out.
+    let coarse = g.missing_tiles_for_step(0, 0, 15, 15, 8);
+    rig.store.load(coarse[0]).unwrap();
+    assert!(
+        !g.missing_tiles_for_step(0, 0, 15, 15, 8)
+            .contains(&coarse[0])
+    );
+}
+
+#[test]
 fn the_surface_is_exact_however_far_above_the_hint_it_is() {
     let rig = rig();
     // The spire's top: about 8,000 blocks above a column at sea level, and 4,096 is as far as a search goes.

@@ -11,6 +11,10 @@
 //!   Cube populations whose 2 x 2 x 2 region touches the vanilla range are
 //!   skipped (vanilla decorated that range itself): [`needs_population`].
 //! * **Flat**: CubicWorldGen's flat generator, nothing to populate.
+//! * **Earth**: terrain from real elevation tiles (`horizon-earth`), one
+//!   biome (plains), nothing to populate and no vegetation or structures
+//!   yet. Its tiles come from the world's cache and, when the world allows
+//!   it, its tile server (`earth_net`).
 //!
 //! # Population state
 //!
@@ -37,6 +41,7 @@ use horizon_world::cubic::custom::{
     BiomeColumns, ClimateBiomes, CustomCubicGenerator, CustomGeneratorSettings, FixedBiome,
     FlatGeneratorSettings,
 };
+use horizon_world::cubic::earth::EarthSettings;
 use horizon_world::nbt::{NamedTag, Tag};
 use horizon_world::registry::BlockRegistry;
 use horizon_world::worldgen::generator::GeneratorData;
@@ -89,12 +94,12 @@ impl CubicGeneration {
 }
 
 /// Whether the population of cube `p` runs in a world of `kind`: always in
-/// Custom, never in Flat, and in Hybrid when neither `p` nor the cube above
+/// Custom, never in Flat or Earth, and in Hybrid when neither `p` nor the cube above
 /// it (its region) is in vanilla's range.
 pub fn needs_population(kind: CubicKind, p: SectionPos) -> bool {
     match kind {
         CubicKind::Custom => true,
-        CubicKind::Flat => false,
+        CubicKind::Flat | CubicKind::Earth => false,
         CubicKind::Hybrid => p.y + 1 < *VANILLA_CUBES.start() || p.y > *VANILLA_CUBES.end(),
     }
 }
@@ -120,7 +125,16 @@ pub struct Generation {
     /// Custom Cubic's structures (none in Hybrid, whose vanilla band has
     /// vanilla's, or in Flat, or without the generator data).
     pub structures: Option<Arc<CubicStructures>>,
+    /// An Earth world's settings and tiles; `None` for the other types.
+    pub earth: Option<EarthParts>,
     pub seed: i64,
+}
+
+/// What an Earth world is made of besides the generator.
+#[derive(Clone)]
+pub struct EarthParts {
+    pub settings: EarthSettings,
+    pub tiles: Arc<crate::earth_net::EarthTiles>,
 }
 
 impl Generation {
@@ -132,6 +146,18 @@ impl Generation {
         seed: i64,
         registry: &'static BlockRegistry,
         data: Option<&Arc<GeneratorData>>,
+    ) -> Result<Self, String> {
+        Self::with_tiles(choice, seed, registry, data, None)
+    }
+
+    /// [`Generation::new`], an Earth world reading its tiles through `tiles`
+    /// (the world's tile cache and server, `earth_net::open`, when `None`).
+    pub fn with_tiles(
+        choice: &CubicGeneration,
+        seed: i64,
+        registry: &'static BlockRegistry,
+        data: Option<&Arc<GeneratorData>>,
+        tiles: Option<Arc<crate::earth_net::EarthTiles>>,
     ) -> Result<Self, String> {
         let text = if choice.settings_json.trim().is_empty() {
             crate::cubic_settings::default_json(choice.kind)
@@ -149,6 +175,31 @@ impl Generation {
                 climate: None,
                 vegetation: None,
                 structures: None,
+                earth: None,
+                seed,
+            });
+        }
+        if choice.kind == CubicKind::Earth {
+            // The settings name the place and the tiles; nothing else is
+            // read from the generator data: one biome, no vegetation and
+            // no structures (yet).
+            let settings = EarthSettings::from_json(&text)?;
+            let tiles = tiles.unwrap_or_else(|| {
+                Arc::new(crate::earth_net::open(
+                    &settings,
+                    &crate::earth_net::cache_root(),
+                ))
+            });
+            let generator = CustomCubicGenerator::earth(&settings, tiles.store.clone(), registry)?;
+            return Ok(Self {
+                kind: choice.kind,
+                generator: Arc::new(generator),
+                settings: None,
+                columns: Arc::new(FixedBiome::new(horizon_world::cubic::earth::BIOME)),
+                climate: None,
+                vegetation: None,
+                structures: None,
+                earth: Some(EarthParts { settings, tiles }),
                 seed,
             });
         }
@@ -213,6 +264,7 @@ impl Generation {
             climate,
             vegetation,
             structures,
+            earth: None,
             seed,
         })
     }

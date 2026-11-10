@@ -2,12 +2,16 @@
 //! chooses them and as a world folder keeps them (docs/cubic-v2-plan.md,
 //! "Generation"):
 //!
-//! * `horizon_cubic.json` carries `"type": "custom" | "hybrid" | "flat"` beside
+//! * `horizon_cubic.json` carries `"type": "custom" | "hybrid" | "flat" | "earth"` beside
 //!   the window the world last held (a world made before the types has no
 //!   `type` and is [`CubicKind::Hybrid`], what v1 generated);
 //! * `cubicgen.json` is the generator's settings, CubicWorldGen's v9 JSON for
-//!   Custom Cubic and Hybrid, the layers for Flat Cubic.
+//!   Custom Cubic and Hybrid, the layers for Flat Cubic, and
+//!   [`EarthSettings`] for Earth (which has no defaults: a world has to say
+//!   where on the globe it is, so its default text is the origin the Create
+//!   World page starts from).
 use horizon_world::cubic::custom::{CustomGeneratorSettings, FlatGeneratorSettings};
+use horizon_world::cubic::earth::EarthSettings;
 use std::path::Path;
 
 /// The file a world's cubic generator settings are kept in.
@@ -24,16 +28,19 @@ pub enum CubicKind {
     Hybrid,
     /// Endless superflat layers.
     Flat,
+    /// Real-world terrain from public elevation tiles (`horizon-earth`).
+    Earth,
 }
 impl CubicKind {
     /// Every kind, in the order the Create World button cycles them.
-    pub const ALL: [Self; 3] = [Self::Custom, Self::Hybrid, Self::Flat];
+    pub const ALL: [Self; 4] = [Self::Custom, Self::Hybrid, Self::Flat, Self::Earth];
     /// The name `horizon_cubic.json` stores.
     pub fn id(self) -> &'static str {
         match self {
             Self::Custom => "custom",
             Self::Hybrid => "hybrid",
             Self::Flat => "flat",
+            Self::Earth => "earth",
         }
     }
     pub fn from_id(id: &str) -> Option<Self> {
@@ -45,12 +52,13 @@ impl CubicKind {
             Self::Custom => "horizon.cubic.type.custom",
             Self::Hybrid => "horizon.cubic.type.hybrid",
             Self::Flat => "horizon.cubic.type.flat",
+            Self::Earth => "horizon.cubic.type.earth",
         }
     }
     /// The kind after `self` in the cycle, with `None` (Off) between the last
     /// and the first: `step` 1 goes forward, -1 back.
     pub fn cycle(current: Option<Self>, step: i32) -> Option<Self> {
-        // Off, Custom, Hybrid, Flat.
+        // Off, Custom, Hybrid, Flat, Earth.
         let at = current.map_or(0, |kind| {
             Self::ALL.iter().position(|k| *k == kind).unwrap_or(0) as i32 + 1
         });
@@ -59,7 +67,13 @@ impl CubicKind {
     }
     /// Whether the settings are CubicWorldGen's (`CustomGeneratorSettings`).
     pub fn has_terrain_settings(self) -> bool {
-        self != Self::Flat
+        matches!(self, Self::Custom | Self::Hybrid)
+    }
+    /// Whether a settings text written for `other` is also this kind's:
+    /// Custom Cubic and Hybrid share CubicWorldGen's; every other kind has a
+    /// format of its own.
+    pub fn shares_settings(self, other: Self) -> bool {
+        self == other || (self.has_terrain_settings() && other.has_terrain_settings())
     }
 }
 
@@ -67,8 +81,17 @@ impl CubicKind {
 pub fn default_json(kind: CubicKind) -> String {
     match kind {
         CubicKind::Flat => FlatGeneratorSettings::default().to_json_pretty(),
-        _ => CustomGeneratorSettings::defaults().to_json_pretty(),
+        CubicKind::Earth => default_earth().to_json_pretty(),
+        CubicKind::Custom | CubicKind::Hybrid => {
+            CustomGeneratorSettings::defaults().to_json_pretty()
+        }
     }
+}
+
+/// Where a new Earth world starts: the Create World page's first values (in the
+/// Swiss Alps, for relief to look at), no tile address and downloads off.
+pub fn default_earth() -> EarthSettings {
+    EarthSettings::at(46.0, 7.5)
 }
 
 /// `text` read as the settings of `kind` (an empty text is the preset) and
@@ -76,7 +99,9 @@ pub fn default_json(kind: CubicKind) -> String {
 pub fn normalize_json(kind: CubicKind, text: &str) -> Result<String, String> {
     match kind {
         CubicKind::Flat => FlatGeneratorSettings::from_json(text).map(|s| s.to_json_pretty()),
-        _ => {
+        CubicKind::Earth if text.trim().is_empty() => Ok(default_earth().to_json_pretty()),
+        CubicKind::Earth => EarthSettings::from_json(text).map(|s| s.to_json_pretty()),
+        CubicKind::Custom | CubicKind::Hybrid => {
             let settings = CustomGeneratorSettings::from_json(text)?;
             settings.validate()?;
             Ok(settings.to_json_pretty())
@@ -157,10 +182,10 @@ mod tests {
     }
 
     #[test]
-    fn the_cycle_goes_off_custom_hybrid_flat_and_back() {
+    fn the_cycle_goes_off_custom_hybrid_flat_earth_and_back() {
         let mut kind = None;
         let mut seen = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..5 {
             kind = CubicKind::cycle(kind, 1);
             seen.push(kind);
         }
@@ -170,10 +195,11 @@ mod tests {
                 Some(CubicKind::Custom),
                 Some(CubicKind::Hybrid),
                 Some(CubicKind::Flat),
+                Some(CubicKind::Earth),
                 None
             ]
         );
-        assert_eq!(CubicKind::cycle(None, -1), Some(CubicKind::Flat));
+        assert_eq!(CubicKind::cycle(None, -1), Some(CubicKind::Earth));
         assert_eq!(
             CubicKind::cycle(Some(CubicKind::Custom), -1),
             None,
@@ -243,5 +269,106 @@ mod tests {
         );
         assert!(save_world_generation(&dir, CubicKind::Custom, "{ not json").is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn an_earth_text() -> String {
+        let mut settings = EarthSettings::at(-33.87, 151.21);
+        settings.metres_per_block = 4.0;
+        settings.tile_url = "https://tiles.example.com/{z}/{x}/{y}.png".into();
+        settings.allow_downloads = true;
+        settings.to_json_compact()
+    }
+
+    #[test]
+    fn an_earth_world_reads_back_its_kind_and_settings_from_the_save_files() {
+        let dir = scratch("earth");
+        std::fs::write(
+            dir.join("horizon_cubic.json"),
+            r#"{"cubic":true,"window_min_y":-96}"#,
+        )
+        .unwrap();
+        save_world_generation(&dir, CubicKind::Earth, &an_earth_text()).unwrap();
+        let (kind, text) = load_world_generation(&dir).unwrap();
+        assert_eq!(kind, CubicKind::Earth);
+        let settings = EarthSettings::from_json(&text).unwrap();
+        assert_eq!(
+            (
+                settings.origin_latitude,
+                settings.origin_longitude,
+                settings.metres_per_block
+            ),
+            (-33.87, 151.21, 4.0)
+        );
+        assert_eq!(
+            settings.tile_url,
+            "https://tiles.example.com/{z}/{x}/{y}.png"
+        );
+        assert!(settings.allow_downloads);
+        let world: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("horizon_cubic.json")).unwrap())
+                .unwrap();
+        assert_eq!(world["type"], "earth");
+        assert_eq!(world["window_min_y"], -96);
+        assert_eq!(stored_type(&dir).as_deref(), Some("earth"));
+        assert_eq!(CubicKind::from_id("earth"), Some(CubicKind::Earth));
+        // Nothing but the origin written, or nothing at all: the page's starting place.
+        save_world_generation(&dir, CubicKind::Earth, "").unwrap();
+        let (_, text) = load_world_generation(&dir).unwrap();
+        assert_eq!(EarthSettings::from_json(&text).unwrap(), default_earth());
+        assert!(!default_earth().allow_downloads && default_earth().tile_url.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn earth_settings_are_not_normalised_as_custom_cubics() {
+        // Earth's own format comes back as itself, with nothing of Custom's added.
+        let text = normalize_json(CubicKind::Earth, &an_earth_text()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["originLongitude"], 151.21);
+        assert!(value.get("dungeonCount").is_none(), "{text}");
+        // Custom Cubic's JSON is not an Earth world's (it has no place), and the other way round.
+        let custom = CustomGeneratorSettings::defaults().to_json_compact();
+        assert!(normalize_json(CubicKind::Earth, &custom).is_err());
+        assert!(normalize_json(CubicKind::Earth, "{ not json").is_err());
+        assert!(
+            normalize_json(
+                CubicKind::Earth,
+                r#"{"originLatitude":95,"originLongitude":0}"#
+            )
+            .is_err()
+        );
+        let earth_defaults: serde_json::Value =
+            serde_json::from_str(&default_json(CubicKind::Earth)).unwrap();
+        assert!(earth_defaults.get("originLatitude").is_some());
+        assert!(earth_defaults.get("dungeonCount").is_none());
+        for kind in [CubicKind::Custom, CubicKind::Hybrid] {
+            assert!(!default_json(kind).contains("originLatitude"));
+        }
+        // A world made with a bad Earth text is refused at the save, not written.
+        let dir = scratch("earth-bad");
+        assert!(save_world_generation(&dir, CubicKind::Earth, &custom).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_custom_cubic_and_hybrid_share_a_settings_format() {
+        use CubicKind::{Custom, Earth, Flat, Hybrid};
+        assert!(Custom.shares_settings(Hybrid) && Hybrid.shares_settings(Custom));
+        for kind in CubicKind::ALL {
+            assert!(kind.shares_settings(kind));
+        }
+        for (a, b) in [
+            (Custom, Flat),
+            (Custom, Earth),
+            (Hybrid, Earth),
+            (Flat, Earth),
+        ] {
+            assert!(
+                !a.shares_settings(b) && !b.shares_settings(a),
+                "{a:?} {b:?}"
+            );
+        }
+        assert!(Custom.has_terrain_settings() && Hybrid.has_terrain_settings());
+        assert!(!Flat.has_terrain_settings() && !Earth.has_terrain_settings());
     }
 }

@@ -976,6 +976,32 @@ pub(super) fn make_streaming(
                 &generation,
                 Some(&inner_data),
             )?;
+            // An Earth world's tiles around its origin, before anything is
+            // placed there (`earth_prefetch::preload`).
+            if let Some(earth) = level.generation().generator.earth_generator() {
+                let started = std::time::Instant::now();
+                let far = settings
+                    .horizon
+                    .lod_distance
+                    .min(horizon_client::earth_prefetch::MAX_FAR_CHUNKS as u32)
+                    as i32;
+                let done = horizon_client::earth_prefetch::preload(
+                    earth,
+                    (0, 0),
+                    settings.render_distance,
+                    far,
+                );
+                // A world that downloads nothing misses many tiles for one reason: the first few say it.
+                for (id, why) in done.failed.iter().take(3) {
+                    log::warn!("Horizon: Earth tile {id:?} is not available: {why}");
+                }
+                log::info!(
+                    "Horizon: Earth tiles around the origin: {} loaded, {} missing, in {:?}",
+                    done.loaded,
+                    done.failed.len(),
+                    started.elapsed()
+                );
+            }
             let _ = save.cubic.set(level.clone());
             // Custom Cubic's structures answer `/locate`, maps and the
             // structures a position is in, not the vanilla generator's.

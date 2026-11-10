@@ -313,6 +313,26 @@ impl EarthGenerator {
         self.missing_in(self.node_rect(level, x, z))
     }
 
+    /// The tiles missing for a read of the block rectangle `x0..=x1` by `z0..=z1` (corners in either order) with
+    /// samples `step` blocks apart, at the zoom of that step: what the far view asks for beyond one-block
+    /// resolution. `step` 1 is [`EarthGenerator::missing_tiles`].
+    pub fn missing_tiles_for_step(
+        &self,
+        x0: i32,
+        z0: i32,
+        x1: i32,
+        z1: i32,
+        step: i32,
+    ) -> Vec<TileId> {
+        self.missing_in(Rect {
+            x0,
+            z0,
+            x1,
+            z1,
+            zoom: self.zoom_for_step(step),
+        })
+    }
+
     pub(super) fn missing_in(&self, r: Rect) -> Vec<TileId> {
         self.field
             .tiles_for(r.x0, r.z0, r.x1, r.z1, r.zoom)

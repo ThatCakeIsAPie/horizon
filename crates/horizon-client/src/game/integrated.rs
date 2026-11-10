@@ -900,6 +900,10 @@ impl Game<'_> {
     /// then the world is saved.
     fn stop_integrated(&mut self) -> Result<()> {
         // Abort background terrain generation/decoration on shutdown, matching vanilla behavior.
+        // An Earth level first stops waiting for tiles, so no worker stays blocked on a download.
+        if let Some(level) = self.save.cubic.get() {
+            level.cancel_generation();
+        }
         self.streaming.abort_generation();
         // The close request: lifecycle observation stops.
         self.native_lifecycle.begin_close();

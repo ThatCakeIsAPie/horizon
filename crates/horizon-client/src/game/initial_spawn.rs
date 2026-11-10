@@ -104,6 +104,16 @@ impl Game<'_> {
         {
             return Ok(((0, 0), flat.spawn_height()));
         }
+        // An Earth world spawns at its origin, whose tiles must be there.
+        if self.world.shape.cubic
+            && let Some(origin) = self
+                .save
+                .cubic
+                .get()
+                .and_then(|level| level.earth_spawn_origin())
+        {
+            return Ok(origin?);
+        }
         // A cubic world's own generator knows where its land is.
         if self.world.shape.cubic
             && let Some(origin) = self.save.cubic.get().and_then(|level| level.spawn_origin())

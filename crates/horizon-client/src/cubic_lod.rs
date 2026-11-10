@@ -805,6 +805,11 @@ impl CubeSampler for CubicLodSampler {
             return Some(node);
         }
         let node = self.sampled(key)?;
+        // An Earth node made after the level shut down is built of air in
+        // place of tiles it could not read: neither kept nor drawn.
+        if self.level.generation_cancelled() {
+            return None;
+        }
         let node = self.with_structures(node);
         // The generator is exact outside a Hybrid world's band (and
         // everywhere in the others).
@@ -980,7 +985,9 @@ impl CubicLodSampler {
         if crate::lod::cube::profile::on() {
             crate::lod::cube::profile::add(&crate::lod::cube::profile::S_SAMPLE, started);
         }
-        Some(self.covered(node?))
+        let node = self.covered(node?);
+        // Likewise its sky cover, which probes the generator too.
+        (!self.level.generation_cancelled()).then_some(node)
     }
 
     /// Cube `key` (level 0) as the generator makes it whole: terrain and

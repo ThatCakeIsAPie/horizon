@@ -276,6 +276,14 @@ impl Game<'_> {
             return;
         };
         let centres: Vec<(i32, i32)> = viewers.iter().map(|v| v.column).collect();
+        // An Earth world fetches the tiles around the players ahead of the
+        // generator, as far as the far view reaches.
+        let far = if self.cube_lod.is_some() {
+            self.lod_distance() as i32
+        } else {
+            0
+        };
+        level.follow_players(&centres, self.streaming.radius, far);
         level.retarget_shard_ring(
             self.shard,
             self.world.shape.column(),

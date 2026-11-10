@@ -4,8 +4,9 @@
 //! a [`CustomGeneratorSettings`]; Custom Cubic has a sixth after Basic,
 //! Horizon's Structures, which switches and tunes vanilla's structure sets
 //! (Hybrid's structures are vanilla's own, from its vanilla band). Flat Cubic
-//! opens a layer editor. Both have Presets, an overlay that imports and exports
-//! the settings as JSON.
+//! opens a layer editor, and Earth ([`earth`]) one plain page of text boxes: where
+//! on the globe the world is, its scale and its tile server. All have Presets,
+//! an overlay that imports and exports the settings as JSON.
 //!
 //! The controls of a page are rebuilt from the state each time they are drawn
 //! or pressed ([`page`]): a [`Widget`] is its rectangle, its label and a
@@ -32,6 +33,8 @@ use horizon_world::cubic::custom::{
     },
 };
 use std::{cell::RefCell, collections::BTreeSet, path::Path, rc::Rc};
+
+mod earth;
 
 /// Writes into the ore `i` of the combined list (standard ores, then periodic
 /// ones); `$body` sees it as `$o`, of either type.
@@ -73,6 +76,8 @@ enum PageId {
     Lakes,
     Caves,
     Terrain,
+    /// Earth's one page: its place, scale and tile server.
+    Earth,
 }
 impl PageId {
     /// The language key of the page's name.
@@ -84,6 +89,7 @@ impl PageId {
             Self::Lakes => "horizon.cubic.page.lakes",
             Self::Caves => "horizon.cubic.page.caves",
             Self::Terrain => "horizon.cubic.page.terrain",
+            Self::Earth => "horizon.cubic.page.earth",
         }
     }
 }
@@ -106,6 +112,9 @@ const HYBRID_PAGES: &[PageId] = &[
     PageId::Caves,
     PageId::Terrain,
 ];
+
+/// Earth's: the one page.
+const EARTH_PAGES: &[PageId] = &[PageId::Earth];
 
 const HEADER: f32 = 24.0;
 const FOOTER: f32 = 33.0;
@@ -152,6 +161,8 @@ pub struct State {
     pub(super) settings: CustomGeneratorSettings,
     /// Flat Cubic's layers, bottom to top (the settings key them by `fromY`).
     pub(super) flat: Vec<FlatLayer>,
+    /// Earth's settings as the page's boxes hold them.
+    earth: earth::Draft,
     pub(super) page: usize,
     pub(super) scroll: ui::Scroll,
     /// The Lock of the expected heights (Advanced terrain).
@@ -319,6 +330,7 @@ impl State {
             kind,
             settings: CustomGeneratorSettings::defaults(),
             flat: Vec::new(),
+            earth: earth::Draft::default(),
             page: 0,
             scroll: ui::Scroll::default(),
             lock: true,
@@ -343,7 +355,7 @@ impl State {
         self.page
     }
     /// The number of pages: six for Custom Cubic, five for Hybrid, one for
-    /// Flat Cubic's layers.
+    /// Flat Cubic's layers and one for Earth.
     pub fn page_count(&self) -> usize {
         self.pages().len().max(1)
     }
@@ -354,6 +366,7 @@ impl State {
             CubicKind::Custom => CUSTOM_PAGES,
             CubicKind::Hybrid => HYBRID_PAGES,
             CubicKind::Flat => &[],
+            CubicKind::Earth => EARTH_PAGES,
         }
     }
     /// The open page; `None` on Flat Cubic's layers.
@@ -363,7 +376,9 @@ impl State {
     /// Reads `text` as the settings of this world type, replacing the current
     /// ones; an error leaves them as they were.
     pub(super) fn load_json(&mut self, text: &str) -> Result<(), String> {
-        if self.kind.has_terrain_settings() {
+        if self.kind == CubicKind::Earth {
+            self.earth = earth::Draft::from_json(text)?;
+        } else if self.kind.has_terrain_settings() {
             let settings = CustomGeneratorSettings::from_json(text)?;
             settings.validate()?;
             self.lock = cubic_map::heights_locked(&settings);
@@ -384,7 +399,9 @@ impl State {
     /// The settings as pretty JSON, what Done hands back and `cubicgen.json`
     /// holds.
     pub(super) fn json(&self) -> String {
-        if self.kind.has_terrain_settings() {
+        if self.kind == CubicKind::Earth {
+            self.earth.json(true)
+        } else if self.kind.has_terrain_settings() {
             self.settings.to_json_pretty()
         } else {
             self.flat_settings().to_json_pretty()
@@ -427,7 +444,9 @@ impl State {
     fn open_presets(&mut self) {
         self.dragging = None;
         self.overlay = Overlay::Presets(Presets {
-            compact: if self.kind.has_terrain_settings() {
+            compact: if self.kind == CubicKind::Earth {
+                self.earth.json(false)
+            } else if self.kind.has_terrain_settings() {
                 self.settings.to_json_compact()
             } else {
                 self.flat_settings().to_json_compact()
@@ -628,6 +647,7 @@ impl State {
         match &mut self.overlay {
             Overlay::Presets(p) if p.focused => Some((COMPACT, &mut p.compact, 8_000_000)),
             Overlay::Picker(p) if p.focused => Some((SEARCH, &mut p.query, 50)),
+            Overlay::None => self.earth.focused_text(),
             _ => None,
         }
     }
@@ -636,14 +656,30 @@ impl State {
         match &self.overlay {
             Overlay::Presets(p) if p.focused => Some(compact_box(size.0.ceil())),
             Overlay::Picker(p) if p.focused => Some(search_box(size.0.ceil())),
+            Overlay::None => {
+                let focus = self.earth.focus?;
+                let (top, _, left) = list_area(self, size);
+                let widgets = page(self);
+                let widget = widgets
+                    .widgets
+                    .iter()
+                    .find(|w| w.item.kind == Kind::Field(focus))?;
+                let (x, y, w, h) = absolute(widget.rect, self.scroll.amount.trunc(), (left, top));
+                Some([x, y, w, h])
+            }
             _ => None,
         }
     }
     /// Escape: closes an overlay and says so; false when none was open.
     pub(super) fn escape(&mut self) -> bool {
-        let open = self.overlay_open();
+        let open = self.overlay_open() || self.earth.focus.take().is_some();
         self.overlay = Overlay::None;
         open
+    }
+    /// Whether Done may be pressed: always, except when Earth's boxes hold
+    /// something its settings refuse.
+    fn can_finish(&self) -> bool {
+        self.kind != CubicKind::Earth || self.earth.settings().is_ok()
     }
     /// The Presets overlay's JSON, pretty, while it parses.
     fn presets_result(&self, presets: &Presets) -> Result<String, String> {
@@ -672,8 +708,12 @@ type Set = Rc<dyn Fn(&mut State, f32)>;
 enum Kind {
     Heading,
     Note,
+    /// A note in red: what is wrong with the page's values.
+    Warning,
     Button,
     Slider(f32),
+    /// Text box `n` of Earth's page.
+    Field(usize),
 }
 struct Item {
     kind: Kind,
@@ -806,6 +846,7 @@ fn page(state: &State) -> Page {
     let mut b = Builder::new();
     match state.page_id() {
         None => flat_page(&mut b, state),
+        Some(PageId::Earth) => earth::page(&mut b, state),
         Some(PageId::Basic) => basic_page(&mut b, state),
         Some(PageId::Structures) => structures_page(&mut b, state),
         Some(PageId::Ores) => ores_page(&mut b, state),
@@ -2130,7 +2171,7 @@ pub(super) fn buttons(w: f32, h: f32, state: &State) -> Vec<Button> {
                 specs.push(("horizon.cubic.page.next", state.page + 1 < pages, NEXT));
             }
             specs.push(("createWorld.customize.presets", true, PRESETS));
-            specs.push(("gui.done", true, DONE));
+            specs.push(("gui.done", state.can_finish(), DONE));
             specs.push(("gui.cancel", true, CANCEL));
             row(specs, 60.0)
         }
@@ -2145,6 +2186,7 @@ pub(super) fn buttons(w: f32, h: f32, state: &State) -> Vec<Button> {
 pub(super) fn press(state: &mut State, id: u8) -> Exit {
     match std::mem::replace(&mut state.overlay, Overlay::None) {
         Overlay::None => match id {
+            DONE if !state.can_finish() => {}
             DONE => return Exit::Apply,
             CANCEL => return Exit::Cancel,
             PRESETS => state.open_presets(),
@@ -2168,7 +2210,9 @@ pub(super) fn press(state: &mut State, id: u8) -> Exit {
             }
             DEFAULTS => {
                 let mut presets = presets;
-                presets.compact = if state.kind.has_terrain_settings() {
+                presets.compact = if state.kind == CubicKind::Earth {
+                    cubic_settings::default_earth().to_json_compact()
+                } else if state.kind.has_terrain_settings() {
                     CustomGeneratorSettings::defaults().to_json_compact()
                 } else {
                     FlatGeneratorSettings::default().to_json_compact()
@@ -2213,6 +2257,8 @@ pub(super) fn click(state: &mut State, cursor: (f32, f32), size: (f32, f32)) -> 
         return false;
     }
     settle(state, size);
+    // A press anywhere takes the keys from Earth's boxes; one on a box gives them back.
+    state.earth.focus = None;
     let widgets = page(state);
     let (top, bottom, left) = list_area(state, size);
     let content = content_height(&widgets);
@@ -2240,6 +2286,7 @@ pub(super) fn click(state: &mut State, cursor: (f32, f32), size: (f32, f32)) -> 
             set(state, ui::slider_value(x, wd, cursor.0));
         }
         (Kind::Button, Some(set)) => set(state, 0.0),
+        (Kind::Field(n), _) => state.earth.focus = Some(n),
         _ => return false,
     }
     true
@@ -2267,7 +2314,7 @@ fn widget_at(
     origin: (f32, f32),
 ) -> Option<(usize, &Widget)> {
     page.widgets.iter().enumerate().find(|(_, w)| {
-        matches!(w.item.kind, Kind::Button | Kind::Slider(_)) && {
+        matches!(w.item.kind, Kind::Button | Kind::Slider(_) | Kind::Field(_)) && {
             let (x, y, wd, h) = absolute(w.rect, offset, origin);
             ui::hovered(cursor, x, y, wd, h)
         }
@@ -2402,6 +2449,7 @@ pub(super) fn draw(
         Overlay::None => {}
     }
     let title_text = match state.page_id() {
+        Some(PageId::Earth) => tr("horizon.cubic.earth.title"),
         Some(id) => Text::translate(
             "horizon.cubic.page.title",
             &[
@@ -2441,6 +2489,20 @@ pub(super) fn draw(
             }
             Kind::Note => {
                 batch.text(atlas, &item.label, x, y, GRAY, true);
+            }
+            Kind::Warning => {
+                batch.text(atlas, &item.label, x, y, RED, true);
+            }
+            Kind::Field(n) => {
+                title.caret.borrow_mut().draw(
+                    batch,
+                    atlas,
+                    state.earth.field(n),
+                    [x, y, wd, ht],
+                    state.earth.focus == Some(n),
+                    title.started,
+                );
+                crate::widgets::name_last_edit_box(|| earth::label(n));
             }
             Kind::Button => {
                 ui::button(
@@ -3442,5 +3504,212 @@ mod tests {
                 assert!(strings.contains_key(key), "{code} names {key}");
             }
         }
+    }
+
+    // ---------------------------------------------------------------- Earth
+
+    use horizon_world::cubic::earth::EarthSettings;
+
+    /// Types `text` into Earth's box `n`, as the keys of a focused box do.
+    fn type_into(state: &mut State, n: usize, text: &str) {
+        state.earth.focus = Some(n);
+        let (_, field, _) = state.focused_text().expect("a focused box");
+        *field = text.to_owned();
+    }
+    fn earth_settings(state: &State) -> Result<EarthSettings, String> {
+        state.earth.settings()
+    }
+    fn done_enabled(state: &State) -> bool {
+        buttons(SIZE.0, SIZE.1, state)
+            .iter()
+            .find(|b| b.id == DONE)
+            .unwrap()
+            .enabled
+    }
+    /// The middle of Earth's box `n` on the screen.
+    fn box_centre(state: &State, n: usize) -> (f32, f32) {
+        let (top, _, left) = list_area(state, SIZE);
+        let widgets = page(state);
+        let widget = widgets
+            .widgets
+            .iter()
+            .find(|w| w.item.kind == Kind::Field(n))
+            .unwrap();
+        let (x, y, w, h) = absolute(widget.rect, 0.0, (left, top));
+        (x + w / 2.0, y + h / 2.0)
+    }
+
+    #[test]
+    fn earth_opens_one_page_of_the_origin_scale_and_tile_server() {
+        let s = state(CubicKind::Earth, "");
+        assert_eq!((s.page_count(), s.page_id()), (1, Some(PageId::Earth)));
+        let widgets = page(&s).widgets;
+        let fields = widgets
+            .iter()
+            .filter(|w| matches!(w.item.kind, Kind::Field(_)))
+            .count();
+        assert_eq!(fields, 4, "latitude, longitude, scale and the tile address");
+        // The starting values are the defaults: no server, downloads off.
+        let defaults = earth_settings(&s).unwrap();
+        assert_eq!(defaults, cubic_settings::default_earth());
+        assert!(defaults.tile_url.is_empty() && !defaults.allow_downloads);
+        // The footer has no Prev or Next.
+        let ids: Vec<u8> = buttons(SIZE.0, SIZE.1, &s).iter().map(|b| b.id).collect();
+        assert!(!ids.contains(&PREV) && !ids.contains(&NEXT));
+        assert!(ids.contains(&DONE) && ids.contains(&PRESETS));
+    }
+
+    #[test]
+    fn what_is_typed_on_earths_page_is_what_done_returns() {
+        let mut s = state(CubicKind::Earth, "");
+        type_into(&mut s, 0, "35,68");
+        type_into(&mut s, 1, " 139.69 ");
+        type_into(&mut s, 2, "8");
+        type_into(&mut s, 3, "https://tiles.example.com/{z}/{x}/{y}.png");
+        let toggle = buttons_of(&s)[0].clone();
+        toggle(&mut s, 0.0);
+        assert!(done_enabled(&s));
+        assert_eq!(press(&mut s, DONE), Exit::Apply);
+        let returned = EarthSettings::from_json(&s.json()).unwrap();
+        assert_eq!(returned.origin_latitude, 35.68);
+        assert_eq!(returned.origin_longitude, 139.69);
+        assert_eq!(returned.metres_per_block, 8.0);
+        assert_eq!(
+            returned.tile_url,
+            "https://tiles.example.com/{z}/{x}/{y}.png"
+        );
+        assert!(returned.allow_downloads);
+        // What the page does not show is kept: the screen reads a file back and returns it the same.
+        let mut with_more = returned.clone();
+        with_more.sea_level_y = 40;
+        with_more.vertical_exaggeration = 3.0;
+        let again = state(CubicKind::Earth, &with_more.to_json_compact());
+        assert_eq!(earth_settings(&again).unwrap(), with_more);
+        assert!(s.json().contains('\n'), "Done hands back the pretty form");
+    }
+
+    #[test]
+    fn done_waits_while_earths_boxes_hold_something_the_settings_refuse() {
+        let mut s = state(CubicKind::Earth, "");
+        for (n, bad) in [
+            (0, "91"),
+            (0, "north"),
+            (1, "200"),
+            (2, "0"),
+            (2, "-3"),
+            (3, "http://example.com/{z}/{x}/{y}.png"),
+            (3, "https://example.com/tiles.png"),
+        ] {
+            let mut s = s.clone();
+            type_into(&mut s, n, bad);
+            assert!(!done_enabled(&s), "{bad}");
+            assert_eq!(press(&mut s, DONE), Exit::Stay, "{bad}");
+            // The page says what is wrong, in red.
+            assert!(
+                page(&s)
+                    .widgets
+                    .iter()
+                    .any(|w| w.item.kind == Kind::Warning),
+                "{bad}"
+            );
+        }
+        type_into(&mut s, 0, "46");
+        assert!(done_enabled(&s));
+    }
+
+    #[test]
+    fn a_click_gives_earths_box_the_keys_and_a_click_elsewhere_or_escape_takes_them_back() {
+        let mut s = state(CubicKind::Earth, "");
+        assert!(s.focused_text().is_none());
+        let at = box_centre(&s, 1);
+        assert!(click(&mut s, at, SIZE), "a click on a box is a hit");
+        assert_eq!(s.earth.focus, Some(1));
+        let (id, _, max) = s.focused_text().unwrap();
+        assert_eq!(id, ("cubic.earth", 1));
+        assert!(max >= 16);
+        let frame = s.focused_box(SIZE).expect("the box the pointer edits");
+        assert!(ui::hovered(at, frame[0], frame[1], frame[2], frame[3]));
+        // Another box takes them; the empty part of the page releases them.
+        let other = box_centre(&s, 3);
+        click(&mut s, other, SIZE);
+        assert_eq!(s.earth.focus, Some(3));
+        click(&mut s, (2.0, 2.0), SIZE);
+        assert_eq!(s.earth.focus, None);
+        // Escape closes the box first, then the screen.
+        click(&mut s, at, SIZE);
+        assert!(s.escape());
+        assert_eq!(s.earth.focus, None);
+        assert!(!s.escape());
+    }
+
+    #[test]
+    fn earths_presets_edit_the_same_settings_as_json() {
+        let mut s = state(CubicKind::Earth, "");
+        type_into(&mut s, 0, "12.5");
+        assert_eq!(press(&mut s, PRESETS), Exit::Stay);
+        let Overlay::Presets(p) = &s.overlay else {
+            panic!("Presets are open")
+        };
+        assert!(
+            p.compact.contains("\"originLatitude\":12.5"),
+            "{}",
+            p.compact
+        );
+        presets_text(
+            &mut s,
+            r#"{"originLatitude":-20,"originLongitude":30,"metresPerBlock":16,"seaLevelY":10}"#,
+        );
+        assert!(presets_result(&s).is_ok());
+        assert_eq!(press(&mut s, DONE), Exit::Stay);
+        let read = earth_settings(&s).unwrap();
+        assert_eq!(
+            (
+                read.origin_latitude,
+                read.metres_per_block,
+                read.sea_level_y
+            ),
+            (-20.0, 16.0, 10)
+        );
+        // Custom Cubic's JSON is not accepted here: Done stays disabled in the overlay.
+        presets_text(
+            &mut s,
+            &CustomGeneratorSettings::defaults().to_json_compact(),
+        );
+        assert!(presets_result(&s).is_err());
+        // Defaults brings back the starting place.
+        assert_eq!(press(&mut s, DEFAULTS), Exit::Stay);
+        let Overlay::Presets(p) = &s.overlay else {
+            panic!("Presets are open")
+        };
+        assert_eq!(
+            EarthSettings::from_json(&p.compact).unwrap(),
+            cubic_settings::default_earth()
+        );
+    }
+
+    #[test]
+    fn earths_strings_are_in_the_language_file() {
+        let strings: std::collections::HashMap<String, String> =
+            serde_json::from_str(include_str!("../../assets/horizon/lang/en_us.json")).unwrap();
+        for key in [
+            "horizon.cubic.type.earth",
+            PageId::Earth.name(),
+            "horizon.cubic.earth.title",
+            "horizon.cubic.earth.help.1",
+            "horizon.cubic.earth.help.2",
+            "horizon.cubic.earth.place",
+            "horizon.cubic.earth.latitude",
+            "horizon.cubic.earth.longitude",
+            "horizon.cubic.earth.scale",
+            "horizon.cubic.earth.tiles",
+            "horizon.cubic.earth.url",
+            "horizon.cubic.earth.url.help",
+            "horizon.cubic.earth.downloads",
+            "horizon.cubic.earth.no_url",
+            "horizon.cubic.earth.invalid",
+        ] {
+            assert!(strings.contains_key(key), "{key}");
+        }
+        assert_eq!(CubicKind::Earth.label(), "horizon.cubic.type.earth");
     }
 }

@@ -505,6 +505,9 @@ pub struct CubicLevel {
     /// The cubes just outside the window, ready in memory
     /// (`cubic_prefetch`).
     ring: crate::cubic_prefetch::Ring,
+    /// An Earth world's background fetch of the tiles around the players
+    /// (`earth_prefetch`); none when the world downloads nothing.
+    earth_follow: Option<crate::earth_prefetch::Prefetcher>,
     /// Each column's vanilla surface heights, for the sky a window's top
     /// leaves open (`sky_cover`); `None` for a column without them.
     surfaces: Mutex<HashMap<(i32, i32), Option<Arc<Vec<i32>>>>>,
@@ -533,12 +536,38 @@ impl CubicLevel {
         generation: &CubicGeneration,
         data: Option<&Arc<horizon_world::worldgen::generator::GeneratorData>>,
     ) -> Result<Arc<Self>, String> {
-        let wg = Arc::new(Generation::new(generation, seed, registry, data)?);
+        let wg = Generation::new(generation, seed, registry, data)?;
+        Self::with_generation(level_dir, seed, registry, biomes, window, generation, wg)
+    }
+
+    /// [`CubicLevel::new`] over a generation made by the caller (an Earth
+    /// level over tiles of its own, `Generation::with_tiles`).
+    pub fn with_generation(
+        level_dir: &Path,
+        seed: i64,
+        registry: &'static BlockRegistry,
+        biomes: &Arc<Biomes>,
+        window: LevelShape,
+        generation: &CubicGeneration,
+        wg: Generation,
+    ) -> Result<Arc<Self>, String> {
+        let wg = Arc::new(wg);
         let io = Arc::new(CubeIo {
             store: CubeStore::new(level_dir),
             pending: Mutex::default(),
             queued: (Mutex::new(0usize), Condvar::new()),
         });
+        let earth_follow = match &wg.earth {
+            Some(earth) if earth.tiles.downloads => {
+                crate::earth_prefetch::Prefetcher::start(&wg.generator, crate::earth_prefetch::GAP)
+            }
+            _ => None,
+        };
+        // The far terrain cache is keyed by what decides the terrain.
+        let fingerprint_text = match &wg.earth {
+            Some(earth) => earth_terrain_text(&earth.settings),
+            None => generation.settings_json.clone(),
+        };
         let (send, receive) = channel::<(SectionPos, Arc<Record>)>();
         let writer = io.clone();
         std::thread::Builder::new()
@@ -569,10 +598,11 @@ impl CubicLevel {
 ",
                     crate::lod::cube_cache::fingerprint(seed, registry.len()),
                     generation.kind.id(),
-                    settings_hash(&generation.settings_json)
+                    settings_hash(&fingerprint_text)
                 ),
             ),
             ring: crate::cubic_prefetch::Ring::new(),
+            earth_follow,
             surfaces: Mutex::default(),
             vanilla_write: Mutex::new(()),
             shard_maker: std::sync::OnceLock::new(),
@@ -613,11 +643,13 @@ impl CubicLevel {
     /// Where a new world's spawn search starts (`game/initial_spawn.rs`): the
     /// chunk and the height to stand at, for a world that is not Hybrid. A
     /// Flat world's is the origin; a Custom world's, the first chunk of a
-    /// spiral round it whose surface is above the sea (land).
+    /// spiral round it whose surface is above the sea (land); an Earth
+    /// world's, world block (0, 0) ([`Self::earth_spawn_origin`]).
     pub fn spawn_origin(&self) -> Option<((i32, i32), i32)> {
         let generator = &self.wg.generator;
         match self.wg.kind {
             CubicKind::Hybrid => None,
+            CubicKind::Earth => self.earth_spawn_origin()?.ok(),
             CubicKind::Flat => {
                 let y = generator.surface_y(8, 8, 320).unwrap_or(0);
                 Some(((0, 0), y + 1))
@@ -645,6 +677,79 @@ impl CubicLevel {
                 best.or(Some(((0, 0), sea + 1)))
             }
         }
+    }
+
+    /// An Earth world's spawn: the chunk of world block (0, 0) and the height
+    /// to stand at, on the exact surface there, or on the water when the
+    /// origin is under the sea. `None` for the other types. It reads only
+    /// tiles that are local or load at once: when the tile at the origin is
+    /// neither cached nor downloadable, the error says so (and why), instead
+    /// of waiting for it for ever.
+    pub fn earth_spawn_origin(&self) -> Option<Result<((i32, i32), i32), String>> {
+        let earth = self.wg.generator.earth_generator()?;
+        let (x, z) = (0, 0);
+        let missing = match earth.surface_y(x, z) {
+            Ok(surface) => {
+                return Some(Ok((
+                    (x >> 4, z >> 4),
+                    spawn_height(surface, earth.sea_level()),
+                )));
+            }
+            Err(not_ready) => not_ready.tiles,
+        };
+        // One try at the tile, for the reason it cannot be had.
+        let why = missing.first().map_or_else(
+            || "there is no elevation data there".to_owned(),
+            |&id| match earth.field().store().load(id) {
+                Ok(_) => "there is no elevation data there".to_owned(),
+                Err(e) => format!("{e}"),
+            },
+        );
+        Some(match earth.surface_y(x, z) {
+            Ok(surface) => Ok(((x >> 4, z >> 4), spawn_height(surface, earth.sea_level()))),
+            Err(_) => Err(format!(
+                "Earth: the elevation tiles at the world's origin are not available ({why}). \
+                 Give the world a tile server and allow downloads, or put the tiles in {}",
+                self.wg.earth.as_ref().map_or_else(
+                    || "the tile cache".to_owned(),
+                    |e| e.tiles.dir.display().to_string()
+                )
+            )),
+        })
+    }
+
+    /// Aims the Earth tile prefetcher at the players' columns (`centres`),
+    /// `near` chunks of load distance and `far` chunks of far view around
+    /// them. Does nothing for the other types, or a world that downloads
+    /// nothing.
+    pub fn follow_players(&self, centres: &[(i32, i32)], near: i32, far: i32) {
+        if let Some(follow) = &self.earth_follow {
+            follow.follow(crate::earth_prefetch::Target {
+                centres: centres.to_vec(),
+                near_chunks: near,
+                far_chunks: far,
+            });
+        }
+    }
+
+    /// The level is shutting down: an Earth generator stops waiting for tiles
+    /// and its prefetcher stops, so no worker stays blocked on a download.
+    /// What the generator made once this was called is not terrain (air in
+    /// place of what it could not read) and is never kept: not cached, not
+    /// written, not handed to the far view. Does nothing for the other types.
+    pub fn cancel_generation(&self) {
+        self.wg.generator.set_earth_cancelled(true);
+        if let Some(follow) = &self.earth_follow {
+            follow.stop();
+        }
+    }
+
+    /// Whether [`Self::cancel_generation`] was called on an Earth level.
+    pub fn generation_cancelled(&self) -> bool {
+        self.wg
+            .generator
+            .earth_generator()
+            .is_some_and(|earth| earth.is_cancelled())
     }
 
     /// The client's biome table (the ids sections and far nodes carry).
@@ -927,7 +1032,10 @@ impl CubicLevel {
             }
         }
         let held = self.generate(pos);
-        self.pop.keep(pos, held.clone());
+        // Nothing made after the generator was cancelled is terrain.
+        if !self.generation_cancelled() {
+            self.pop.keep(pos, held.clone());
+        }
         (held, false)
     }
 
@@ -1420,11 +1528,13 @@ impl CubicLevel {
                 } else {
                     Some(Arc::new(self.generated_surface(x, z)))
                 };
-                let mut surfaces = self.surfaces.lock().unwrap();
-                if surfaces.len() >= 1 << 16 {
-                    surfaces.clear();
+                if !self.generation_cancelled() {
+                    let mut surfaces = self.surfaces.lock().unwrap();
+                    if surfaces.len() >= 1 << 16 {
+                        surfaces.clear();
+                    }
+                    surfaces.insert((x, z), surface.clone());
                 }
-                surfaces.insert((x, z), surface.clone());
                 surface
             }
         };
@@ -1436,6 +1546,17 @@ impl CubicLevel {
     /// (columns with no surface read as far below).
     fn generated_surface(&self, x: i32, z: i32) -> Vec<i32> {
         let mut heights = vec![i32::MIN / 2; 256];
+        // An Earth column's surface is known to the block, from the tiles.
+        if let Some(earth) = self.wg.generator.earth_generator() {
+            if let Some(tops) = earth.chunk_tops_blocking(x, z)
+                && tops.len() == 256
+            {
+                for (h, top) in heights.iter_mut().zip(tops) {
+                    *h = top.saturating_add(1);
+                }
+            }
+            return heights;
+        }
         let mut sample = [[0i32; 2]; 2];
         for (qz, row) in sample.iter_mut().enumerate() {
             for (qx, cell) in row.iter_mut().enumerate() {
@@ -1520,7 +1641,12 @@ impl CubicLevel {
                 self.note_entities(pos, false);
                 return;
             }
-            None => self.blank_record(pos, &ctx),
+            // The generator's cube cannot be trusted once it was cancelled:
+            // the entities wait in the world, which is closing.
+            None => match self.blank_record(pos, &ctx) {
+                Some(root) => root,
+                None => return,
+            },
         };
         self.note_entities(pos, !entities.is_empty());
         if record_entities(&root) == entities {
@@ -1535,9 +1661,9 @@ impl CubicLevel {
     fn add_cube_entities(&self, pos: SectionPos, entities: Vec<Tag>) {
         let _edit = self.edit.lock().unwrap();
         let ctx = self.codec();
-        let mut root = self
-            .read(pos)
-            .unwrap_or_else(|| self.blank_record(pos, &ctx));
+        let Some(mut root) = self.read(pos).or_else(|| self.blank_record(pos, &ctx)) else {
+            return;
+        };
         let mut all = record_entities(&root);
         all.extend(entities);
         self.note_entities(pos, !all.is_empty());
@@ -1545,16 +1671,21 @@ impl CubicLevel {
         self.write_later(pos, root);
     }
 
-    /// A record of cube `pos` as the generator makes it.
-    fn blank_record(&self, pos: SectionPos, ctx: &Codec) -> NamedTag {
+    /// A record of cube `pos` as the generator makes it; `None` when an Earth
+    /// generator was cancelled, whose cube is not terrain.
+    fn blank_record(&self, pos: SectionPos, ctx: &Codec) -> Option<NamedTag> {
         let section = if self.is_vanilla(pos.y) {
             Arc::new(Section::default())
         } else {
-            self.terrain_section(pos).0
+            let section = self.terrain_section(pos).0;
+            if self.generation_cancelled() {
+                return None;
+            }
+            section
         };
         let mut one = Chunk::with_layout(pos.x, pos.z, ColumnLayout::window(pos.y * 16, 16));
         one.sections[0] = section;
-        ctx.encode(&one, 0, false, &[])
+        Some(ctx.encode(&one, 0, false, &[]))
     }
 
     /// Moves the entities a column of an older save kept in its entity file
@@ -1643,8 +1774,25 @@ impl CubicLevel {
 
 impl Drop for CubicLevel {
     fn drop(&mut self) {
+        self.cancel_generation();
         self.send.lock().unwrap().take();
     }
+}
+
+/// The block Y to stand at over an Earth column whose ground is at `surface`
+/// with the sea at `sea`: on the ground, or on the water over it.
+fn spawn_height(surface: i32, sea: i32) -> i32 {
+    surface.saturating_add(1).max(sea)
+}
+
+/// The Earth settings that decide what a level's terrain looks like, as the
+/// far terrain cache's key: the tile server and the download switch do not
+/// (the same place gives the same land whoever serves the tiles).
+fn earth_terrain_text(settings: &horizon_world::cubic::earth::EarthSettings) -> String {
+    let mut terrain = settings.clone();
+    terrain.tile_url.clear();
+    terrain.allow_downloads = false;
+    terrain.to_json_compact()
 }
 
 /// The writer thread: cubes to disk in the order they were queued, until
@@ -2383,6 +2531,45 @@ mod tests {
                 window,
                 &generation,
                 None,
+            )
+            .expect("level");
+            level.set_tables(self.tables.clone());
+            level
+        }
+        /// An Earth level over synthetic tiles (`fetcher`), caching them in a
+        /// folder of the fixture's.
+        fn earth_level(
+            &self,
+            settings: &horizon_world::cubic::earth::EarthSettings,
+            fetcher: Arc<horizon_earth::testing::MemoryFetcher>,
+        ) -> Arc<CubicLevel> {
+            let dir = self.dir.join("tiles");
+            let tiles = crate::earth_net::EarthTiles {
+                store: Arc::new(horizon_earth::TileStore::new(&dir, fetcher, 64)),
+                downloads: true,
+                dir,
+            };
+            let generation = CubicGeneration {
+                kind: CubicKind::Earth,
+                settings_json: settings.to_json_compact(),
+            };
+            let wg = Generation::with_tiles(
+                &generation,
+                1,
+                self.assets.registry,
+                None,
+                Some(Arc::new(tiles)),
+            )
+            .expect("generation");
+            let window = LevelShape::cubic_window(LevelShape::OVERWORLD, -192, 512);
+            let level = CubicLevel::with_generation(
+                &self.dir,
+                1,
+                self.assets.registry,
+                &self.biomes,
+                window,
+                &generation,
+                wg,
             )
             .expect("level");
             level.set_tables(self.tables.clone());
@@ -3660,5 +3847,238 @@ mod tests {
         drop(made);
         drop(level);
         let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    // ---------------------------------------------------------------- Earth
+
+    use horizon_earth::testing::MemoryFetcher;
+    use horizon_world::cubic::earth::EarthSettings;
+
+    /// Land at about 300 m with 40 m ripples a couple of hundred metres across.
+    fn hills(lat: f64, lon: f64) -> f64 {
+        300.0 + 40.0 * (lat * 3000.0).sin() + 25.0 * (lon * 4000.0).cos()
+    }
+
+    fn earth_settings() -> EarthSettings {
+        let mut s = EarthSettings::at(46.0, 7.5);
+        s.metres_per_block = 2.0;
+        s.sea_level_y = 63;
+        s
+    }
+
+    /// The block height the surface should be at the origin, worked out from the terrain function alone.
+    fn origin_surface() -> i32 {
+        63 + (hills(46.0, 7.5) / 2.0).floor() as i32
+    }
+
+    fn block_at(level: &CubicLevel, x: i32, y: i32, z: i32) -> u32 {
+        let cube = level.make_cube(SectionPos::new(x >> 4, y >> 4, z >> 4));
+        cube.section
+            .get(((y & 15) << 8) as usize | ((z & 15) << 4) as usize | (x & 15) as usize)
+    }
+
+    #[test]
+    fn an_earth_level_spawns_at_the_origin_on_the_surface() {
+        let Some(f) = Fixture::new("earth-spawn") else {
+            return;
+        };
+        let level = f.earth_level(&earth_settings(), Arc::new(MemoryFetcher::new(hills)));
+        assert_eq!(level.kind(), CubicKind::Earth);
+        let ((cx, cz), y) = level.spawn_origin().expect("a spawn");
+        assert_eq!((cx, cz), (0, 0));
+        let surface = origin_surface();
+        assert!(
+            (y - 1 - surface).abs() <= 2,
+            "the player stands at {y}, over a surface near {surface}"
+        );
+        // The blocks agree: grass under the feet, air at them.
+        assert_eq!(
+            block_at(&level, 0, y - 1, 0),
+            f.state("minecraft:grass_block")
+        );
+        assert_eq!(block_at(&level, 0, y, 0), f.state("minecraft:air"));
+        assert_eq!(level.earth_spawn_origin().unwrap().unwrap(), ((0, 0), y));
+    }
+
+    #[test]
+    fn an_earth_spawn_over_the_sea_stands_on_the_water() {
+        let Some(f) = Fixture::new("earth-sea-spawn") else {
+            return;
+        };
+        let ocean = |_: f64, _: f64| -200.0;
+        let level = f.earth_level(&earth_settings(), Arc::new(MemoryFetcher::new(ocean)));
+        let (_, y) = level.spawn_origin().expect("a spawn");
+        // The sea is at 63 (its top water block is 62): the player is on it.
+        assert_eq!(y, 63);
+        assert_eq!(block_at(&level, 0, 62, 0), f.state("minecraft:water"));
+        assert_eq!(block_at(&level, 0, 63, 0), f.state("minecraft:air"));
+    }
+
+    #[test]
+    fn an_earth_spawn_says_why_when_the_origin_has_no_tile() {
+        let Some(f) = Fixture::new("earth-no-spawn") else {
+            return;
+        };
+        let fetcher = Arc::new(MemoryFetcher::new(hills));
+        fetcher.fail_with(Some(horizon_earth::FetchError::Other(
+            "tile downloads are off".into(),
+        )));
+        let level = f.earth_level(&earth_settings(), fetcher);
+        let error = level.earth_spawn_origin().unwrap().unwrap_err();
+        assert!(error.contains("tile downloads are off"), "{error}");
+        assert!(error.contains("origin"), "{error}");
+        assert_eq!(level.spawn_origin(), None);
+    }
+
+    #[test]
+    fn an_earth_cube_at_the_surface_follows_the_terrain_rule() {
+        let Some(f) = Fixture::new("earth-surface") else {
+            return;
+        };
+        let level = f.earth_level(&earth_settings(), Arc::new(MemoryFetcher::new(hills)));
+        let (_, stand) = level.spawn_origin().unwrap();
+        let s = stand - 1;
+        let name = |n: &str| f.state(n);
+        // Stone from four below the surface down, soil between, grass on top, then sky.
+        assert_eq!(block_at(&level, 0, s, 0), name("minecraft:grass_block"));
+        for y in s - 3..s {
+            assert_eq!(block_at(&level, 0, y, 0), name("minecraft:dirt"), "y {y}");
+        }
+        for y in [s - 4, s - 5, s - 40] {
+            assert_eq!(block_at(&level, 0, y, 0), name("minecraft:stone"), "y {y}");
+        }
+        for y in [s + 1, s + 2, s + 60] {
+            assert_eq!(block_at(&level, 0, y, 0), name("minecraft:air"), "y {y}");
+        }
+        // The column is a plains one, and a generated cube is not a saved one.
+        assert_eq!(level.biome_id_at(0, 0), f.biomes.id("minecraft:plains"));
+        let at = SectionPos::new(0, s >> 4, 0);
+        assert!(level.make_cube(at).generated);
+        assert!(level.read(at).is_none());
+    }
+
+    #[test]
+    fn earth_cubes_high_in_the_sky_and_deep_underground_are_uniform_and_shared() {
+        let Some(f) = Fixture::new("earth-uniform") else {
+            return;
+        };
+        let level = f.earth_level(&earth_settings(), Arc::new(MemoryFetcher::new(hills)));
+        let section = |x, y, z| level.make_cube(SectionPos::new(x, y, z)).section;
+        let (a, b) = (section(0, 200, 0), section(5, 300, -3));
+        assert!(a.same_as(&b));
+        assert_eq!(a.get(0), f.state("minecraft:air"));
+        assert_eq!(a.get(4095), f.state("minecraft:air"));
+        let (c, d) = (section(0, -100, 0), section(-4, -300, 7));
+        assert!(c.same_as(&d));
+        assert_eq!(c.get(0), f.state("minecraft:stone"));
+        assert_eq!(c.get(2048), f.state("minecraft:stone"));
+        // They are the same section, not equal copies.
+        assert!(Arc::ptr_eq(&section(1, 250, 1), &section(2, 251, 2)));
+    }
+
+    #[test]
+    fn an_earth_world_file_round_trips_and_its_cubes_are_never_populated() {
+        let Some(f) = Fixture::new("earth-world-file") else {
+            return;
+        };
+        crate::cubic::mark_cubic_world(&f.dir).unwrap();
+        let settings = earth_settings();
+        crate::cubic_settings::save_world_generation(
+            &f.dir,
+            CubicKind::Earth,
+            &settings.to_json_compact(),
+        )
+        .unwrap();
+        let generation = CubicGeneration::of_world(&f.dir);
+        assert_eq!(generation.kind, CubicKind::Earth);
+        assert_eq!(
+            EarthSettings::from_json(&generation.settings_json).unwrap(),
+            settings
+        );
+        assert!(!needs_population(
+            CubicKind::Earth,
+            SectionPos::new(0, 5, 0)
+        ));
+        assert!(!needs_population(
+            CubicKind::Earth,
+            SectionPos::new(9, -90, 4)
+        ));
+    }
+
+    #[test]
+    fn what_an_earth_generator_made_after_it_was_cancelled_is_never_kept_or_saved() {
+        let Some(f) = Fixture::new("earth-cancel") else {
+            return;
+        };
+        let fetcher = Arc::new(MemoryFetcher::new(hills));
+        fetcher.fail_with(Some(horizon_earth::FetchError::Temporary(
+            "no route".into(),
+        )));
+        let level = f.earth_level(&earth_settings(), fetcher);
+        let pos = SectionPos::new(0, 13, 0);
+        let worker = {
+            let level = level.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                (level.make_cube(pos), started.elapsed())
+            })
+        };
+        // The worker is stuck waiting for a tile that does not come.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!worker.is_finished());
+        level.cancel_generation();
+        let (cube, waited) = worker.join().unwrap();
+        assert!(waited < std::time::Duration::from_secs(3), "{waited:?}");
+        assert!(level.generation_cancelled());
+        // It made air in place of terrain, which the level did not keep...
+        assert_eq!(cube.section.get(0), f.state("minecraft:air"));
+        assert!(level.pop.cached(pos).is_none());
+        // ... and a save that would write the generator's cube, for the entities in it, writes nothing.
+        level.save_cube_entities(pos, vec![mob(1, 13.0 * 16.0 + 2.0)]);
+        level.flush();
+        assert!(level.read(pos).is_none());
+        // Nor is the sky cover cached.
+        let _ = level.sky_cover(0, 0, level.window());
+        assert!(level.surfaces.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_earth_level_that_downloads_follows_the_players_and_stops_at_shutdown() {
+        let Some(f) = Fixture::new("earth-follow") else {
+            return;
+        };
+        let fetcher = Arc::new(MemoryFetcher::new(hills));
+        let level = f.earth_level(&earth_settings(), fetcher.clone());
+        let earth = level.generation().generator.clone();
+        level.follow_players(&[(0, 0)], 3, 0);
+        assert!(wait_until(|| fetcher.fetch_count() > 0));
+        assert!(wait_until(|| earth
+            .earth_generator()
+            .unwrap()
+            .missing_tiles(-100, -100, 100, 100)
+            .is_empty()));
+        level.cancel_generation();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let count = fetcher.fetch_count();
+        level.follow_players(&[(4000, 4000)], 3, 0);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(fetcher.fetch_count(), count, "a stopped prefetcher fetched");
+    }
+
+    #[test]
+    fn the_far_cache_of_an_earth_level_ignores_the_tile_server_but_not_the_place() {
+        let mut a = earth_settings();
+        let mut b = a.clone();
+        b.tile_url = "https://tiles.example.com/{z}/{x}/{y}.png".into();
+        b.allow_downloads = true;
+        assert_eq!(earth_terrain_text(&a), earth_terrain_text(&b));
+        a.origin_latitude += 0.01;
+        assert_ne!(earth_terrain_text(&a), earth_terrain_text(&b));
+        let mut c = earth_settings();
+        c.vertical_exaggeration = 2.0;
+        assert_ne!(
+            earth_terrain_text(&c),
+            earth_terrain_text(&earth_settings())
+        );
     }
 }

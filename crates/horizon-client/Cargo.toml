@@ -28,6 +28,8 @@ horizon-optifine = { path = "../horizon-optifine" }
 horizon-threads = { path = "../horizon-threads" }
 horizon-hdr = { path = "../horizon-hdr" }
 horizon-world = { path = "../horizon-world" }
+# Real-world elevation tiles: Earth worlds (earth_net.rs fetches them).
+horizon-earth = { path = "../horizon-earth" }
 horizon-protocol = { path = "../horizon-protocol" }
 # server.properties, eula.txt and the user lists, shared with horizon-server.
 horizon-server-files = { path = "../horizon-server-files" }
@@ -175,5 +177,7 @@ workspace = true
 [dev-dependencies]
 horizon-client-render = { path = "../horizon-client-render", features = ["test-support"] }
 horizon-items = { path = "../horizon-items", features = ["test-support"] }
+# Synthetic tiles for the Earth tests (no network).
+horizon-earth = { path = "../horizon-earth", features = ["testing"] }
 # Every WGSL shader translated as wgpu's DirectX 12 backend does (gfx.rs tests).
 naga = { version = "30.0.1", features = ["wgsl-in", "hlsl-out", "msl-out", "spv-out"] }

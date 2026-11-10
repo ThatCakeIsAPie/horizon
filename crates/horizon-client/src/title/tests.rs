@@ -2789,12 +2789,12 @@ fn cubic_kind(f: &Fixture) -> Option<crate::cubic_settings::CubicKind> {
 
 #[test]
 fn the_cubic_world_type_cycles_and_customize_follows_it() {
-    use crate::cubic_settings::CubicKind::{Custom, Flat, Hybrid};
+    use crate::cubic_settings::CubicKind::{Custom, Earth, Flat, Hybrid};
     let mut f = Fixture::new();
     let size = open_world_tab(&mut f);
     assert_eq!(cubic_kind(&f), None);
     assert!(!button_by_id(&f, size, 37).enabled);
-    for expected in [Some(Custom), Some(Hybrid), Some(Flat), None] {
+    for expected in [Some(Custom), Some(Hybrid), Some(Flat), Some(Earth), None] {
         press_id(&mut f, size, 36);
         assert_eq!(cubic_kind(&f), expected);
         assert_eq!(button_by_id(&f, size, 37).enabled, expected.is_some());
@@ -2989,4 +2989,53 @@ fn cancelling_a_realms_new_world_returns_to_the_realm() {
         crate::realms::SubScreen::Configure { .. }
     ));
     let _ = fs::remove_dir_all(&f.root);
+}
+
+#[test]
+fn an_earth_world_has_its_own_settings_that_no_other_type_keeps() {
+    use crate::cubic_settings::CubicKind::{Earth, Flat};
+    let mut f = Fixture::new();
+    let size = open_world_tab(&mut f);
+    // Custom, Hybrid, Flat, Earth.
+    for _ in 0..4 {
+        press_id(&mut f, size, 36);
+    }
+    assert_eq!(cubic_kind(&f), Some(Earth));
+    press_id(&mut f, size, 37);
+    let Mode::CreateCubic { cubic, .. } = &f.title.mode else {
+        panic!("the Customize screen is open")
+    };
+    assert_eq!((cubic.kind(), cubic.page_count()), (Earth, 1));
+    // Done writes Earth's JSON, not Custom's.
+    press_id(&mut f, size, 100);
+    let Mode::Create { options, .. } = &f.title.mode else {
+        panic!("Done returns to Create New World")
+    };
+    assert!(
+        options.cubic_json.contains("\"originLatitude\""),
+        "{}",
+        options.cubic_json
+    );
+    assert!(!options.cubic_json.contains("dungeonCount"));
+    // Cycling away and back to a type with another format starts from its defaults: Flat's layers never
+    // arrive in an Earth world's settings, nor Earth's place in a Flat one's.
+    press_id(&mut f, size, 36);
+    let Mode::Create { options, .. } = &f.title.mode else {
+        panic!()
+    };
+    assert_eq!(options.cubic, None);
+    assert!(options.cubic_json.is_empty());
+    for _ in 0..3 {
+        press_id(&mut f, size, 36);
+    }
+    assert_eq!(cubic_kind(&f), Some(Flat));
+    press_id(&mut f, size, 36);
+    let Mode::Create { options, .. } = &f.title.mode else {
+        panic!()
+    };
+    assert_eq!(options.cubic, Some(Earth));
+    assert!(
+        options.cubic_json.is_empty(),
+        "Earth starts over from its defaults"
+    );
 }

@@ -229,15 +229,16 @@ impl WorldOptions {
     pub(super) fn press(&mut self, id: u8, creative: &mut bool) {
         self.cycle(id, creative, 1);
     }
-    /// The Cubic Chunks button: Off, Custom Cubic, Hybrid, Flat Cubic. A
-    /// settings text of another kind starts over from the defaults, which
-    /// Custom Cubic and Hybrid share.
+    /// The Cubic Chunks button: Off, Custom Cubic, Hybrid, Flat Cubic, Earth. A
+    /// settings text of another format starts over from the defaults; Custom
+    /// Cubic and Hybrid share theirs.
     fn cycle_cubic(&mut self, step: i32) {
         use crate::cubic_settings::CubicKind;
         let before = self.cubic;
         self.cubic = CubicKind::cycle(self.cubic, step);
-        let terrain = |kind: Option<CubicKind>| kind.is_some_and(CubicKind::has_terrain_settings);
-        if terrain(before) != terrain(self.cubic) || self.cubic.is_none() {
+        let same_format =
+            matches!((before, self.cubic), (Some(a), Some(b)) if a.shares_settings(b));
+        if !same_format {
             self.cubic_json.clear();
         }
     }
