@@ -81,6 +81,7 @@ To play, use [the launcher](../launcher/README.md); the project site is [playhor
 
 - [World generation](world-generation.md): the pipeline from noise to features. Each stage's vanilla comparison is its harness (`tools/test_<name>_parity.py`); `python3 tools/port_ledger.py where Class.method` finds the Rust port of a vanilla method.
 - [World height](world-height.md): each level's shape from its dimension type, data packs' taller levels.
+- [Earth](earth.md): the real world as terrain: create a world at a place on the globe from public elevation tiles, the settings, the player's approval of tile servers, the data's attribution, limits and design.
 - [Pregeneration](pregeneration.md): `/pregen`, generating, lighting and saving an area ahead of the players.
 
 ## Architecture: world data and simulation

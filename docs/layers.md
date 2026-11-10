@@ -595,6 +595,7 @@ Horizon's own and third-party addresses (Horizon layer):
 | `api.modrinth.com`, `cdn.modrinth.com` | the in-game resource pack browser, modpack porting | `pack_browser.rs`, `horizon-port-pack` |
 | `github.com`, `raw.githubusercontent.com`, `gitlab.com`, `maven.neoforged.net` | modpack porting's sources | `horizon-port-pack` |
 | `playhorizon.dev` | the download link shown with no resources | `no_resources.rs` |
+| `s3.amazonaws.com` (AWS Terrain Tiles) | the tile address Earth's settings page offers (downloads still need the player's approval, docs/earth.md) | `horizon-addresses`, passed in through `Hooks::earth_tile_address` (`horizon-earth-source`) |
 | `api.github.com`, `discord.com` | hosting: updates, Discord webhooks | `horizon-server` |
 | `api.github.com`, `uploads.github.com`, `playhorizon.dev` | the registry's submission service | `horizon-mod-registry` |
 | Modrinth, CurseForge, Fabric, Quilt, Forge, NeoForge, GitHub, Microsoft and Xbox sign-in, Tailscale, `discord.gg`, `mclo.gs`, Sculk Hosting, `static.rust-lang.org`, GitHub Sponsors | the launcher's browsers, loaders, sign-in, logs, hosting, partner and sponsor pages | `launcher/src/`, `launcher/links.json` |
