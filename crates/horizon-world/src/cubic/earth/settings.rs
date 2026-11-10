@@ -110,6 +110,28 @@ impl EarthSettings {
         Ok(())
     }
 
+    /// The elevation field these settings describe over `store`: the projection from world blocks to the
+    /// globe, the height map and the finest zoom. The generator reads its terrain through it, and so does
+    /// whoever needs a surface height before a generator exists.
+    pub fn elevation_field(
+        &self,
+        store: std::sync::Arc<horizon_earth::TileStore>,
+    ) -> Result<horizon_earth::ElevationField, String> {
+        self.validate()?;
+        let projection = horizon_earth::Projection::local(
+            self.origin_latitude,
+            self.origin_longitude,
+            self.metres_per_block,
+        )
+        .map_err(|e| e.to_string())?;
+        let vertical = horizon_earth::VerticalMap::new(self.sea_level_y, self.metres_per_block)
+            .with_exaggeration(self.vertical_exaggeration);
+        Ok(
+            horizon_earth::ElevationField::new(store, projection, vertical)
+                .with_max_zoom(self.max_zoom),
+        )
+    }
+
     /// Parses and validates the JSON of a world's Earth settings. Unknown fields are ignored; a missing origin
     /// is an error.
     pub fn from_json(text: &str) -> Result<Self, String> {

@@ -2278,6 +2278,55 @@ pub fn saved_window(world_root: &Path) -> Option<(i32, i32)> {
     Some((min_y, height))
 }
 
+/// The window an Earth world opens with when it has none saved: the default
+/// height of a window, around the cube the player stands in. That is the
+/// saved player's cube when there is one, else the spawn's: world block
+/// (0, 0)'s surface (or the sea over a sunken origin, `spawn_height`), read
+/// from the tiles the way the spawn is (`CubicLevel::earth_spawn_origin`), so
+/// the first window holds the ground wherever on the globe the world is.
+/// `None` for the other types, and for an Earth world whose origin tile is
+/// not available: it opens on the default window and the spawn says why.
+pub fn earth_first_window(world_root: &Path) -> Option<(i32, i32)> {
+    use horizon_world::cubic::earth::EarthSettings;
+    let (kind, json) = crate::cubic_settings::load_world_generation(world_root)?;
+    if kind != crate::cubic_settings::CubicKind::Earth {
+        return None;
+    }
+    let saved = crate::save::Level::read(world_root)
+        .filter(|level| level.dimension == "minecraft:overworld")
+        .and_then(|level| level.position);
+    let settings = EarthSettings::from_json(&json).ok()?;
+    let tiles = crate::earth_net::open(&settings, &crate::earth_net::cache_root());
+    earth_window(
+        &settings,
+        tiles.store.clone(),
+        saved.map(|p| p[1].floor() as i32),
+    )
+}
+
+/// [`earth_first_window`] over `store`: the window around `feet` when the
+/// player is known to be there, else around the spawn at world block (0, 0).
+fn earth_window(
+    settings: &horizon_world::cubic::earth::EarthSettings,
+    store: Arc<horizon_earth::TileStore>,
+    feet: Option<i32>,
+) -> Option<(i32, i32)> {
+    let feet = match feet {
+        Some(y) => y,
+        None => {
+            let field = settings.elevation_field(store).ok()?;
+            let zoom = field.zoom_for(settings.metres_per_block);
+            let surface = field.surface_y_blocking(0, 0, zoom).ok()??;
+            spawn_height(surface, settings.sea_level_y)
+        }
+    };
+    let window = window_of_cubes(
+        LevelShape::OVERWORLD,
+        wanted_cubes(feet >> 4, DEFAULT_VERTICAL),
+    );
+    Some((window.min_y, window.height))
+}
+
 /// Records the bottom and height (blocks) of the window a cubic world's
 /// Overworld holds. The world type Create World chose stays (`cubic_settings`).
 pub fn save_window(world_root: &Path, min_y: i32, height: i32) -> std::io::Result<()> {
@@ -2307,10 +2356,12 @@ pub fn cubic_shapes(
     {
         return shapes;
     }
-    let (min_y, height) = saved_window(world_root).unwrap_or((
-        FIRST_WINDOW_MIN_Y,
-        window_cubes(i32::from(DEFAULT_VERTICAL)) * 16,
-    ));
+    let (min_y, height) = saved_window(world_root)
+        .or_else(|| earth_first_window(world_root))
+        .unwrap_or((
+            FIRST_WINDOW_MIN_Y,
+            window_cubes(i32::from(DEFAULT_VERTICAL)) * 16,
+        ));
     shapes.overworld = LevelShape::cubic_window(shapes.overworld, min_y, height);
     shapes
 }
@@ -3849,6 +3900,141 @@ mod tests {
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 
+    // ---------------------------------------------------------------- Earth's first window
+
+    /// A tile store over synthetic terrain, caching in a folder of its own.
+    fn synthetic_store(
+        name: &str,
+        fetcher: Arc<horizon_earth::testing::MemoryFetcher>,
+    ) -> Arc<horizon_earth::TileStore> {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-earth-window-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(horizon_earth::TileStore::new(&dir, fetcher, 16))
+    }
+
+    /// The first cube the window holds and the last, in blocks.
+    fn blocks_held(window: (i32, i32)) -> (i32, i32) {
+        (window.0, window.0 + window.1 - 1)
+    }
+
+    #[test]
+    fn a_new_earth_world_over_a_high_summit_opens_its_window_on_the_summit() {
+        use horizon_world::cubic::earth::EarthSettings;
+        // A 1 block per metre world whose origin stands about 8,700 m up.
+        let summit =
+            |lat: f64, lon: f64| 8700.0 + 20.0 * (lat * 2000.0).sin() + 10.0 * (lon * 3000.0).cos();
+        let mut settings = EarthSettings::at(27.9881, 86.925);
+        settings.metres_per_block = 1.0;
+        let store = synthetic_store(
+            "summit",
+            Arc::new(horizon_earth::testing::MemoryFetcher::new(summit)),
+        );
+        let window = earth_window(&settings, store, None).expect("a window");
+        assert_eq!(window.0 % 16, 0);
+        assert_eq!(window.1 % 16, 0);
+        assert_eq!(window.1, window_cubes(i32::from(DEFAULT_VERTICAL)) * 16);
+        // The ground at the origin, from the terrain function alone (the tiles interpolate between
+        // pixels, a few blocks off); the player stands on it. The window reaches the vertical
+        // distance (V cubes) below and above that, and not much further.
+        let ground = summit(27.9881, 86.925).floor() as i32;
+        let v = i32::from(DEFAULT_VERTICAL) * 16;
+        let (low, high) = blocks_held(window);
+        assert!(
+            low <= ground - 4 - v,
+            "window starts at {low}, ground {ground}"
+        );
+        assert!(
+            high >= ground + 4 + v,
+            "window ends at {high}, ground {ground}"
+        );
+        assert!(
+            low > ground - v - 64 && high < ground + v + 64,
+            "{low}..{high}"
+        );
+    }
+
+    #[test]
+    fn a_new_earth_world_over_a_sunken_origin_opens_its_window_on_the_water() {
+        use horizon_world::cubic::earth::EarthSettings;
+        let mut settings = EarthSettings::at(10.0, 20.0);
+        // The sea is high up and the sea floor 200 m under it: the player stands on the water.
+        settings.sea_level_y = 5000;
+        let store = synthetic_store(
+            "sunken",
+            Arc::new(horizon_earth::testing::MemoryFetcher::new(|_, _| -200.0)),
+        );
+        let window = earth_window(&settings, store, None).expect("a window");
+        let (low, high) = blocks_held(window);
+        let v = i32::from(DEFAULT_VERTICAL) * 16;
+        assert!(low <= 5000 - v && high >= 5000 + v, "{low}..{high}");
+        assert!(low > 5000 - v - 64 && high < 5000 + v + 64);
+    }
+
+    #[test]
+    fn an_earth_world_without_its_origin_tile_keeps_the_default_window() {
+        use horizon_world::cubic::earth::EarthSettings;
+        let fetcher = Arc::new(horizon_earth::testing::MemoryFetcher::new(|_, _| 100.0));
+        fetcher.fail_with(Some(horizon_earth::FetchError::Other("no network".into())));
+        let store = synthetic_store("offline", fetcher);
+        assert_eq!(
+            earth_window(&EarthSettings::at(46.0, 7.5), store, None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_player_already_somewhere_decides_an_earth_window_over_the_spawn() {
+        use horizon_world::cubic::earth::EarthSettings;
+        let store = synthetic_store(
+            "player",
+            Arc::new(horizon_earth::testing::MemoryFetcher::new(|_, _| 300.0)),
+        );
+        let window = earth_window(&EarthSettings::at(46.0, 7.5), store, Some(1234)).unwrap();
+        let (low, high) = blocks_held(window);
+        assert!(low <= 1234 && 1234 <= high);
+        assert_eq!(
+            window_cube_range(window_of_cubes(
+                LevelShape::OVERWORLD,
+                (low >> 4, high >> 4)
+            )),
+            (low >> 4, high >> 4)
+        );
+    }
+
+    #[test]
+    fn a_saved_earth_window_is_kept_and_other_types_are_left_alone() {
+        let dir =
+            std::env::temp_dir().join(format!("horizon-earth-saved-window-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("horizon_cubic.json"),
+            r#"{"cubic":true,"type":"earth","window_min_y":9856,"window_height":304}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("cubicgen.json"),
+            r#"{"originLatitude":27.9881,"originLongitude":86.925,"tileUrl":"http://127.0.0.1:9/{z}/{x}/{y}.png"}"#,
+        )
+        .unwrap();
+        let shapes = cubic_shapes(&dir, crate::chunk::LevelShapes::VANILLA);
+        assert_eq!(
+            (shapes.overworld.min_y, shapes.overworld.height),
+            (9856, 304)
+        );
+        // A Custom world with no window has none chosen for it.
+        std::fs::write(
+            dir.join("horizon_cubic.json"),
+            r#"{"cubic":true,"type":"custom"}"#,
+        )
+        .unwrap();
+        assert_eq!(earth_first_window(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---------------------------------------------------------------- Earth
 
     use horizon_earth::testing::MemoryFetcher;
@@ -3898,6 +4084,38 @@ mod tests {
         );
         assert_eq!(block_at(&level, 0, y, 0), f.state("minecraft:air"));
         assert_eq!(level.earth_spawn_origin().unwrap().unwrap(), ((0, 0), y));
+    }
+
+    #[test]
+    fn an_earth_spawn_high_up_stands_on_the_ground_inside_the_first_window() {
+        let Some(f) = Fixture::new("earth-high-spawn") else {
+            return;
+        };
+        let summit =
+            |lat: f64, lon: f64| 8700.0 + 20.0 * (lat * 2000.0).sin() + 10.0 * (lon * 3000.0).cos();
+        let mut settings = EarthSettings::at(27.9881, 86.925);
+        settings.metres_per_block = 1.0;
+        let level = f.earth_level(&settings, Arc::new(MemoryFetcher::new(summit)));
+        let (_, y) = level.spawn_origin().expect("a spawn");
+        let ground = summit(27.9881, 86.925).floor() as i32;
+        assert!(
+            (y - 1 - ground).abs() <= 4,
+            "the player stands at {y}, ground {ground}"
+        );
+        // Solid ground under the feet, air at them, and both inside the window a new world opens with.
+        assert_ne!(block_at(&level, 0, y - 1, 0), f.state("minecraft:air"));
+        assert_eq!(block_at(&level, 0, y, 0), f.state("minecraft:air"));
+        let store = level
+            .generation()
+            .earth
+            .as_ref()
+            .unwrap()
+            .tiles
+            .store
+            .clone();
+        let window = earth_window(&settings, store, None).unwrap();
+        let (low, high) = blocks_held(window);
+        assert!(low < y && y <= high, "{y} outside {low}..{high}");
     }
 
     #[test]

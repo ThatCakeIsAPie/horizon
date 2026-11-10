@@ -262,9 +262,14 @@ impl WorldRequest {
             // Create World's world type and settings; `--cubic` is Custom Cubic.
             let chosen = create.and_then(|o| o.cubic_kind().map(|k| (k, o.cubic_json.as_str())));
             if options.cubic || chosen.is_some() {
-                horizon_client::cubic::mark_cubic_world(&save_root)?;
                 let (kind, json) =
                     chosen.unwrap_or((horizon_client::cubic_settings::CubicKind::Custom, ""));
+                // An Earth world's first window is chosen where its surface
+                // is (`cubic::earth_first_window`), so it is not marked with
+                // the default one.
+                if kind != horizon_client::cubic_settings::CubicKind::Earth {
+                    horizon_client::cubic::mark_cubic_world(&save_root)?;
+                }
                 horizon_client::cubic_settings::save_world_generation(&save_root, kind, json)?;
             }
         }

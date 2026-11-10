@@ -27,9 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use horizon_core::position::SectionPos;
-use horizon_earth::{
-    ElevationField, FetchError, LoadError, Projection, TileId, TileStore, VerticalMap,
-};
+use horizon_earth::{ElevationField, FetchError, LoadError, TileId, TileStore};
 
 use super::settings::EarthSettings;
 use super::surface::{SNOW_DEPTH, SOIL_DEPTH, SurfaceKind};
@@ -166,17 +164,7 @@ impl EarthGenerator {
         store: Arc<TileStore>,
         blocks: EarthBlocks,
     ) -> Result<Self, String> {
-        settings.validate()?;
-        let projection = Projection::local(
-            settings.origin_latitude,
-            settings.origin_longitude,
-            settings.metres_per_block,
-        )
-        .map_err(|e| e.to_string())?;
-        let vertical = VerticalMap::new(settings.sea_level_y, settings.metres_per_block)
-            .with_exaggeration(settings.vertical_exaggeration);
-        let field =
-            ElevationField::new(store, projection, vertical).with_max_zoom(settings.max_zoom);
+        let field = settings.elevation_field(store)?;
         Ok(Self {
             base_zoom: field.zoom_for(settings.metres_per_block),
             field,
