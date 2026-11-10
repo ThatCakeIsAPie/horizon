@@ -34,6 +34,8 @@
 //! * `cubeAreas` delegate whole cubes (generation and population) to nested
 //!   generators; the first area in list order that contains the cube wins.
 //! * Flat Cubic: [`CustomCubicGenerator::flat`].
+//! * Earth (real-world terrain, [`earth`]): [`CustomCubicGenerator::earth`]. Its methods wait for the tiles
+//!   they need; see [`earth::blocking`].
 //!
 //! The cube index layout is `y << 8 | z << 4 | x`, as in `cubic/generator.rs`.
 //!
@@ -53,6 +55,8 @@ use horizon_core::density::Beardifier;
 use horizon_core::position::SectionPos;
 
 use crate::registry::BlockRegistry;
+
+use super::earth;
 
 pub mod biomes;
 pub mod bounds;
@@ -97,6 +101,8 @@ struct Terrain {
 enum Kind {
     Terrain(Box<Terrain>),
     Flat(flat::FlatGenerator),
+    /// Terrain from elevation tiles; every method waits for the tiles it needs.
+    Heightmap(earth::EarthGenerator),
 }
 
 /// The custom cubic generator (also Flat Cubic).
@@ -176,6 +182,38 @@ impl CustomCubicGenerator {
         })
     }
 
+    /// An Earth generator: terrain from the elevation tiles in `store`, placed by `settings`. The generator's
+    /// methods load missing tiles through the store's fetcher and wait; see [`earth::blocking`] and
+    /// [`Self::set_earth_cancelled`].
+    pub fn earth(
+        settings: &earth::EarthSettings,
+        store: Arc<horizon_earth::TileStore>,
+        registry: &BlockRegistry,
+    ) -> Result<Self, String> {
+        let blocks = earth::EarthBlocks::from_registry(registry)?;
+        Ok(Self {
+            kind: Kind::Heightmap(earth::EarthGenerator::new(settings, store, blocks)?),
+            areas: Vec::new(),
+        })
+    }
+
+    /// The Earth generator, for its tiles-missing and not-ready queries; `None` for the other kinds.
+    pub fn earth_generator(&self) -> Option<&earth::EarthGenerator> {
+        match &self.kind {
+            Kind::Heightmap(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Sets the Earth generator's cancel flag (no effect on other kinds). While set, its methods stop waiting
+    /// for tiles and return air or `Mixed`: **what they produced after it was set must be discarded**. Set it
+    /// only when the level shuts down. See [`earth::EarthGenerator::set_cancelled`].
+    pub fn set_earth_cancelled(&self, cancelled: bool) {
+        if let Kind::Heightmap(e) = &self.kind {
+            e.set_cancelled(cancelled);
+        }
+    }
+
     /// Whether some `cubeAreas` entry hands cubes to other settings (what
     /// reproduces only the main terrain, as the far view's surface tiles,
     /// does not apply).
@@ -199,6 +237,7 @@ impl CustomCubicGenerator {
         }
         match &self.kind {
             Kind::Flat(f) => f.generate(cube, out),
+            Kind::Heightmap(e) => e.generate_blocking(cube, out),
             Kind::Terrain(t) => {
                 t.generate(cube, out);
                 let first = out[0];
@@ -225,6 +264,7 @@ impl CustomCubicGenerator {
         }
         match &self.kind {
             Kind::Flat(f) => f.generate(cube, out),
+            Kind::Heightmap(e) => e.generate_blocking(cube, out),
             Kind::Terrain(t) => {
                 t.generate_adapted(cube, out, beard);
                 let first = out[0];
@@ -258,6 +298,9 @@ impl CustomCubicGenerator {
             Kind::Flat(f) => {
                 f.generate(cube, out);
             }
+            Kind::Heightmap(e) => {
+                e.generate_blocking(cube, out);
+            }
             Kind::Terrain(t) => t.base(cube, out),
         }
     }
@@ -272,6 +315,9 @@ impl CustomCubicGenerator {
         match &self.kind {
             Kind::Flat(f) => {
                 f.generate(cube, out);
+            }
+            Kind::Heightmap(e) => {
+                e.generate_blocking(cube, out);
             }
             Kind::Terrain(t) => {
                 t.base(cube, out);
@@ -303,6 +349,7 @@ impl CustomCubicGenerator {
         }
         match &self.kind {
             Kind::Flat(f) => f.block_at_y(y),
+            Kind::Heightmap(e) => e.block_at_blocking(x, y, z, resolution_blocks),
             Kind::Terrain(t) => t.block_at(x, y, z, resolution_blocks),
         }
     }
@@ -320,6 +367,9 @@ impl CustomCubicGenerator {
         resolution_blocks: i32,
         mut stop: impl FnMut(u32) -> bool,
     ) -> Option<(usize, u32)> {
+        if let Kind::Heightmap(e) = &self.kind {
+            return e.first_at_column_blocking(x, z, ys, resolution_blocks, stop);
+        }
         let mut probe = None;
         for (i, &y) in ys.iter().enumerate() {
             let cube = SectionPos::new(x >> 4, y >> 4, z >> 4);
@@ -358,6 +408,8 @@ impl CustomCubicGenerator {
         }
         match &self.kind {
             Kind::Flat(f) => f.surface_y().filter(|&s| s <= from_y),
+            // The exact surface from the data: `from_y` is no hint to search from.
+            Kind::Heightmap(e) => e.surface_y_blocking(x, z),
             Kind::Terrain(t) => t.surface_y(x, z, from_y),
         }
     }
@@ -371,6 +423,11 @@ impl CustomCubicGenerator {
     pub fn chunk_tops(&self, cx: i32, cz: i32) -> Box<[i32; 256]> {
         match &self.kind {
             Kind::Flat(f) => Box::new([f.surface_y().unwrap_or(NO_TOP); 256]),
+            Kind::Heightmap(e) => Box::new(
+                e.chunk_tops_blocking(cx, cz)
+                    .and_then(|tops| <[i32; 256]>::try_from(tops).ok())
+                    .unwrap_or([NO_TOP; 256]),
+            ),
             Kind::Terrain(t) => t.chunk_tops(cx, cz),
         }
     }
@@ -404,6 +461,9 @@ impl CustomCubicGenerator {
     /// the sea level is water, so use [`Self::uniform_block`] to know the
     /// block. Flat Cubic and boxes touching a `cubeAreas` entry are `Mixed`.
     pub fn classify_box(&self, min: [i32; 3], max: [i32; 3]) -> BoxClass {
+        if let Kind::Heightmap(e) = &self.kind {
+            return earth_class(e.classify_box_blocking(min, max, 1));
+        }
         self.bounded(min, max)
             .map_or(BoxClass::Mixed, |t| t.classify_box(min, max))
     }
@@ -411,6 +471,9 @@ impl CustomCubicGenerator {
     /// The one block that all of `min..=max` is after density and replacers
     /// (no carvers, no population), when the bounds prove it; `None` if not.
     pub fn uniform_block(&self, min: [i32; 3], max: [i32; 3]) -> Option<u32> {
+        if let Kind::Heightmap(e) = &self.kind {
+            return e.fill_block(e.classify_box_blocking(min, max, 1));
+        }
         self.bounded(min, max)?.uniform_block(min, max)
     }
 
@@ -428,6 +491,14 @@ impl CustomCubicGenerator {
         z: i32,
         min_wavelength: f64,
     ) -> NodeClass {
+        if let Kind::Heightmap(e) = &self.kind {
+            // The node's voxels are `1 << level` apart, whatever `min_wavelength` says.
+            let fill = e.classify_node_blocking(level, x, y, z);
+            return NodeClass {
+                class: earth_class(fill),
+                block: e.fill_block(fill),
+            };
+        }
         let side = 16_i64 << level.min(24);
         let at = |v: i32| -> i32 { (i64::from(v) * side).clamp(-(1 << 30), 1 << 30) as i32 };
         let min = [at(x), at(y), at(z)];
@@ -446,7 +517,7 @@ impl CustomCubicGenerator {
     pub fn gpu_terms(&self) -> Option<GpuTerms> {
         match &self.kind {
             Kind::Terrain(t) => Some(t.bound.gpu_terms()),
-            Kind::Flat(_) => None,
+            Kind::Flat(_) | Kind::Heightmap(_) => None,
         }
     }
 
@@ -455,7 +526,7 @@ impl CustomCubicGenerator {
     pub fn density_bound(&self) -> Option<&DensityBound> {
         match &self.kind {
             Kind::Terrain(t) => Some(&t.bound),
-            Kind::Flat(_) => None,
+            Kind::Flat(_) | Kind::Heightmap(_) => None,
         }
     }
 
@@ -464,6 +535,7 @@ impl CustomCubicGenerator {
         match &self.kind {
             Kind::Terrain(t) => t.sea_level,
             Kind::Flat(_) => 0,
+            Kind::Heightmap(e) => e.sea_level(),
         }
     }
 
@@ -472,7 +544,7 @@ impl CustomCubicGenerator {
     pub fn noise_tables(&self) -> Option<[NoiseTable; 4]> {
         match &self.kind {
             Kind::Terrain(t) => Some(t.noise.tables()),
-            Kind::Flat(_) => None,
+            Kind::Flat(_) | Kind::Heightmap(_) => None,
         }
     }
 
@@ -481,7 +553,7 @@ impl CustomCubicGenerator {
     pub fn density_shape(&self) -> Option<[f64; 5]> {
         match &self.kind {
             Kind::Terrain(t) => Some(t.noise.shape()),
-            Kind::Flat(_) => None,
+            Kind::Flat(_) | Kind::Heightmap(_) => None,
         }
     }
 
@@ -494,7 +566,7 @@ impl CustomCubicGenerator {
                 let c = t.blend.terrain_at(x, z);
                 Some((c.height, c.volatility))
             }
-            Kind::Flat(_) => None,
+            Kind::Flat(_) | Kind::Heightmap(_) => None,
         }
     }
 
@@ -503,8 +575,17 @@ impl CustomCubicGenerator {
     pub fn biome_scale(&self) -> f64 {
         match &self.kind {
             Kind::Terrain(t) => t.biome_scale,
-            Kind::Flat(_) => 1.0,
+            Kind::Flat(_) | Kind::Heightmap(_) => 1.0,
         }
+    }
+}
+
+/// An Earth box's class: water is "air" here as for the density terrain (`uniform_block` says which block).
+fn earth_class(fill: earth::Fill) -> BoxClass {
+    match fill {
+        earth::Fill::Air | earth::Fill::Water => BoxClass::Air,
+        earth::Fill::Stone => BoxClass::Solid,
+        earth::Fill::Mixed => BoxClass::Mixed,
     }
 }
 

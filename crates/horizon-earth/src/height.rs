@@ -3,6 +3,7 @@
 //! Every query comes in a form that only reads tiles the store already holds and says `None` when one is missing,
 //! so a caller never gets a made-up height; `*_blocking` forms load missing tiles through the store's fetcher.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::projection::{Projection, VerticalMap, latlon_to_pixel, world_pixels};
@@ -100,6 +101,70 @@ impl ElevationField {
     pub fn surface_y_blocking(&self, x: i32, z: i32, zoom: u8) -> Result<Option<i32>, LoadError> {
         let h = self.height_m_blocking(f64::from(x) + 0.5, f64::from(z) + 0.5, zoom)?;
         Ok(h.map(|h| self.vertical.block_y(f64::from(h))))
+    }
+
+    /// The elevations in metres at the centres of the blocks `x0..x0 + width` by `z0..z0 + depth`, row by row
+    /// (index `dz * width + dx`), each exactly what [`ElevationField::height_m`] gives at `(x + 0.5, z + 0.5)`.
+    /// It resolves every tile once for the whole rectangle, so it takes the store's lock once per tile rather
+    /// than once per block. `None` when any tile the rectangle needs is not in the store (nothing is fetched),
+    /// or a point is not finite. An empty rectangle gives an empty list.
+    pub fn heights_m(
+        &self,
+        x0: i32,
+        z0: i32,
+        width: usize,
+        depth: usize,
+        zoom: u8,
+    ) -> Option<Vec<f32>> {
+        self.grid_with(x0, z0, width, depth, zoom, &mut |id| {
+            Ok::<_, std::convert::Infallible>(self.store.cached(id))
+        })
+        .unwrap_or(None)
+    }
+
+    /// [`ElevationField::heights_m`] that fetches the tiles it lacks, blocking.
+    pub fn heights_m_blocking(
+        &self,
+        x0: i32,
+        z0: i32,
+        width: usize,
+        depth: usize,
+        zoom: u8,
+    ) -> Result<Option<Vec<f32>>, LoadError> {
+        self.grid_with(x0, z0, width, depth, zoom, &mut |id| {
+            self.store.load(id).map(Some)
+        })
+    }
+
+    /// The surface block heights of the same rectangle as [`ElevationField::heights_m`], each exactly what
+    /// [`ElevationField::surface_y`] gives.
+    pub fn surface_ys(
+        &self,
+        x0: i32,
+        z0: i32,
+        width: usize,
+        depth: usize,
+        zoom: u8,
+    ) -> Option<Vec<i32>> {
+        let heights = self.heights_m(x0, z0, width, depth, zoom)?;
+        Some(heights.into_iter().map(|h| self.block_y_of(h)).collect())
+    }
+
+    /// [`ElevationField::surface_ys`] that fetches the tiles it lacks, blocking.
+    pub fn surface_ys_blocking(
+        &self,
+        x0: i32,
+        z0: i32,
+        width: usize,
+        depth: usize,
+        zoom: u8,
+    ) -> Result<Option<Vec<i32>>, LoadError> {
+        let heights = self.heights_m_blocking(x0, z0, width, depth, zoom)?;
+        Ok(heights.map(|hs| hs.into_iter().map(|h| self.block_y_of(h)).collect()))
+    }
+
+    fn block_y_of(&self, height_m: f32) -> i32 {
+        self.vertical.block_y(f64::from(height_m))
     }
 
     /// A lowest and highest elevation, in metres, that bound [`ElevationField::height_m`] at every point of the
@@ -219,6 +284,41 @@ impl ElevationField {
         let top = h00 + (h10 - h00) * tx;
         let bottom = h01 + (h11 - h01) * tx;
         Ok(Some((top + (bottom - top) * ty) as f32))
+    }
+
+    fn grid_with<E>(
+        &self,
+        x0: i32,
+        z0: i32,
+        width: usize,
+        depth: usize,
+        zoom: u8,
+        get: &mut dyn FnMut(TileId) -> Result<Option<Arc<Tile>>, E>,
+    ) -> Result<Option<Vec<f32>>, E> {
+        // Tiles already resolved for this rectangle, so the store is asked once for each.
+        let mut resolved: HashMap<TileId, Arc<Tile>> = HashMap::new();
+        let mut cached_get = |id: TileId| -> Result<Option<Arc<Tile>>, E> {
+            if let Some(tile) = resolved.get(&id) {
+                return Ok(Some(Arc::clone(tile)));
+            }
+            let tile = get(id)?;
+            if let Some(tile) = &tile {
+                resolved.insert(id, Arc::clone(tile));
+            }
+            Ok(tile)
+        };
+        let mut out = Vec::with_capacity(width.saturating_mul(depth));
+        for dz in 0..depth {
+            for dx in 0..width {
+                let x = f64::from(x0) + dx as f64 + 0.5;
+                let z = f64::from(z0) + dz as f64 + 0.5;
+                match self.sample(x, z, zoom, &mut cached_get)? {
+                    Some(h) => out.push(h),
+                    None => return Ok(None),
+                }
+            }
+        }
+        Ok(Some(out))
     }
 
     fn range_with<E>(
@@ -395,6 +495,61 @@ mod tests {
             columns.contains(&1023) && columns.contains(&0),
             "wrapped tile columns: {columns:?}"
         );
+    }
+
+    #[test]
+    fn a_batched_read_matches_the_single_reads_point_for_point_across_a_seam() {
+        // The origin is the corner four tiles meet at, so the rectangle reads all four.
+        let rig = build(0.0, 0.0, 100.0, smooth);
+        let (x0, z0, width, depth) = (-9, -6, 20, 13);
+        let heights = rig
+            .field
+            .heights_m_blocking(x0, z0, width, depth, 8)
+            .unwrap()
+            .unwrap();
+        let ys = rig.field.surface_ys(x0, z0, width, depth, 8).unwrap();
+        assert_eq!((heights.len(), ys.len()), (width * depth, width * depth));
+        for dz in 0..depth {
+            for dx in 0..width {
+                let (x, z) = (x0 + dx as i32, z0 + dz as i32);
+                let single = rig
+                    .field
+                    .height_m(f64::from(x) + 0.5, f64::from(z) + 0.5, 8)
+                    .unwrap();
+                assert_eq!(heights[dz * width + dx], single, "height at {x},{z}");
+                assert_eq!(
+                    Some(ys[dz * width + dx]),
+                    rig.field.surface_y(x, z, 8),
+                    "surface at {x},{z}"
+                );
+            }
+        }
+        // The rectangle really crossed the seam: all four tiles were needed, one fetch each.
+        assert_eq!(rig.fetcher.fetch_count(), 4);
+        assert_eq!(
+            rig.field
+                .surface_ys_blocking(x0, z0, width, depth, 8)
+                .unwrap(),
+            Some(ys)
+        );
+    }
+
+    #[test]
+    fn a_batched_read_with_a_tile_missing_gives_none_and_fetches_nothing() {
+        let rig = build(0.0, 0.0, 100.0, smooth);
+        rig.field
+            .store()
+            .load(TileId {
+                z: 8,
+                x: 127,
+                y: 127,
+            })
+            .unwrap();
+        assert!(rig.field.heights_m(-20, -20, 8, 8, 8).is_some());
+        assert_eq!(rig.field.heights_m(-4, -4, 8, 8, 8), None);
+        assert_eq!(rig.field.surface_ys(-4, -4, 8, 8, 8), None);
+        assert_eq!(rig.fetcher.fetch_count(), 1);
+        assert_eq!(rig.field.heights_m(0, 0, 0, 5, 8), Some(Vec::new()));
     }
 
     #[test]

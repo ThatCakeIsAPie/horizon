@@ -2024,6 +2024,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "horizon-core",
+ "horizon-earth",
  "libm",
  "log",
  "lz4_flex",
