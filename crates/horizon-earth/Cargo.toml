@@ -1,0 +1,17 @@
+[package]
+name = "horizon-earth"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+rust-version.workspace = true
+description = "Real-world terrain: terrarium elevation tiles, a disk and memory tile store, and a Mercator-to-block elevation field. No network, no game types"
+
+[dependencies]
+png = "0.18"
+
+[features]
+# Synthetic tiles and a fake fetcher (`horizon_earth::testing`) for other crates' tests.
+testing = []
+
+[lints]
+workspace = true

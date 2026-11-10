@@ -1670,6 +1670,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-earth"
+version = "0.1.0"
+dependencies = [
+ "png",
+]
+
+[[package]]
 name = "horizon-friends"
 version = "0.1.0"
 dependencies = [
