@@ -38,6 +38,16 @@ pub struct EarthSettings {
     /// Whether structures (villages and the like) generate.
     #[serde(default)]
     pub structures: bool,
+    /// Whether the surface and the biomes follow land cover (ESA WorldCover classes) where the generator is
+    /// given a source of it ([`crate::cubic::earth::EarthGenerator::with_land_cover`]). Off by default, and
+    /// then, or with no source, the terrain is the elevation-only terrain exactly. The file leaves the name out
+    /// while it is off, so a world made without land cover keeps the text (and the cache key) it always had.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub land_cover: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_metres_per_block() -> f64 {
@@ -65,6 +75,7 @@ impl EarthSettings {
             tile_url: String::new(),
             allow_downloads: false,
             structures: false,
+            land_cover: false,
         }
     }
 
@@ -132,6 +143,26 @@ impl EarthSettings {
         )
     }
 
+    /// The land cover these settings describe over `store`, filled by `fetcher`: the same projection as
+    /// [`EarthSettings::elevation_field`], so a block has the class of the ground its height is read from.
+    pub fn land_cover_source(
+        &self,
+        store: std::sync::Arc<horizon_earth::LandCoverStore>,
+        fetcher: std::sync::Arc<dyn horizon_earth::LandCoverFetcher>,
+    ) -> Result<std::sync::Arc<horizon_earth::LandCoverSource>, String> {
+        self.validate()?;
+        let projection = horizon_earth::Projection::local(
+            self.origin_latitude,
+            self.origin_longitude,
+            self.metres_per_block,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(std::sync::Arc::new(horizon_earth::LandCoverSource::new(
+            horizon_earth::LandCoverField::new(store, projection),
+            fetcher,
+        )))
+    }
+
     /// Parses and validates the JSON of a world's Earth settings. Unknown fields are ignored; a missing origin
     /// is an error.
     pub fn from_json(text: &str) -> Result<Self, String> {
@@ -152,14 +183,25 @@ impl EarthSettings {
     /// A text that changes with whatever decides what the terrain is made of: these settings and the version of
     /// the surface rule ([`super::surface::RULES`]) and the elevation cleaning rule
     /// ([`horizon_earth::clean::CLEAN_RULES`]). Far-view caches are keyed by it, so nodes built under an
-    /// older rule are not shown.
+    /// older rule are not shown. With land cover on it also carries the version of the land-cover data rules
+    /// ([`horizon_earth::LAND_COVER_RULES`]) and of the land-cover surface and biome rules
+    /// ([`super::surface::LAND_RULES`]), so a world made with land cover never shares a cache with one made
+    /// without; with it off the text is what it was before land cover existed.
     pub fn terrain_key(&self) -> String {
-        format!(
+        let mut key = format!(
             "{}#surface{}#clean{}",
             self.to_json_compact(),
             super::surface::RULES,
             horizon_earth::clean::CLEAN_RULES
-        )
+        );
+        if self.land_cover {
+            key.push_str(&format!(
+                "#landcover{}.{}",
+                horizon_earth::LAND_COVER_RULES,
+                super::surface::LAND_RULES
+            ));
+        }
+        key
     }
 }
 
@@ -187,7 +229,7 @@ mod tests {
         assert_eq!(s.vertical_exaggeration, 1.0);
         assert_eq!(s.max_zoom, 15);
         assert_eq!(s.tile_url, "");
-        assert!(!s.allow_downloads && !s.structures);
+        assert!(!s.allow_downloads && !s.structures && !s.land_cover);
         assert_eq!(s, EarthSettings::at(46.0, 7.5));
     }
 
@@ -203,6 +245,7 @@ mod tests {
             tile_url: "tiles/{z}/{x}/{y}.png".into(),
             allow_downloads: true,
             structures: true,
+            land_cover: true,
         };
         for text in [s.to_json_pretty(), s.to_json_compact()] {
             assert_eq!(EarthSettings::from_json(&text).unwrap(), s);
@@ -218,9 +261,54 @@ mod tests {
             "tileUrl",
             "allowDownloads",
             "structures",
+            "landCover",
         ] {
             assert!(value.get(key).is_some(), "missing {key}");
         }
+    }
+
+    #[test]
+    fn land_cover_is_off_by_default_and_left_out_of_the_file_while_off() {
+        let off = EarthSettings::at(46.0, 7.5);
+        assert!(!off.land_cover);
+        assert!(!off.to_json_compact().contains("landCover"));
+        let on = EarthSettings::from_json(
+            r#"{"originLatitude": 46.0, "originLongitude": 7.5, "landCover": true}"#,
+        )
+        .unwrap();
+        assert!(on.land_cover);
+        assert!(on.to_json_compact().contains("\"landCover\":true"));
+        assert!(
+            EarthSettings::from_json(
+                r#"{"originLatitude": 46.0, "originLongitude": 7.5, "landCover": "yes"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_terrain_key_changes_with_land_cover_and_carries_its_rules_only_then() {
+        let off = EarthSettings::at(46.0, 7.5);
+        let mut on = off.clone();
+        on.land_cover = true;
+        assert_ne!(off.terrain_key(), on.terrain_key());
+        let rules = format!(
+            "#landcover{}.{}",
+            horizon_earth::LAND_COVER_RULES,
+            super::super::surface::LAND_RULES
+        );
+        assert!(on.terrain_key().ends_with(&rules), "{}", on.terrain_key());
+        assert!(!off.terrain_key().contains("landcover"));
+        // The key of a world without land cover is what it was before the setting existed.
+        assert_eq!(
+            off.terrain_key(),
+            format!(
+                "{}#surface{}#clean{}",
+                off.to_json_compact(),
+                super::super::surface::RULES,
+                horizon_earth::clean::CLEAN_RULES
+            )
+        );
     }
 
     #[test]

@@ -6,13 +6,19 @@
 //! [`EarthGenerator::far_voxel`] of each column's surface and the voxel's height. When a tile is missing the read
 //! says [`NotReady`], and a worker calls [`EarthGenerator::request_tiles`] with the tiles it names and gives the
 //! node up for later, so nothing built without its data is ever kept.
+//!
+//! With land cover the same holds for it: a node whose columns lack the class of a column is not ready, never
+//! built from the elevation rule alone and kept. That choice is deliberate: a far node is cached on disk, so one
+//! built before its class arrived would have to be thrown away and rebuilt when it did, and the player would see
+//! the colour of the whole distance flip. What is missing is recorded ([`EarthGenerator::take_land_requests`]);
+//! a place the source has no file for is no data at once (open sea), which is the elevation rule and final.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use horizon_earth::TileId;
+use horizon_earth::{Fetch, TileId};
 
-use super::generator::{EarthGenerator, NotReady, Rect, node_box};
+use super::generator::{Access, EarthGenerator, NotReady, Rect, node_box};
 use super::surface::SurfaceKind;
 
 /// How many requests wait at most; a long list means whatever fetches them is far behind.
@@ -25,6 +31,7 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 #[derive(Default)]
 pub struct Requests {
     pending: Mutex<HashSet<TileId>>,
+    land: Mutex<HashSet<Fetch>>,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -45,9 +52,39 @@ impl NodeColumns {
 }
 
 impl EarthGenerator {
+    /// The surfaces alone of [`EarthGenerator::columns_at`]: what only the height of the ground decides (sky
+    /// cover), which does not wait for land cover.
+    pub fn surfaces_at(
+        &self,
+        x0: i32,
+        z0: i32,
+        stride: i32,
+        zoom_step: i32,
+    ) -> Result<Vec<i32>, NotReady> {
+        let stride = stride.max(1);
+        let (sx, sz) = (x0.saturating_add(stride / 2), z0.saturating_add(stride / 2));
+        let zoom = self.zoom_for_step(zoom_step);
+        self.field
+            .surface_ys_strided(sx, sz, 16, 16, stride, zoom)
+            .ok_or_else(|| {
+                let span = 15 * stride;
+                NotReady {
+                    tiles: self.missing_in(Rect {
+                        x0: sx,
+                        z0: sz,
+                        x1: sx.saturating_add(span),
+                        z1: sz.saturating_add(span),
+                        zoom,
+                    }),
+                }
+            })
+    }
+
     /// The columns of a block of 16 by 16 voxels `stride` blocks apart whose first voxel starts at the block
     /// `(x0, z0)`: each column is sampled at its voxel's middle block (`+ stride / 2`), at the zoom of a spacing
-    /// of `zoom_step` blocks. Gives [`NotReady`] naming the tiles it lacks.
+    /// of `zoom_step` blocks (and, with land cover, its class at the level of that spacing). Gives
+    /// [`NotReady`] naming the tiles it lacks; when only land cover is missing the list is empty and what to
+    /// fetch is in [`EarthGenerator::take_land_requests`].
     pub fn columns_at(
         &self,
         x0: i32,
@@ -56,33 +93,31 @@ impl EarthGenerator {
         zoom_step: i32,
     ) -> Result<NodeColumns, NotReady> {
         let stride = stride.max(1);
-        let half = stride / 2;
-        let (sx, sz) = (x0.saturating_add(half), z0.saturating_add(half));
-        let zoom = self.zoom_for_step(zoom_step);
-        let Some(surfaces) = self.field.surface_ys_strided(sx, sz, 16, 16, stride, zoom) else {
-            let span = 15 * stride;
-            return Err(NotReady {
-                tiles: self.missing_in(Rect {
+        let (sx, sz) = (x0.saturating_add(stride / 2), z0.saturating_add(stride / 2));
+        let surfaces = self.surfaces_at(x0, z0, stride, zoom_step)?;
+        let span = 15 * stride;
+        let not_ready = |_| NotReady {
+            tiles: self.missing_in(self.kind_rect(
+                Rect {
                     x0: sx,
                     z0: sz,
                     x1: sx.saturating_add(span),
                     z1: sz.saturating_add(span),
-                    zoom,
-                }),
-            });
+                    zoom: self.zoom_for_step(zoom_step),
+                },
+                stride,
+            )),
         };
-        let kinds = surfaces
-            .iter()
-            .enumerate()
-            .map(|(i, &s)| {
-                let (cx, cz) = (i & 15, i >> 4);
-                self.surface_kind(
-                    sx.saturating_add(cx as i32 * stride),
-                    sz.saturating_add(cz as i32 * stride),
-                    s,
-                )
-            })
-            .collect();
+        let kinds = self
+            .kinds_core(
+                Access::Local,
+                [sx, sz],
+                [16, 16],
+                stride,
+                zoom_step,
+                &surfaces,
+            )
+            .map_err(not_ready)?;
         Ok(NodeColumns {
             step: stride,
             surfaces,
@@ -147,6 +182,51 @@ impl EarthGenerator {
             .drain()
             .collect();
         taken.sort_unstable();
+        taken
+    }
+
+    /// Records land-cover fetches a read found missing, for whatever fetches them in the background (see
+    /// [`EarthGenerator::take_land_requests`]); only a fetch not already waiting wakes the taker.
+    pub(super) fn note_land(&self, fetches: Vec<Fetch>) {
+        let mut added = false;
+        {
+            let mut pending = self
+                .requests
+                .land
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for fetch in fetches {
+                if pending.len() < MAX_PENDING {
+                    added |= pending.insert(fetch);
+                }
+            }
+        }
+        if !added {
+            return;
+        }
+        let waker = self
+            .requests
+            .waker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(wake) = waker {
+            wake();
+        }
+    }
+
+    /// The land-cover fetches asked for since the last call (by far-view reads and other local ones that lacked
+    /// a class), in file and offset order. The downloader gives each to
+    /// [`horizon_earth::LandCoverSource::satisfy`], and the readers that said "later" ask again.
+    pub fn take_land_requests(&self) -> Vec<Fetch> {
+        let mut taken: Vec<Fetch> = self
+            .requests
+            .land
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .collect();
+        taken.sort_unstable_by_key(|f| (f.file, f.range.offset, f.range.len));
         taken
     }
 

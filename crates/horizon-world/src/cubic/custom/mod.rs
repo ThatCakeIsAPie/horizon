@@ -102,7 +102,7 @@ enum Kind {
     Terrain(Box<Terrain>),
     Flat(flat::FlatGenerator),
     /// Terrain from elevation tiles; every method waits for the tiles it needs.
-    Heightmap(earth::EarthGenerator),
+    Heightmap(Arc<earth::EarthGenerator>),
 }
 
 /// The custom cubic generator (also Flat Cubic).
@@ -190,17 +190,44 @@ impl CustomCubicGenerator {
         store: Arc<horizon_earth::TileStore>,
         registry: &BlockRegistry,
     ) -> Result<Self, String> {
+        Self::earth_with_land_cover(settings, store, None, registry)
+    }
+
+    /// [`Self::earth`] reading land cover from `land` (see [`earth::EarthGenerator::with_land_cover`]): it takes
+    /// effect only when the settings say `landCover`; with it off, or `None`, the terrain is the elevation-only
+    /// terrain exactly.
+    pub fn earth_with_land_cover(
+        settings: &earth::EarthSettings,
+        store: Arc<horizon_earth::TileStore>,
+        land: Option<Arc<horizon_earth::LandCoverSource>>,
+        registry: &BlockRegistry,
+    ) -> Result<Self, String> {
         let blocks = earth::EarthBlocks::from_registry(registry)?;
+        let mut generator = earth::EarthGenerator::new(settings, store, blocks)?;
+        if let Some(land) = land {
+            generator = generator.with_land_cover(land);
+        }
         Ok(Self {
-            kind: Kind::Heightmap(earth::EarthGenerator::new(settings, store, blocks)?),
+            kind: Kind::Heightmap(Arc::new(generator)),
             areas: Vec::new(),
         })
+    }
+
+    /// The biome source of an Earth world whose generator reads land cover; `None` when it does not (every column
+    /// is then [`earth::BIOME`]) and for the other kinds.
+    pub fn earth_biomes(&self) -> Option<Arc<dyn BiomeColumns>> {
+        match &self.kind {
+            Kind::Heightmap(e) if e.land_cover_active() => {
+                Some(Arc::new(earth::EarthBiomes::new(e.clone())))
+            }
+            _ => None,
+        }
     }
 
     /// The Earth generator, for its tiles-missing and not-ready queries; `None` for the other kinds.
     pub fn earth_generator(&self) -> Option<&earth::EarthGenerator> {
         match &self.kind {
-            Kind::Heightmap(e) => Some(e),
+            Kind::Heightmap(e) => Some(e.as_ref()),
             _ => None,
         }
     }

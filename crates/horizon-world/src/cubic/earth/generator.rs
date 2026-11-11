@@ -13,6 +13,13 @@
 //! the voxel grid; the voxels above and below it are what the rule gives at their own top (below the ground) and
 //! bottom (above it) block.
 //!
+//! With land cover on and a source handed in ([`EarthGenerator::with_land_cover`]) a column whose class is known
+//! takes its top from the class ([`SurfaceKind::on_classified`]): a lake or marsh is water up to the surface
+//! block over a bed under it, and a known class that is not water stays dry under the sea level. The sea fills
+//! only columns whose class is water or unknown. Columns read their class at the zoom of their step, like their
+//! height; bare ground also reads its neighbours' heights for the slope. Without it every rule above is exactly
+//! what it was.
+//!
 //! Every query comes in two forms. The plain one reads only tiles the store already holds and gives
 //! [`NotReady`], naming the tiles it lacks, when one is missing: it never invents a height, because a cube that
 //! is saved is permanent. The `*_blocking` forms (see [`super::blocking`]) fetch what is missing and wait.
@@ -27,15 +34,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use horizon_core::position::SectionPos;
-use horizon_earth::{ElevationField, FetchError, LoadError, TileId, TileStore};
+use horizon_earth::{
+    ElevationField, Fetch, FetchError, LandClass, LandCoverSource, LoadError, TileId, TileStore,
+};
 
 use super::settings::EarthSettings;
-use super::surface::{SNOW_DEPTH, SOIL_DEPTH, SurfaceKind};
+use super::surface::{
+    LAKE_DEPTH, SLOPE_BASE_M, SNOW_DEPTH, SOIL_DEPTH, STEEP_GRADIENT, SurfaceKind,
+};
 use crate::cubic::custom::replacers::resolve_block;
 use crate::cubic::custom::settings::BlockStateDesc;
 use crate::registry::BlockRegistry;
 
-/// The one biome an Earth world has for now.
+/// The one biome an Earth world has without land cover (see [`super::biome`] for the biomes with it).
 pub const BIOME: &str = "plains";
 
 /// The block state ids the generator places.
@@ -48,6 +59,9 @@ pub struct EarthBlocks {
     pub sand: u32,
     pub water: u32,
     pub snow_block: u32,
+    pub gravel: u32,
+    pub mud: u32,
+    pub moss_block: u32,
 }
 
 impl EarthBlocks {
@@ -62,6 +76,9 @@ impl EarthBlocks {
             sand: get("sand")?,
             water: get("water")?,
             snow_block: get("snow_block")?,
+            gravel: get("gravel")?,
+            mud: get("mud")?,
+            moss_block: get("moss_block")?,
         })
     }
 }
@@ -79,16 +96,20 @@ pub enum Fill {
     Mixed,
 }
 
-/// Elevation tiles a query needs are not in the store.
+/// Elevation tiles (or land cover) a query needs are not in the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotReady {
-    /// The tiles to fetch before asking again, in tile order. It can list a neighbour the answer would not
-    /// have read, never fewer than it needs.
+    /// The elevation tiles to fetch before asking again, in tile order. It can list a neighbour the answer would
+    /// not have read, never fewer than it needs. It is empty when only land cover is missing: that is recorded
+    /// in [`EarthGenerator::take_land_requests`].
     pub tiles: Vec<TileId>,
 }
 
 impl fmt::Display for NotReady {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.tiles.is_empty() {
+            return f.write_str("land cover is not ready");
+        }
         f.write_str("elevation tiles are not ready:")?;
         for (i, t) in self.tiles.iter().take(8).enumerate() {
             write!(
@@ -141,6 +162,8 @@ pub(super) enum Gap {
     Missing,
     /// The fetcher failed.
     Load(LoadError),
+    /// Land cover the source does not hold yet (a local read); the fetches are recorded.
+    Land,
 }
 
 /// A generator of Earth terrain over a tile store.
@@ -155,6 +178,10 @@ pub struct EarthGenerator {
     pub(super) failing: AtomicBool,
     /// Tiles far-view workers found missing, for whatever fetches tiles in the background.
     pub(super) requests: super::far::Requests,
+    /// Whether the settings ask for land cover.
+    land_cover: bool,
+    /// The land cover the generator was handed, kept only while the settings ask for it.
+    land: Option<Arc<LandCoverSource>>,
 }
 
 impl EarthGenerator {
@@ -177,7 +204,29 @@ impl EarthGenerator {
             },
             failing: AtomicBool::new(false),
             requests: super::far::Requests::default(),
+            land_cover: settings.land_cover,
+            land: None,
         })
+    }
+
+    /// The same generator reading land cover from `source` (built by [`EarthSettings::land_cover_source`] so it
+    /// shares the projection). It has no effect unless the settings say `landCover`: with it off, or without
+    /// this call, the terrain is the elevation-only terrain exactly.
+    pub fn with_land_cover(mut self, source: Arc<LandCoverSource>) -> Self {
+        if self.land_cover {
+            self.land = Some(source);
+        }
+        self
+    }
+
+    /// Whether columns follow land cover: the settings ask for it and a source was handed in.
+    pub fn land_cover_active(&self) -> bool {
+        self.land.is_some()
+    }
+
+    /// The land cover source in use, for whatever fetches in the background.
+    pub fn land_source(&self) -> Option<&Arc<LandCoverSource>> {
+        self.land.as_ref()
     }
 
     /// The same generator whose blocking forms retry after `first`, doubling up to `cap`.
@@ -240,24 +289,37 @@ impl EarthGenerator {
         self.field.zoom_for(metres)
     }
 
-    /// The block at height `y` of a column whose surface is `s` and whose top is of `kind`.
+    /// The block at height `y` of a column whose surface is `s` and whose top is of `kind`. The ground (the top
+    /// of the soil or bed) is `s` for most kinds and a few blocks lower under the water of a lake or marsh,
+    /// which reaches the surface block `s`; only a [`SurfaceKind::Sand`] column is flooded up to the sea level.
     pub fn block_for(&self, y: i32, s: i32, kind: SurfaceKind) -> u32 {
         let (y, s) = (i64::from(y), i64::from(s));
         let sea = i64::from(self.sea_level);
         let b = &self.blocks;
-        if y < s - SOIL_DEPTH {
+        let ground = s - kind.sink();
+        if y < ground - SOIL_DEPTH {
             return b.stone;
         }
-        if y > s {
-            return if s < sea && y < sea { b.water } else { b.air };
+        if y > ground {
+            let wet = if kind == SurfaceKind::Sand {
+                s < sea && y < sea
+            } else {
+                y <= s
+            };
+            return if wet { b.water } else { b.air };
         }
         match kind {
-            SurfaceKind::Sand => b.sand,
-            SurfaceKind::Grass if y == s => b.grass_block,
+            SurfaceKind::Sand | SurfaceKind::Dune | SurfaceKind::Lake => b.sand,
+            SurfaceKind::Grass if y == ground => b.grass_block,
             SurfaceKind::Grass => b.dirt,
             SurfaceKind::Alpine => b.stone,
-            SurfaceKind::Snow if y > s - SNOW_DEPTH => b.snow_block,
+            SurfaceKind::Snow if y > ground - SNOW_DEPTH => b.snow_block,
             SurfaceKind::Snow => b.stone,
+            SurfaceKind::Gravel if y == ground => b.gravel,
+            SurfaceKind::Gravel => b.stone,
+            SurfaceKind::Moss if y == ground => b.moss_block,
+            SurfaceKind::Moss => b.dirt,
+            SurfaceKind::Marsh => b.mud,
         }
     }
 
@@ -289,18 +351,189 @@ impl EarthGenerator {
         }
     }
 
-    /// The kind of top of the column at the point `(x, z)` whose surface block is `s`: by its elevation and the
-    /// latitude of the point itself (not of the world's origin).
+    /// The kind of top of the column at the point `(x, z)` whose surface block is `s`, without land cover: by
+    /// its elevation and the latitude of the point itself (not of the world's origin).
     pub fn surface_kind(&self, x: i32, z: i32, s: i32) -> SurfaceKind {
         if s < self.sea_level {
             return SurfaceKind::Sand;
         }
-        let latitude = self
-            .field
+        SurfaceKind::of_column(
+            s,
+            self.latitude_at(x, z),
+            self.sea_level,
+            self.field.vertical(),
+        )
+    }
+
+    /// The latitude of the centre of block `(x, z)`.
+    pub(super) fn latitude_at(&self, x: i32, z: i32) -> f64 {
+        self.field
             .projection()
             .to_lat_lon(f64::from(x) + 0.5, f64::from(z) + 0.5)
-            .lat;
-        SurfaceKind::of_column(s, latitude, self.sea_level, self.field.vertical())
+            .lat
+    }
+
+    /// The ground distance (in blocks) a bare column's slope is measured over for samples `stride` blocks apart:
+    /// [`SLOPE_BASE_M`] of ground, and at least the stride.
+    pub(super) fn slope_base(&self, stride: i32) -> i32 {
+        let metres = self.field.projection().metres_per_block();
+        let blocks = (SLOPE_BASE_M / metres).round().clamp(1.0, 64.0) as i32;
+        blocks.max(stride.max(1))
+    }
+
+    /// Whether the ground at block `(x, z)` (surface `s`) is steep: a neighbour one [`EarthGenerator::slope_base`]
+    /// away north, south, east or west differs in height by [`STEEP_GRADIENT`] of that distance or more, the
+    /// heights read at the zoom of `zoom_step`. A neighbour whose tile is missing is a gap, never a guess.
+    fn is_steep(
+        &self,
+        a: Access,
+        x: i32,
+        z: i32,
+        s: i32,
+        stride: i32,
+        zoom_step: i32,
+    ) -> Result<bool, Gap> {
+        let d = self.slope_base(stride);
+        let mut most = 0_i64;
+        for (dx, dz) in [(d, 0), (-d, 0), (0, d), (0, -d)] {
+            let n = self.surface_core(a, x.saturating_add(dx), z.saturating_add(dz), zoom_step)?;
+            most = most.max((i64::from(n) - i64::from(s)).abs());
+        }
+        Ok(most as f64 >= STEEP_GRADIENT * f64::from(d))
+    }
+
+    /// The class of the column `(i, j)` of each of `width` by `depth` columns `stride` blocks apart from
+    /// `(x0, z0)`, read at the zoom of `zoom_step`. A local read that lacks data records what to fetch
+    /// ([`EarthGenerator::take_land_requests`]) and gives [`Gap::Land`].
+    fn classes_core(
+        &self,
+        a: Access,
+        land: &LandCoverSource,
+        [x0, z0]: [i32; 2],
+        [width, depth]: [usize; 2],
+        stride: i32,
+        zoom_step: i32,
+    ) -> Result<Vec<LandClass>, Gap> {
+        let metres = f64::from(zoom_step.max(1)) * self.field.projection().metres_per_block();
+        match a {
+            Access::Local => land
+                .field()
+                .class_grid(x0, z0, width, depth, stride, metres)
+                .map_err(|first| {
+                    let span = |n: usize| (n.saturating_sub(1) as i64 * i64::from(stride)) as i32;
+                    let mut wanted = vec![first];
+                    wanted.extend(land.field().needs(
+                        x0,
+                        z0,
+                        x0.saturating_add(span(width)),
+                        z0.saturating_add(span(depth)),
+                        metres,
+                    ));
+                    self.note_land(wanted);
+                    Gap::Land
+                }),
+            Access::Fetch => land
+                .class_grid_blocking(x0, z0, width, depth, stride, metres)
+                .map_err(|e| Gap::Load(LoadError::Fetch(e))),
+        }
+    }
+
+    /// The kinds of `width` by `depth` columns `stride` blocks apart from `(x0, z0)` whose surfaces are
+    /// `surfaces`, row by row: by land cover where the generator has it, else by [`EarthGenerator::surface_kind`].
+    /// `zoom_step` is the spacing whose zoom and land-cover level the columns are read at.
+    pub(super) fn kinds_core(
+        &self,
+        a: Access,
+        [x0, z0]: [i32; 2],
+        [width, depth]: [usize; 2],
+        stride: i32,
+        zoom_step: i32,
+        surfaces: &[i32],
+    ) -> Result<Vec<SurfaceKind>, Gap> {
+        let at = |i: usize| {
+            (
+                x0.saturating_add((i % width) as i32 * stride),
+                z0.saturating_add((i / width) as i32 * stride),
+            )
+        };
+        let Some(land) = &self.land else {
+            return Ok(surfaces
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    let (x, z) = at(i);
+                    self.surface_kind(x, z, s)
+                })
+                .collect());
+        };
+        let classes = self.classes_core(a, land, [x0, z0], [width, depth], stride, zoom_step)?;
+        surfaces
+            .iter()
+            .zip(&classes)
+            .enumerate()
+            .map(|(i, (&s, &class))| {
+                let (x, z) = at(i);
+                self.land_kind(a, [x, z], s, stride, zoom_step, class)
+            })
+            .collect()
+    }
+
+    /// The kind of the one column at `(x, z)` whose surface is `s`, samples `step` blocks apart.
+    pub(super) fn kind_core(
+        &self,
+        a: Access,
+        x: i32,
+        z: i32,
+        s: i32,
+        step: i32,
+    ) -> Result<SurfaceKind, Gap> {
+        Ok(self.kinds_core(a, [x, z], [1, 1], step, step, &[s])?[0])
+    }
+
+    fn land_kind(
+        &self,
+        a: Access,
+        [x, z]: [i32; 2],
+        s: i32,
+        stride: i32,
+        zoom_step: i32,
+        class: LandClass,
+    ) -> Result<SurfaceKind, Gap> {
+        let elevation = self.field.vertical().elevation_for_y(f64::from(s));
+        SurfaceKind::on_classified(
+            class,
+            elevation,
+            self.latitude_at(x, z),
+            s < self.sea_level,
+            || self.is_steep(a, x, z, s, stride, zoom_step),
+        )
+    }
+
+    /// `r` grown by what the kinds of its columns read beyond it (a bare column's neighbours), for the lists of
+    /// tiles a read is not ready for. Unchanged without land cover.
+    pub(super) fn kind_rect(&self, r: Rect, stride: i32) -> Rect {
+        if self.land.is_none() {
+            return r;
+        }
+        let d = self.slope_base(stride);
+        Rect {
+            x0: r.x0.saturating_sub(d),
+            z0: r.z0.saturating_sub(d),
+            x1: r.x1.saturating_add(d),
+            z1: r.z1.saturating_add(d),
+            zoom: r.zoom,
+        }
+    }
+
+    /// The land-cover fetches still missing for a read of the block rectangle `x0..=x1` by `z0..=z1` with samples
+    /// `step` blocks apart, for prefetching; empty without land cover. Asking again after providing gives the
+    /// next round (see [`horizon_earth::LandCoverStore::needs`]).
+    pub fn land_needs(&self, x0: i32, z0: i32, x1: i32, z1: i32, step: i32) -> Vec<Fetch> {
+        let Some(land) = &self.land else {
+            return Vec::new();
+        };
+        let metres = f64::from(step.max(1)) * self.field.projection().metres_per_block();
+        land.field().needs(x0, z0, x1, z1, metres)
     }
 
     /// The block a [`Fill`] stands for; `None` for `Mixed`.
@@ -318,11 +551,19 @@ impl EarthGenerator {
         let (ymin, ymax) = (i64::from(ymin), i64::from(ymax));
         let (s_lo, s_hi) = (i64::from(s_lo), i64::from(s_hi));
         let sea = i64::from(self.sea_level);
-        if ymax < s_lo - SOIL_DEPTH {
+        // With land cover a lake's bed lies lower under its surface, and what is under the sea level is water
+        // only where the map says so, which the heights do not prove.
+        let land = self.land.is_some();
+        let margin = if land {
+            SOIL_DEPTH + LAKE_DEPTH
+        } else {
+            SOIL_DEPTH
+        };
+        if ymax < s_lo - margin {
             Fill::Stone
         } else if ymin > s_hi && ymin >= sea {
             Fill::Air
-        } else if ymin > s_hi && ymax < sea {
+        } else if !land && ymin > s_hi && ymax < sea {
             Fill::Water
         } else {
             Fill::Mixed
@@ -334,25 +575,28 @@ impl EarthGenerator {
     /// The tiles a read of the block rectangle `x0..=x1` by `z0..=z1` (corners in either order) at one-block
     /// resolution needs and the store does not hold, for prefetching.
     pub fn missing_tiles(&self, x0: i32, z0: i32, x1: i32, z1: i32) -> Vec<TileId> {
-        self.missing_in(Rect {
-            x0,
-            z0,
-            x1,
-            z1,
-            zoom: self.base_zoom,
-        })
+        self.missing_in(self.kind_rect(
+            Rect {
+                x0,
+                z0,
+                x1,
+                z1,
+                zoom: self.base_zoom,
+            },
+            1,
+        ))
     }
 
     /// [`EarthGenerator::missing_tiles`] for the footprint of one cube.
     pub fn missing_tiles_for_cube(&self, cube: SectionPos) -> Vec<TileId> {
-        self.missing_in(cube_rect(cube, self.base_zoom))
+        self.missing_in(self.kind_rect(cube_rect(cube, self.base_zoom), 1))
     }
 
     /// The tiles missing for a far node of the octree at `level` (a cube-aligned box of side `16 << level`
     /// blocks, as [`EarthGenerator::classify_node`] takes), at the zoom of that level's step. Its blocks all
     /// read the same tiles whatever their height, so there is no `y`.
     pub fn missing_tiles_for_node(&self, level: u32, x: i32, z: i32) -> Vec<TileId> {
-        self.missing_in(self.node_rect(level, x, z))
+        self.missing_in(self.kind_rect(self.node_rect(level, x, z), 1 << level.min(24)))
     }
 
     /// The tiles missing for a read of the block rectangle `x0..=x1` by `z0..=z1` (corners in either order) with
@@ -366,13 +610,16 @@ impl EarthGenerator {
         z1: i32,
         step: i32,
     ) -> Vec<TileId> {
-        self.missing_in(Rect {
-            x0,
-            z0,
-            x1,
-            z1,
-            zoom: self.zoom_for_step(step),
-        })
+        self.missing_in(self.kind_rect(
+            Rect {
+                x0,
+                z0,
+                x1,
+                z1,
+                zoom: self.zoom_for_step(step),
+            },
+            step,
+        ))
     }
 
     pub(super) fn missing_in(&self, r: Rect) -> Vec<TileId> {
@@ -391,6 +638,11 @@ impl EarthGenerator {
             z1: z,
             zoom: self.zoom_for_step(step),
         }
+    }
+
+    /// [`EarthGenerator::point_rect`] with what the column's kind reads around it, for the reads that give one.
+    pub(super) fn kind_point_rect(&self, x: i32, z: i32, step: i32) -> Rect {
+        self.kind_rect(self.point_rect(x, z, step), step)
     }
 
     /// The footprint of a node and the zoom of its step; its far faces are included, where voxel corners sit.
@@ -447,12 +699,8 @@ impl EarthGenerator {
 
     pub(super) fn block_core(&self, a: Access, [x, y, z]: [i32; 3], step: i32) -> Result<u32, Gap> {
         let s = self.surface_core(a, x, z, step)?;
-        Ok(self.voxel_block(
-            Self::voxel_floor(y, step),
-            step,
-            s,
-            self.surface_kind(x, z, s),
-        ))
+        let kind = self.kind_core(a, x, z, s, step)?;
+        Ok(self.voxel_block(Self::voxel_floor(y, step), step, s, kind))
     }
 
     pub(super) fn column_core(
@@ -468,7 +716,7 @@ impl EarthGenerator {
             return Ok(None);
         }
         let s = self.surface_core(a, x, z, step)?;
-        let kind = self.surface_kind(x, z, s);
+        let kind = self.kind_core(a, x, z, s, step)?;
         for (i, &y) in ys.iter().enumerate() {
             let block = self.voxel_block(Self::voxel_floor(y, step), step, s, kind);
             if stop(block) {
@@ -532,11 +780,7 @@ impl EarthGenerator {
             return Ok(Some(id));
         }
         let surfaces = self.surfaces_of(a, r)?;
-        let kinds: Vec<SurfaceKind> = surfaces
-            .iter()
-            .enumerate()
-            .map(|(i, &s)| self.surface_kind(r.x0 + (i & 15) as i32, r.z0 + (i >> 4) as i32, s))
-            .collect();
+        let kinds = self.kinds_core(a, [r.x0, r.z0], [16, 16], 1, 1, &surfaces)?;
         for dy in 0..16 {
             for (column, (&s, &kind)) in surfaces.iter().zip(&kinds).enumerate() {
                 out[dy << 8 | column] = self.block_for(y0 + dy as i32, s, kind);
@@ -580,7 +824,7 @@ impl EarthGenerator {
         out: &mut [u32; 4096],
     ) -> Result<Option<u32>, NotReady> {
         self.ready(
-            cube_rect(cube, self.base_zoom),
+            self.kind_rect(cube_rect(cube, self.base_zoom), 1),
             self.cube_core(Access::Local, cube, out),
         )
     }
@@ -589,7 +833,7 @@ impl EarthGenerator {
     /// [`EarthGenerator::generate`] places).
     pub fn block_at(&self, x: i32, y: i32, z: i32, step: i32) -> Result<u32, NotReady> {
         self.ready(
-            self.point_rect(x, z, step),
+            self.kind_point_rect(x, z, step),
             self.block_core(Access::Local, [x, y, z], step),
         )
     }
@@ -605,7 +849,7 @@ impl EarthGenerator {
         stop: impl FnMut(u32) -> bool,
     ) -> Result<Option<(usize, u32)>, NotReady> {
         self.ready(
-            self.point_rect(x, z, step),
+            self.kind_point_rect(x, z, step),
             self.column_core(Access::Local, x, z, ys, step, stop),
         )
     }

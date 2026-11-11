@@ -13,8 +13,8 @@ use super::*;
 use crate::cubic::custom::testing::default_registry;
 use crate::cubic::custom::{BoxClass, CustomCubicGenerator};
 
-const LAT0: f64 = 45.0;
-const LON0: f64 = 7.0;
+pub(super) const LAT0: f64 = 45.0;
+pub(super) const LON0: f64 = 7.0;
 
 /// The permanent snow line in metres, restated from the rule: 5,500 m to 30 degrees, then straight down to 0 m at
 /// 80 degrees.
@@ -31,7 +31,7 @@ fn snow_line(latitude: f64) -> f64 {
 
 /// A coast along `east = 0` (sea to the west, a long slope up to the east), ripples, and a 7 km spire 2.5 km
 /// east of the origin whose flanks are far steeper than one block per block.
-fn terrain(lat: f64, lon: f64) -> f64 {
+pub(super) fn terrain(lat: f64, lon: f64) -> f64 {
     let east = (lon - LON0).to_radians() * EARTH_RADIUS_M * LAT0.to_radians().cos();
     let north = (lat - LAT0).to_radians() * EARTH_RADIUS_M;
     let spire =

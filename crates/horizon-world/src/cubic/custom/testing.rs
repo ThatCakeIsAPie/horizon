@@ -43,6 +43,7 @@ pub fn default_block_names() -> Vec<String> {
         "lava",
         "lily_pad",
         "bedrock",
+        "moss_block",
     ]
     .iter()
     .map(|n| format!("minecraft:{n}"))
