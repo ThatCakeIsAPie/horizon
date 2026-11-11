@@ -4149,6 +4149,38 @@ mod tests {
     }
 
     #[test]
+    fn an_earth_cube_over_a_refused_tile_is_made_and_the_spawn_still_says_why() {
+        let Some(f) = Fixture::new("earth-refused") else {
+            return;
+        };
+        let fetcher = Arc::new(MemoryFetcher::new(hills));
+        fetcher.fail_with(Some(horizon_earth::FetchError::Refused(
+            "you have not approved downloads from the tile server".into(),
+        )));
+        let level = Arc::new(f.earth_level(&earth_settings(), fetcher));
+        // What a reopened world does for the player's saved position: make the cubes around it. With a
+        // tile that cannot come this used to wait for ever; a watchdog turns that into a failure.
+        let watchdog = {
+            let level = level.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                level.cancel_generation();
+            })
+        };
+        let at = SectionPos::new(300, 3, 300);
+        let cube = level.make_cube(at);
+        assert!(!level.generation_cancelled(), "the cube waited for its tile");
+        assert!(cube.generated);
+        assert_eq!(block_at(&level, 4800, 50, 4800), f.state("minecraft:water"));
+        drop(watchdog);
+        // The spawn is the one place that says why instead: a world with no tile at its origin has nowhere to
+        // start, which is not the same as a sea.
+        let error = level.earth_spawn_origin().unwrap().unwrap_err();
+        assert!(error.contains("not approved"), "{error}");
+        assert_eq!(level.spawn_origin(), None);
+    }
+
+    #[test]
     fn an_earth_cube_at_the_surface_follows_the_terrain_rule() {
         let Some(f) = Fixture::new("earth-surface") else {
             return;

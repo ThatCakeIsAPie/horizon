@@ -29,5 +29,5 @@ pub use landcover::{LAND_COVER_RULES, LandClass, WorldCoverFile};
 pub use landfield::{Fetch, GeoBox, LandCoverField, LandCoverStore, Lookup, Wanted};
 pub use landsource::{LandCoverFetcher, LandCoverSource};
 pub use projection::{LatLon, LocalTangent, Projection, VerticalMap};
-pub use source::{FetchError, LoadError, TileFetcher, TileStore};
+pub use source::{FetchError, LoadError, SEA_FLOOR_M, TileFetcher, TileStore};
 pub use tile::{Tile, TileError, TileId};

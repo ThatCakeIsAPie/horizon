@@ -206,9 +206,8 @@ fn a_missing_tile_is_not_found_and_a_busy_server_is_temporary() {
     for path in ["/429", "/503", "/500"] {
         assert!(matches!(get(path), Err(FetchError::Temporary(_))), "{path}");
     }
-    for path in ["/403", "/418"] {
-        assert!(matches!(get(path), Err(FetchError::Other(_))), "{path}");
-    }
+    assert!(matches!(get("/403"), Err(FetchError::Refused(_))));
+    assert!(matches!(get("/418"), Err(FetchError::Other(_))));
 }
 
 #[test]
@@ -279,10 +278,10 @@ fn nothing_is_downloaded_unless_the_world_allows_it() {
     let template = server.template("/{z}/{x}/{y}");
     let off = fetcher_for(&settings(&template, false));
     assert!(!off.downloads());
-    assert!(matches!(off.fetch(ID), Err(FetchError::Other(why)) if why.contains("allowDownloads")));
+    assert!(matches!(off.fetch(ID), Err(FetchError::Refused(why)) if why.contains("allowDownloads")));
     let none = fetcher_for(&settings("", true));
     assert!(!none.downloads());
-    assert!(matches!(none.fetch(ID), Err(FetchError::Other(why)) if why.contains("tileUrl")));
+    assert!(matches!(none.fetch(ID), Err(FetchError::Refused(why)) if why.contains("tileUrl")));
     assert!(
         server.requests().is_empty(),
         "a refused fetch reached the network"
@@ -313,7 +312,7 @@ fn addresses_the_game_may_not_download_from_are_refused() {
         let fetcher = fetcher_for(&settings(template, true));
         assert!(!fetcher.downloads(), "{template}");
         assert!(
-            matches!(fetcher.fetch(ID), Err(FetchError::Other(_))),
+            matches!(fetcher.fetch(ID), Err(FetchError::Refused(_))),
             "{template}"
         );
     }
@@ -346,7 +345,7 @@ fn a_redirect_is_followed_only_to_an_address_that_is_allowed() {
     assert_eq!(get("/start").unwrap(), b"arrived");
     let error = get("/leaves").unwrap_err();
     assert!(
-        matches!(&error, FetchError::Other(why) if why.contains("not allowed")),
+        matches!(&error, FetchError::Refused(why) if why.contains("not allowed")),
         "{error:?}"
     );
     // A loop ends.
@@ -421,7 +420,7 @@ fn an_unapproved_host_never_gets_a_request_even_when_the_world_allows_downloads(
         refusal.contains("127.0.0.1") && refusal.contains("approved"),
         "{refusal}"
     );
-    assert!(matches!(fetcher.fetch(ID), Err(FetchError::Other(_))));
+    assert!(matches!(fetcher.fetch(ID), Err(FetchError::Refused(_))));
     // The same through a store, which is what a world reads tiles with.
     let root = TempDir::new();
     let tiles = open_with(&world, root.path(), &nobody);
@@ -466,7 +465,7 @@ fn an_approved_host_cannot_send_the_game_to_an_unapproved_one() {
         .fetch(ID)
         .unwrap_err();
     assert!(
-        matches!(&error, FetchError::Other(why) if why.contains("localhost") && why.contains("not approved")),
+        matches!(&error, FetchError::Refused(why) if why.contains("localhost") && why.contains("not approved")),
         "{error:?}"
     );
     assert!(other.requests().is_empty(), "the redirect was followed");

@@ -1,13 +1,13 @@
 //! Where tiles come from: a fetcher the caller supplies, and a store that keeps what it fetched on disk and in
 //! memory. The crate has no HTTP client; the caller's [`TileFetcher`] does the downloading.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::tile::{Tile, TileError, TileId, TileIdError};
 
@@ -18,6 +18,11 @@ pub enum FetchError {
     NotFound,
     /// Worth trying again later: a timeout, a busy server, no connection.
     Temporary(String),
+    /// Will not be fetched, and asking again does not help: downloads are off or not approved, the address is
+    /// unusable, or the server refuses the request. A blocking read of the height field
+    /// ([`TileStore::load_or_sea`]) answers such a tile, like one that does not exist, with [`SEA_FLOOR_M`]
+    /// terrain, so a world never waits on it.
+    Refused(String),
     /// Anything else.
     Other(String),
 }
@@ -27,6 +32,7 @@ impl fmt::Display for FetchError {
         match self {
             Self::NotFound => f.write_str("the tile does not exist at the source"),
             Self::Temporary(why) => write!(f, "temporary failure fetching a tile: {why}"),
+            Self::Refused(why) => write!(f, "no tile will be fetched: {why}"),
             Self::Other(why) => write!(f, "could not fetch a tile: {why}"),
         }
     }
@@ -83,6 +89,10 @@ fn decode_tile(id: TileId, bytes: &[u8]) -> Result<Tile, TileError> {
     Ok(tile)
 }
 
+/// The height, in metres, of a tile that can never be had (see [`FetchError::Refused`]): flat sea floor, so the
+/// area is open water at any sea level near the usual one. It is never written to the disk cache.
+pub const SEA_FLOOR_M: f32 = -30.0;
+
 /// A disk cache of tile PNGs laid out `{z}/{x}/{y}.png`, with a bounded memory cache of decoded tiles in front.
 ///
 /// Safe to share between threads. Two threads that ask for the same missing tile make one fetch.
@@ -92,6 +102,9 @@ pub struct TileStore {
     capacity: usize,
     memory: Mutex<Memory>,
     inflight: Mutex<HashMap<TileId, Arc<Mutex<()>>>>,
+    /// Tiles the fetcher said can never be had, which [`TileStore::load_or_sea`] stands a flat tile in for.
+    unavailable: Mutex<HashSet<TileId>>,
+    sea: OnceLock<Arc<Tile>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -115,6 +128,8 @@ impl TileStore {
                 clock: 0,
             }),
             inflight: Mutex::default(),
+            unavailable: Mutex::default(),
+            sea: OnceLock::new(),
         }
     }
 
@@ -167,6 +182,28 @@ impl TileStore {
             inflight.remove(&id);
         }
         result
+    }
+
+    /// [`TileStore::load`], except that a tile the fetcher refuses for good ([`FetchError::Refused`]) or says
+    /// does not exist ([`FetchError::NotFound`]) reads as flat sea floor ([`SEA_FLOOR_M`]) from then on, so a
+    /// reader that must have an answer never waits for a tile that cannot come. The stand-in is shared and in
+    /// memory only: it is not written to disk, [`TileStore::cached`] and [`TileStore::load`] still say the tile
+    /// is missing, and a later session with the tile available reads the real one. Other failures (a timeout,
+    /// a busy server, no connection) are still errors, for the caller to retry.
+    pub fn load_or_sea(&self, id: TileId) -> Result<Arc<Tile>, LoadError> {
+        let sea = || Arc::clone(self.sea.get_or_init(|| Arc::new(Tile::flat(SEA_FLOOR_M))));
+        if lock(&self.unavailable).contains(&id) {
+            return Ok(sea());
+        }
+        match self.load(id) {
+            Err(LoadError::Fetch(why @ (FetchError::Refused(_) | FetchError::NotFound))) => {
+                if lock(&self.unavailable).insert(id) {
+                    log::warn!("Earth tile {id:?} cannot be had ({why}): it reads as flat sea floor");
+                }
+                Ok(sea())
+            }
+            other => other,
+        }
     }
 
     fn fetch_and_store(&self, id: TileId) -> Result<Arc<Tile>, LoadError> {
@@ -322,6 +359,46 @@ mod tests {
         let (again, fresh) = make(&dir, 8);
         assert!(fresh.cached(A).is_some());
         assert_eq!(again.fetch_count(), 0);
+    }
+
+    #[test]
+    fn a_tile_that_can_never_come_reads_as_sea_floor_for_the_session_only() {
+        for gone in [
+            FetchError::Refused("not approved".into()),
+            FetchError::NotFound,
+        ] {
+            let dir = TempDir::new();
+            let (fetcher, store) = make(&dir, 8);
+            fetcher.fail_with(Some(gone));
+            // `load` says why; `load_or_sea` answers with flat sea floor, asking the fetcher once.
+            assert!(store.load(A).is_err());
+            let tile = store.load_or_sea(A).unwrap();
+            assert_eq!(tile.height(0, 0), SEA_FLOOR_M);
+            assert_eq!(tile.height(255, 255), SEA_FLOOR_M);
+            let asked = fetcher.fetch_count();
+            assert!(Arc::ptr_eq(&tile, &store.load_or_sea(A).unwrap()));
+            assert_eq!(fetcher.fetch_count(), asked);
+            // Nothing was stored: the tile is still missing for everything else, and not on disk.
+            assert!(store.cached(A).is_none());
+            assert!(!store.path_of(A).exists());
+            // A new store over the same folder, with the tile available, reads the real one.
+            fetcher.fail_with(None);
+            let (_, again) = make(&dir, 8);
+            assert!(again.load_or_sea(A).unwrap().height(0, 0) > SEA_FLOOR_M);
+        }
+    }
+
+    #[test]
+    fn a_temporary_failure_is_not_a_sea() {
+        let dir = TempDir::new();
+        let (fetcher, store) = make(&dir, 8);
+        fetcher.fail_with(Some(FetchError::Temporary("timed out".into())));
+        assert!(matches!(
+            store.load_or_sea(A),
+            Err(LoadError::Fetch(FetchError::Temporary(_)))
+        ));
+        fetcher.fail_with(Some(FetchError::Other("odd".into())));
+        assert!(store.load_or_sea(A).is_err());
     }
 
     #[test]

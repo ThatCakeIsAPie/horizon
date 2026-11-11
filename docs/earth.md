@@ -41,6 +41,12 @@ Tiles are cached under `.horizon-cache/earth-tiles/<hash of the tile address>/{z
 Worlds share what they download, and two tile servers never mix. A world with downloads off (or an unapproved
 server) runs on whatever is in its folder: copy that folder to move or share the data.
 
+Terrain near a player never waits for a tile that can never come: a tile the game will not fetch (downloads off,
+the server not approved, a refused request) or that does not exist at the server reads as flat sea floor (30 m
+down) for the session, from memory only, and the disk cache stays as it was. The far view still draws nothing for
+it, and the spawn at the origin still says why when its tile is missing. A failure that may pass (a timeout, no
+connection, a busy server) is waited out: terrain waits for the tile and retries with back-off.
+
 ## Who decides about downloads: the player
 
 A world is a file, and a file from someone else could name any server. So **downloading is the player's consent, not
