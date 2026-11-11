@@ -4,10 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 license = "MIT"
 rust-version.workspace = true
-description = "Real-world terrain: terrarium elevation tiles, a disk and memory tile store, and a Mercator-to-block elevation field. No network, no game types"
+description = "Real-world terrain: terrarium elevation tiles, a disk and memory tile store, a Mercator-to-block elevation field, and a land-cover (WorldCover TIFF) reader and cache. No network, no game types"
 
 [dependencies]
 log = "0.4"
+miniz_oxide = "0.8"
 png = "0.18"
 
 [features]
