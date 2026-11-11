@@ -6989,7 +6989,7 @@ impl Renderer {
     fn release_left(&mut self, now: std::time::Instant) {
         let mut done = Vec::new();
         self.lod_leaving.retain(|&(key, since)| {
-            let left = now.saturating_duration_since(since) >= lod::FADE;
+            let left = now.saturating_duration_since(since) >= lod::fade_time();
             if left {
                 done.push((key, since));
             }
@@ -8914,9 +8914,14 @@ impl Renderer {
                 tile.visible(lod::FarKey::Cube(key), camera, &view, now, &mut visible_lods);
             }
             visible_lods.sort_unstable_by_key(|v| (v.distance, v.key));
+            let open = self.fade_stats.on().then(|| {
+                let tiles = self.lods.values();
+                tiles.filter(|t| t.window_open(now)).count() as u32
+            });
             self.fade_stats.frame(
                 &visible_lods,
                 self.cube_far.as_ref().map(|far| far.fading_nodes()),
+                open.unwrap_or(0),
             );
         }
         let mut shadow_visible = std::mem::take(&mut self.shadow_visible);

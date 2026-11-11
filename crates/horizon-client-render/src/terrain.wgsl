@@ -319,12 +319,20 @@ fn dithered_out(shown: f32, local: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> b
 // of its pattern shows finished terrain, never the inside of a section.
 const FRONT: u32 = 4096u;
 // How far toward the camera such a tile is drawn, in whole units of its
-// distance. Far terrain's coarser blocks stand a little out of the real ones
-// or below them (by a block or two near the render distance, more for coarse
-// tiles), and held sections go 2% ahead of the tiles under them: 4% wins over
-// both where the surfaces are within a few blocks, yet leaves alone whatever
-// stands that much nearer in front of the terrain (trees, hills, buildings).
-const FRONT_SCALE: f32 = 1.04;
+// distance, so it wins where it and the sections it dithers over are at the
+// same depth or a little apart: far terrain's coarser blocks stand a little out
+// of the real ones or below them, the more the coarser its level. Out over
+// sections that came in whole, just ahead of them: its own seals and skirts
+// (the walls it has where it meets full-detail terrain, buried under the near
+// surface), which show in the holes of its pattern where the shell is ahead by
+// more than they are deep, then draw dotted lines through the grass. In over
+// sections held in front of far terrain (gfx/lod.rs's `HELD`, 2% ahead of it),
+// ahead of those.
+fn front_scale(code: u32) -> f32 {
+    let level = f32((code - 1u) / 129u);
+    let out = ((code - 1u) % 129u) >= 64u;
+    return select(min(1.022 + 0.004 * level, 1.05), min(1.002 + 0.004 * level, 1.04), out);
+}
 // A fading tile or section is drawn a hair toward the camera (depth is
 // reversed: nearer is larger), the newer the more, so it wins where it draws
 // over the solid tiles it replaces. Distant tiles go back by 0.2% of their
@@ -339,7 +347,7 @@ fn fade_depth(clip: vec4<f32>, w: f32) -> vec4<f32> {
     let tile = instance_step(w) > 0.001;
     var scale = select(1.0, 1.0 - 2e-3, tile);
     if (whole_code & FRONT) != 0u {
-        return vec4(clip.xy, clip.z * FRONT_SCALE, clip.w);
+        return vec4(clip.xy, clip.z * front_scale(code), clip.w);
     }
     if code != 0u && (code - 1u) % 129u < 64u {
         scale *= 1.0 + 5e-6 * f32(64u - (code - 1u) % 129u);

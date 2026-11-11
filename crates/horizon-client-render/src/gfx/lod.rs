@@ -175,11 +175,16 @@ pub(super) struct FadeStats {
     /// Windows in which tiles dither out over sections that came in, in over
     /// sections that leave.
     windows: [u32; 2],
+    /// The most tiles with a window open at a frame.
+    window_open: u32,
     /// Cube nodes (CPU) new, and removed.
     nodes: [u32; 2],
 }
 
 impl FadeStats {
+    pub(super) fn on(&self) -> bool {
+        self.on
+    }
     pub(super) fn from_env() -> Self {
         Self {
             on: std::env::var_os("HORIZON_FADE_STATS").is_some(),
@@ -187,13 +192,14 @@ impl FadeStats {
         }
     }
     /// A frame's drawn far parts, logging the second's totals when it is over.
-    pub(super) fn frame(&mut self, visible: &[Visible], gpu_nodes: Option<[u32; 2]>) {
+    pub(super) fn frame(&mut self, visible: &[Visible], gpu_nodes: Option<[u32; 2]>, open: u32) {
         if !self.on {
             return;
         }
         let now = Instant::now();
         let began = *self.began.get_or_insert(now);
         self.frames += 1;
+        self.window_open = self.window_open.max(open);
         let mut count = [0u32; 3];
         let mut drawn = [0u64; 2];
         for v in visible {
@@ -220,7 +226,7 @@ impl FadeStats {
                 "far fade: {} frames; tiles drawn {} avg, fading max {} ({} frames), in front max {} ({} frames); \
                  cube nodes fading max {} ({} frames); tiles new {} fading, {} whole; removed {} fading out, {} \
                  standing; meshed again {} at once, {} stand-in whole, {} stand-in dithering out; \
-                 windows in front of near sections: {} out, {} in; cpu cube nodes new {}, removed {}",
+                 windows in front of near sections: {} out, {} in, {} open at most; cpu cube nodes new {}, removed {}",
                 self.frames,
                 self.drawn[0] / u64::from(self.frames),
                 self.max[0],
@@ -238,6 +244,7 @@ impl FadeStats {
                 self.remeshed[2],
                 self.windows[1],
                 self.windows[0],
+                self.window_open,
                 self.nodes[0],
                 self.nodes[1],
             );
@@ -272,7 +279,7 @@ pub(super) struct Window {
 
 impl Window {
     fn active(self, now: Instant) -> bool {
-        now.saturating_duration_since(self.since) < FADE
+        now.saturating_duration_since(self.since) < fade_time()
     }
 }
 
@@ -293,6 +300,18 @@ pub(super) enum StandMode {
 
 /// How long a tile takes to fade in over the ones it replaces.
 pub(super) const FADE: Duration = Duration::from_millis(600);
+/// `FADE`, stretched by the number in the environment variable `HORIZON_FADE_SLOW`
+/// (for looking at a fade: the GPU-driven far terrain keeps its own time).
+pub(super) fn fade_time() -> Duration {
+    static TIME: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIME.get_or_init(|| {
+        let slow = std::env::var("HORIZON_FADE_SLOW")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 1.0);
+        slow.map_or(FADE, |slow| FADE.mul_f32(slow))
+    })
+}
 
 /// A tile fading in: 0 drawn whole, else 1 + `level` * 129 +
 /// `shown`, `shown` 1 to 63 sixty-fourths of `FADE` (`fade_out_code`: 65 to
@@ -304,7 +323,7 @@ pub(super) const FADE: Duration = Duration::from_millis(600);
 /// (`upload_lods`): no pixel fought over, no hole. None: nothing to draw yet.
 /// Near sections never carry one; `FRONT` adds where a tile dithers over them.
 pub(super) fn fade_code(shown: Option<Instant>, level: u8, now: Instant) -> Option<u32> {
-    let faded = now.saturating_duration_since(shown?).as_secs_f32() / FADE.as_secs_f32();
+    let faded = now.saturating_duration_since(shown?).as_secs_f32() / fade_time().as_secs_f32();
     let shown = (faded * 64.0) as u32 + 1;
     Some(if shown >= 64 {
         0
@@ -319,7 +338,7 @@ pub(super) const HELD: u32 = 1 + 64;
 /// `fade_code` for a tile leaving since `since`, chunk by chunk as it came,
 /// over what stays behind it; once `FADE` has passed it draws nothing.
 pub(super) fn fade_out_code(since: Instant, level: u8, now: Instant) -> u32 {
-    let faded = now.saturating_duration_since(since).as_secs_f32() / FADE.as_secs_f32();
+    let faded = now.saturating_duration_since(since).as_secs_f32() / fade_time().as_secs_f32();
     1 + u32::from(level) * 129 + 64 + ((faded * 64.0) as u32 + 1).min(64)
 }
 
@@ -330,7 +349,7 @@ pub(super) const FRONT: u32 = 1 << 12;
 /// `fade_code` of a tile coming in in front of near sections: `since` is when
 /// the sections began to be held, none once `FADE` has passed.
 pub(super) fn front_in_code(since: Instant, level: u8, now: Instant) -> Option<u32> {
-    let faded = now.saturating_duration_since(since).as_secs_f32() / FADE.as_secs_f32();
+    let faded = now.saturating_duration_since(since).as_secs_f32() / fade_time().as_secs_f32();
     // Never 0 within `FADE`: whole is the plain mesh drawn behind, and the
     // sections held in front of that one go as this one ends.
     (faded < 1.0).then(|| FRONT + 1 + u32::from(level) * 129 + ((faded * 64.0) as u32 + 1).min(63))
@@ -411,6 +430,10 @@ impl Tile {
             _ => &self.mesh,
         }
     }
+    /// Whether a window is open at `now` (`HORIZON_FADE_STATS`).
+    pub fn window_open(&self, now: Instant) -> bool {
+        self.window.is_some_and(|window| window.active(now))
+    }
     /// The mesh a `Visible` draws.
     pub fn mesh_of(&self, v: &Visible) -> &SectionGpu {
         match self.previous.as_deref() {
@@ -483,9 +506,9 @@ impl Tile {
                 .as_deref()
                 .is_some_and(|stand| stand.mode == StandMode::Over);
         let replaced = self.dying.is_some() || self.previous.is_some();
-        let window = self
-            .window
-            .filter(|window| self.dying.is_none() && window.active(now));
+        // A tile that goes (replaced by finer ones, which it stays whole under, or alone) is
+        // still under its window, as long as it lasts: it goes `FADE` after the tile began.
+        let window = self.window.filter(|window| window.active(now));
         let tested = window.is_none() && self.previous.is_none();
         if over {
             out.push(entry(fade, replaced, replaced, true, window.is_none()));
@@ -883,7 +906,7 @@ impl Renderer {
         let faded: Vec<_> = self
             .lod_cubes
             .iter()
-            .filter(|(_, tile)| tile.dying.is_some_and(|d| start - d >= FADE))
+            .filter(|(_, tile)| tile.dying.is_some_and(|d| start - d >= fade_time()))
             .map(|(&key, _)| key)
             .collect();
         for key in faded {
@@ -944,7 +967,7 @@ impl Renderer {
         let faded: Vec<_> = self
             .lods
             .iter()
-            .filter(|(_, tile)| tile.dying.is_some_and(|d| start - d >= FADE))
+            .filter(|(_, tile)| tile.dying.is_some_and(|d| start - d >= fade_time()))
             .map(|(&key, _)| key)
             .collect();
         for key in faded {
@@ -956,7 +979,7 @@ impl Renderer {
             .filter_map(|tile| match tile.previous.as_deref() {
                 Some(Stand {
                     since: Some(since), ..
-                }) if start - *since >= FADE => tile.previous.take(),
+                }) if start - *since >= fade_time() => tile.previous.take(),
                 _ => None,
             })
             .collect();
@@ -1051,7 +1074,7 @@ impl Renderer {
                             kept.contains(&ancestor)
                         })
                 };
-                let whole = start.checked_sub(FADE).unwrap_or(start);
+                let whole = start.checked_sub(fade_time()).unwrap_or(start);
                 for (&key, tile) in &mut self.lods {
                     if tile.shown.is_none() {
                         let over = over_replaced(key);
@@ -1133,7 +1156,7 @@ impl Renderer {
                 z: z >> level,
                 level,
             };
-            if let Some(tile) = self.lods.get_mut(&key).filter(|t| t.dying.is_none()) {
+            if let Some(tile) = self.lods.get_mut(&key) {
                 let open = tile.window.filter(|window| window.active(now));
                 self.fade_stats.windows[usize::from(out)] += u32::from(open.is_none());
                 let window = *tile.window.insert(open.unwrap_or(Window { since: now, out }));
@@ -1343,7 +1366,8 @@ mod tests {
         let parts = drawn(&over, t0 + FADE / 2);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].stand_in && parts[0].old && parts[0].water && parts[0].fade == 0);
-        // A tile that goes draws its stand-in whichever the mode, and no window.
+        // A tile that goes draws its stand-in whichever the mode. The window is still open
+        // over it, its shell in front; one that fades out alone has its own dither as well.
         let window = Some(Window {
             since: t0,
             out: true,
@@ -1351,8 +1375,14 @@ mod tests {
         let mut dying = tile(Some(stand(StandMode::Out, Some(t0))), window, t0);
         dying.dying = Some(t0);
         let parts = drawn(&dying, t0);
-        assert_eq!(parts.len(), 1);
-        assert!(parts[0].stand_in);
+        assert_eq!(parts.len(), 2);
+        assert!(parts.iter().all(|v| v.stand_in));
+        assert_eq!(parts[1].fade & FRONT, FRONT);
+        dying.alone = true;
+        let parts = drawn(&dying, t0 + FADE / 2);
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].fade != 0 && parts[0].fade & FRONT == 0, "its own fade-out");
+        assert_eq!(parts[1].fade & FRONT, FRONT);
     }
 
     #[test]
@@ -1479,50 +1509,52 @@ mod tests {
         Some(bytemuck::cast_slice::<u8, f32>(&view).to_vec())
     }
 
-    /// terrain.wgsl's depth rule for far shells drawn in front of near sections: they win where
-    /// far and near surfaces coincide or differ by a few percent of their distance either way,
-    /// and held sections too, yet whatever stands clearly nearer in front of the terrain still
-    /// hides them.
+    /// terrain.wgsl's depth rule for far shells drawn in front of near sections: out over
+    /// sections that came in whole (`front_out_code`) they are just ahead of them, more so the
+    /// coarser the tile, so their seals and skirts, buried under the near surface, stay hidden;
+    /// in over held sections (`HELD`, 2% ahead of far terrain) they are ahead of those. What
+    /// stands clearly nearer in front of the terrain hides them either way.
     #[test]
     fn a_far_shell_in_front_wins_the_depth_test_over_near_sections_but_not_what_stands_nearer() {
         let t0 = Instant::now();
         let section = |fade: u32| super::super::section_instance([0.0; 3], fade, 1.0)[3];
         let tile = |fade: u32| instance([0.0; 3], fade)[3];
-        let front_in = front_in_code(t0, 0, t0).unwrap();
-        let front_out = front_out_code(t0, 6, t0 + FADE / 2);
-        let plain_out = fade_out_code(t0, 6, t0 + FADE / 2);
+        let half = t0 + FADE / 2;
         let d = 100.0;
         let cases = [
+            // The sections: whole, held, and 10% nearer.
             (d, section(0)),
             (d, section(HELD)),
             (d * 0.9, section(0)),
-            (d, tile(front_in)),
-            (d * 1.015, tile(front_in)),
-            (d * 1.03, tile(front_out)),
-            (d * 1.06, tile(front_out)),
-            (d, tile(front_out)),
+            // Out, level 0: at the same distance, and 0.5% farther (its seals are deeper).
+            (d, tile(front_out_code(t0, 0, half))),
+            (d * 1.005, tile(front_out_code(t0, 0, half))),
+            // Out, level 6: 2% farther still wins, a coarse tile's surface being that far off.
+            (d * 1.02, tile(front_out_code(t0, 6, half))),
+            // In, level 0: over held sections at the same distance, 1.5% farther than whole ones.
+            (d, tile(front_in_code(t0, 0, half).unwrap())),
+            (d * 1.015, tile(front_in_code(t0, 0, half).unwrap())),
+            (d * 1.04, tile(front_in_code(t0, 0, half).unwrap())),
+            // Without the flag, a tile stays behind a section at the same distance.
             (d, tile(0)),
-            (d, tile(plain_out)),
+            (d, tile(fade_out_code(t0, 6, half))),
         ];
         let Some(depth) = depths(&cases) else {
             eprintln!("SKIP far shell depth: no GPU");
             return;
         };
-        let [whole, held, nearer, shell, shell_far, out_far, out_farther, out, plain, plain_out] =
+        let [whole, held, nearer, out, out_deep, out_coarse, into_held, into_whole, into_far, plain, plain_out] =
             depth[..]
         else {
             unreachable!()
         };
-        // Coinciding surfaces, and a far shell 3% farther than a near surface: the shell wins.
-        // (`shell_far` is 1.5% farther.)
-        assert!(shell > whole && shell_far > whole && out > whole && out_far > whole);
-        // It wins over a section held in front of far terrain (2% ahead) too, where the two
-        // surfaces differ by less than that.
-        assert!(shell_far > held, "{shell_far} vs {held}");
-        // A shell 6% behind a near surface does not, nor one in front of what stands 10% nearer.
-        assert!(out_farther < whole, "{out_farther} vs {whole}");
-        assert!(shell < nearer && out < nearer, "{shell} vs {nearer}");
-        // Without the flag, a tile stays behind a section at the same distance, dithering or not.
+        assert!(out > whole, "{out} vs {whole}");
+        assert!(out_deep < whole, "a seal 0.5% deep stays hidden: {out_deep} vs {whole}");
+        assert!(out_coarse > whole, "{out_coarse} vs {whole}");
+        assert!(into_held > held, "{into_held} vs {held}");
+        assert!(into_whole > whole && into_far < whole, "{into_whole} {into_far} vs {whole}");
+        // Whatever stands 10% nearer hides the shell in every case.
+        assert!([out, out_coarse, into_held].iter().all(|&shell| shell < nearer));
         assert!(plain < whole && plain_out < whole);
     }
 }
