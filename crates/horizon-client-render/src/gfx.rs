@@ -1401,7 +1401,7 @@ pub struct Renderer {
     lod_cutout: crate::fast_hash::FxHashSet<(i32, i32)>,
     /// Removed sections of `lod_cutout` columns, released once tiles cover them.
     lod_retiring: crate::fast_hash::FxHashSet<SectionKey>,
-    /// Removed sections fading out over far terrain (`leave_section`).
+    /// Removed sections held whole while far terrain dithers in over them (`leave_section`).
     lod_leaving: Vec<(SectionKey, std::time::Instant)>,
     /// A mod's hold on the terrain's picture (`hold_world`, gfx/hold.rs) and the new meshes
     /// waiting behind it.
@@ -6970,10 +6970,10 @@ impl Renderer {
     /// Every section of these columns goes: one lookup per column where the
     /// tables are by column, and the meshes' ranges freed in one batch. A
     /// teleport removes a few thousand columns in one frame.
-    /// A section whose column far terrain now draws fades out over it, chunk by
-    /// chunk as it came, and is released once it has (`release_left`): taken
-    /// away at once, the column's detail dropped to the far terrain's in one
-    /// frame.
+    /// A section whose column far terrain now draws is held whole, from `since` (when the
+    /// far tile began to dither in in front of it, `open_window`), and released once
+    /// that is over (`release_left`): taken away at once, the column's detail dropped to
+    /// the far terrain's in one frame.
     fn leave_section(&mut self, key: SectionKey, since: std::time::Instant) {
         if let Some(section) = self.sections.find_mut(key)
             && section.leaving.is_none()
