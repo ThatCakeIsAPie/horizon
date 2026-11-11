@@ -389,4 +389,19 @@ Earth's settings ("Data credits..."):
   courtesy of the U.S. Geological Survey.
 ```
 
+## Land cover data for Earth worlds
+
+Earth worlds with land cover on read **ESA WorldCover 2021 v200**, a global 10 m land cover map made by the ESA
+WorldCover consortium from Copernicus Sentinel data, released under CC BY 4.0
+(<https://creativecommons.org/licenses/by/4.0/>) and hosted on AWS Open Data (the `esa-worldcover` bucket). Horizon
+does not ship the data: the game downloads the parts it needs, by byte range, on the player's say-so, from a server
+the player approved. ESA asks for this attribution (<https://esa-worldcover.org/en/data-access>); the game shows it
+in Earth's settings ("Data credits..."):
+
+```
+© ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) processed by ESA WorldCover consortium
+```
+
+Citation: Zanaga, D. et al. (2022). ESA WorldCover 10 m 2021 v200. <https://doi.org/10.5281/zenodo.7254221>
+
 Earth is inspired by the Terrarium mod by gegy; it shares no code with it.
