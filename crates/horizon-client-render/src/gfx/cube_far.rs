@@ -11,8 +11,11 @@
 //!
 //! 1. [`CubeFar::upload`] (the call that replaces `upload_cube_lods` for these
 //!    nodes): polls the mesher, installs meshed nodes in the node table, hands
-//!    the next batch to the mesher, and, once nothing is pending, fades the new
-//!    nodes in and the replaced ones out, as `Renderer::upload_cube_lods` does.
+//!    the next batch to the mesher, and fades the new nodes in and the replaced
+//!    ones out, as `Renderer::upload_cube_lods` does, plan by plan: a plan's
+//!    nodes fade in together once all of it and every plan before it is in (not
+//!    once nothing at all is pending, which a camera that keeps moving never
+//!    reaches: nothing would fade, or even show, while it does).
 //! 2. [`CubeFar::prepare`]: the culling pass (`cube_cull.wgsl`), before the
 //!    world pass.
 //! 3. [`CubeFar::draw`]: in the world pass, solid after the terrain, then the
@@ -32,7 +35,7 @@ use super::{
     },
 };
 use crate::{
-    fast_hash::{FxHashMap, FxHashSet},
+    fast_hash::FxHashMap,
     lod::cube::{CubeKey, GpuContent, GpuNode},
 };
 use glam::{DVec3, Vec4};
@@ -76,6 +79,8 @@ struct Held {
     total: u32,
     shown: Option<u32>,
     dying: Option<u32>,
+    /// The plan it came with (`CubeFar::queue`), which fades it in once it is whole.
+    plan: u64,
 }
 
 /// `cube_cull.wgsl`'s `Frame`.
@@ -119,6 +124,40 @@ impl DrawSetup<'_> {
     }
 }
 
+/// The plans queued (`CubeFar::queue`) and how many nodes of each are not in yet
+/// (waiting for the mesher, or in it).
+#[derive(Default)]
+struct Plans {
+    /// The last plan, counted from 1.
+    current: u64,
+    outstanding: std::collections::BTreeMap<u64, u32>,
+}
+
+impl Plans {
+    fn begin(&mut self) -> u64 {
+        self.current += 1;
+        self.current
+    }
+    /// A node of `plan` waits.
+    fn add(&mut self, plan: u64) {
+        *self.outstanding.entry(plan).or_default() += 1;
+    }
+    /// A node of `plan` is in, or gone.
+    fn land(&mut self, plan: u64) {
+        if let Some(left) = self.outstanding.get_mut(&plan) {
+            *left -= 1;
+            if *left == 0 {
+                self.outstanding.remove(&plan);
+            }
+        }
+    }
+    /// The plans below this one are whole: every node of theirs is in, and so is every
+    /// node of the plans before them.
+    fn whole(&self) -> u64 {
+        self.outstanding.keys().next().copied().unwrap_or(u64::MAX)
+    }
+}
+
 pub struct CubeFar {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -143,13 +182,22 @@ pub struct CubeFar {
     nodes: FxHashMap<CubeKey, Held>,
     free_ids: Vec<u32>,
     next_id: u32,
-    pending: FxHashMap<CubeKey, GpuNode>,
+    /// Nodes waiting for the mesher, with the plan each came with.
+    pending: FxHashMap<CubeKey, (GpuNode, u64)>,
     order: VecDeque<CubeKey>,
-    removed: FxHashSet<CubeKey>,
+    /// Nodes to retire, with the plan that replaces them.
+    removed: FxHashMap<CubeKey, u64>,
+    plans: Plans,
+    /// The nodes in the mesher, with their plans.
+    meshing: FxHashMap<CubeKey, u64>,
     /// The batch in the mesher belongs to a forgotten plan (`clear`).
     discard: bool,
     epoch: Instant,
     stats: FarStats,
+    /// Fade events since `take_fade_events`: nodes that began fading in, that began
+    /// to go, nodes meshed again over a resident one (they keep its fade), and new
+    /// ones installed (`HORIZON_FADE_STATS`).
+    fade_events: [u32; 4],
 }
 
 /// The terrain shader (with the HDR light it writes, `terrain_shader`) and the
@@ -393,10 +441,13 @@ impl CubeFar {
             next_id: 0,
             pending: FxHashMap::default(),
             order: VecDeque::new(),
-            removed: FxHashSet::default(),
+            removed: FxHashMap::default(),
+            plans: Plans::default(),
+            meshing: FxHashMap::default(),
             discard: false,
             epoch: Instant::now(),
             stats: FarStats::default(),
+            fade_events: [0; 4],
         })
     }
 
@@ -443,22 +494,35 @@ impl CubeFar {
         }
     }
 
-    /// Takes in nodes to mesh and the keys to retire once they are in.
+    /// Takes in a plan: nodes to mesh and the keys to retire once they, and
+    /// the nodes of the plans before, are in.
+    ///
+    /// A call with nodes is a plan. Keys retired alone (`Renderer::queue_cube_lods`
+    /// does, then hands the nodes that replace them over, in `queue_gpu_cube_lods`) go
+    /// with the plan that follows, so they stay until it is in.
     pub fn queue(&mut self, nodes: Vec<GpuNode>, removed: Vec<CubeKey>) {
+        let plan = if nodes.is_empty() {
+            self.plans.current + 1
+        } else {
+            self.plans.begin()
+        };
         for node in nodes {
             self.removed.remove(&node.key);
             let key = node.key;
-            if let Some(old) = self.pending.insert(key, node) {
+            self.plans.add(plan);
+            if let Some((old, old_plan)) = self.pending.insert(key, (node, plan)) {
                 self.release(&old);
+                self.plans.land(old_plan);
             } else {
                 self.order.push_back(key);
             }
         }
         for key in removed {
-            if let Some(old) = self.pending.remove(&key) {
+            if let Some((old, old_plan)) = self.pending.remove(&key) {
                 self.release(&old);
+                self.plans.land(old_plan);
             }
-            self.removed.insert(key);
+            self.removed.insert(key, plan);
         }
     }
 
@@ -495,11 +559,15 @@ impl CubeFar {
 
     /// Puts a meshed (or CPU-made) node in the table, replacing the key's
     /// old one (which keeps its fade state).
-    fn install(&mut self, key: CubeKey, start: u32, total: u32, ranges: [(u32, u32); 12]) {
+    fn install(&mut self, key: CubeKey, plan: u64, start: u32, total: u32, ranges: [(u32, u32); 12]) {
         let shown = self.nodes.remove(&key).and_then(|old| {
             self.drop_held(&old);
+            self.fade_events[2] += 1;
             old.shown.filter(|_| old.dying.is_none())
         });
+        if shown.is_none() {
+            self.fade_events[3] += 1;
+        }
         let id = if total == 0 {
             None
         } else {
@@ -536,6 +604,7 @@ impl CubeFar {
                 total,
                 shown,
                 dying: None,
+                plan,
             },
         );
     }
@@ -561,7 +630,7 @@ impl CubeFar {
         i64::from(key.origin()[1]) + i64::from(key.size()) == i64::from(self.water_top)
     }
 
-    fn install_uniform(&mut self, key: CubeKey, state: u32, biome: u16) {
+    fn install_uniform(&mut self, key: CubeKey, plan: u64, state: u32, biome: u16) {
         self.stats.uniform += 1;
         let (solid, translucent) = if state == self.air {
             (Vec::new(), Vec::new())
@@ -596,11 +665,11 @@ impl CubeFar {
             at += counts[k];
         }
         // The order written is dir 0 solid, dir 0 translucent, dir 1 ...: matches `k`.
-        self.install(key, first, total, ranges);
+        self.install(key, plan, first, total, ranges);
     }
 
     /// Polls the mesher, starts the next batch, and fades the nodes in and
-    /// out once nothing waits. Call every frame.
+    /// out plan by plan (`queue`). Call every frame.
     pub fn upload(&mut self) {
         let now = self.now_ms();
         let faded: Vec<CubeKey> = self
@@ -624,6 +693,10 @@ impl CubeFar {
             {
                 // The emit pass is submitted: the slot can be regenerated.
                 self.pool.free(slot);
+                let plan = self.meshing.remove(&key);
+                if let Some(plan) = plan {
+                    self.plans.land(plan);
+                }
                 if self.discard {
                     if !failed {
                         self.mesher.free(start, ranges.iter().map(|r| r.1).sum());
@@ -636,7 +709,7 @@ impl CubeFar {
                 }
                 self.stats.meshed += 1;
                 let total = ranges.iter().map(|r| r.1).sum();
-                self.install(key, start, total, ranges);
+                self.install(key, plan.unwrap_or(self.plans.current), start, total, ranges);
             }
         }
         if self.mesher.idle() {
@@ -647,23 +720,31 @@ impl CubeFar {
             let mut jobs = Vec::new();
             let mut keep = VecDeque::new();
             while let Some(key) = self.order.pop_front() {
-                let Some(node) = self.pending.remove(&key) else {
+                let Some((node, plan)) = self.pending.remove(&key) else {
                     continue;
                 };
                 match node.content {
                     // Uniform nodes need no mesher: they go in at once.
                     GpuContent::Uniform(voxel) => {
-                        self.install_uniform(key, voxel.state.0, voxel.biome)
+                        self.install_uniform(key, plan, voxel.state.0, voxel.biome);
+                        self.plans.land(plan);
                     }
-                    GpuContent::Slot(slot) if idle && jobs.len() < MAX_JOBS => jobs.push(MeshJob {
-                        key,
-                        slot,
-                        cover: node.cover.as_deref().map(cover_words),
-                        neighbours: [NONE; 6],
-                        sea_top: self.sea_top(key),
-                    }),
+                    GpuContent::Slot(slot) if idle && jobs.len() < MAX_JOBS => {
+                        // (a key meshed again while its first mesh is in the
+                        // mesher: the older plan's node is as good as in)
+                        if let Some(older) = self.meshing.insert(key, plan) {
+                            self.plans.land(older);
+                        }
+                        jobs.push(MeshJob {
+                            key,
+                            slot,
+                            cover: node.cover.as_deref().map(cover_words),
+                            neighbours: [NONE; 6],
+                            sea_top: self.sea_top(key),
+                        });
+                    }
                     GpuContent::Slot(_) => {
-                        self.pending.insert(key, node);
+                        self.pending.insert(key, (node, plan));
                         keep.push_back(key);
                     }
                 }
@@ -673,33 +754,45 @@ impl CubeFar {
                 self.mesher.begin(jobs);
             }
         }
-        if self.pending.is_empty() && self.mesher.idle() {
-            let now = self.now_ms();
-            let shown: Vec<(CubeKey, u32)> = self
-                .nodes
-                .iter_mut()
-                .filter(|(_, n)| n.shown.is_none())
-                .filter_map(|(&k, n)| {
-                    n.shown = Some(now);
-                    n.id.map(|id| (k, id))
-                })
-                .collect();
-            for (_, id) in shown {
-                self.word(id, 4, now);
+        // The plans every node of which is in, and every plan before: their new nodes
+        // fade in and the nodes they replace go, together. Not when nothing at all
+        // is waiting: a camera that keeps moving keeps a plan or two behind, and the
+        // far terrain would stand as it was, then change at once.
+        let whole = self.plans.whole();
+        let now = self.now_ms();
+        let shown: Vec<(CubeKey, u32)> = self
+            .nodes
+            .iter_mut()
+            .filter(|(_, n)| n.shown.is_none() && n.plan < whole)
+            .filter_map(|(&k, n)| {
+                n.shown = Some(now);
+                n.id.map(|id| (k, id))
+            })
+            .collect();
+        self.fade_events[0] += shown.len() as u32;
+        for (_, id) in shown {
+            self.word(id, 4, now);
+        }
+        let due: Vec<CubeKey> = self
+            .removed
+            .iter()
+            .filter(|&(_, &plan)| plan < whole)
+            .map(|(&key, _)| key)
+            .collect();
+        for key in due {
+            self.removed.remove(&key);
+            let Some(held) = self.nodes.get_mut(&key) else {
+                continue;
+            };
+            if held.dying.is_some() {
+                continue;
             }
-            for key in std::mem::take(&mut self.removed) {
-                let Some(held) = self.nodes.get_mut(&key) else {
-                    continue;
-                };
-                if held.dying.is_some() {
-                    continue;
-                }
-                held.dying = Some(now);
-                match held.id {
-                    Some(id) => self.word(id, 5, now),
-                    // Nothing drawn: nothing to fade.
-                    None => self.remove(key),
-                }
+            held.dying = Some(now);
+            self.fade_events[1] += u32::from(held.id.is_some());
+            match held.id {
+                Some(id) => self.word(id, 5, now),
+                // Nothing drawn: nothing to fade.
+                None => self.remove(key),
             }
         }
     }
@@ -724,6 +817,11 @@ impl CubeFar {
         fading
     }
 
+    /// The fade events since the last call (`fade_events`).
+    pub fn take_fade_events(&mut self) -> [u32; 4] {
+        std::mem::take(&mut self.fade_events)
+    }
+
     /// The counters.
     pub fn stats(&self) -> FarStats {
         let free = self.pool.free_slots() as u64;
@@ -740,11 +838,13 @@ impl CubeFar {
 
     /// Forgets every node and what waits.
     pub fn clear(&mut self) {
-        for (_, node) in std::mem::take(&mut self.pending) {
+        for (_, (node, _)) in std::mem::take(&mut self.pending) {
             self.release(&node);
         }
         self.order.clear();
         self.removed.clear();
+        self.meshing.clear();
+        self.plans = Plans::default();
         self.discard = !self.mesher.idle();
         let keys: Vec<CubeKey> = self.nodes.keys().copied().collect();
         for key in keys {
@@ -824,6 +924,48 @@ impl CubeFar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A camera that keeps moving queues plans faster than the mesher finishes them: the
+    /// one nothing is left to wait for must still fade in, and not only once nothing at
+    /// all is pending.
+    #[test]
+    fn a_plan_fades_in_once_it_and_the_plans_before_it_are_in() {
+        let mut plans = Plans::default();
+        let first = plans.begin();
+        (0..3).for_each(|_| plans.add(first));
+        let second = plans.begin();
+        (0..4).for_each(|_| plans.add(second));
+        assert_eq!(plans.whole(), first, "nothing is whole yet");
+        (0..3).for_each(|_| plans.land(first));
+        // The first plan is whole (`plan < whole`) while the second still has nodes out.
+        assert!(first < plans.whole() && second >= plans.whole());
+        // A third plan arrives, and a node of the second is meshed again by it: the second
+        // is not whole before its last node lands, whichever plan brought it.
+        let third = plans.begin();
+        plans.add(third);
+        plans.land(second);
+        plans.land(second);
+        assert!(second >= plans.whole());
+        plans.land(second);
+        plans.land(second);
+        assert!(second < plans.whole() && third >= plans.whole());
+        // Landing what is not counted (a plan cleared) changes nothing.
+        plans.land(99);
+        plans.land(third);
+        assert_eq!(plans.whole(), u64::MAX, "all in: every plan fades");
+        // Under a moving camera the oldest plan completes while newer ones pile up.
+        let mut shown = 0;
+        for step in 0..50 {
+            let plan = plans.begin();
+            (0..5).for_each(|_| plans.add(plan));
+            if step >= 1 {
+                // Last step's five nodes land: its plan is whole, the new one is not.
+                (0..5).for_each(|_| plans.land(plan - 1));
+                shown += u64::from(plan - 1 < plans.whole());
+            }
+        }
+        assert_eq!(shown, 49, "each plan but the newest faded in while the camera moved");
+    }
 
     #[test]
     fn the_drawing_shader_validates_with_the_terrain_shader() {

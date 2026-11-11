@@ -179,6 +179,9 @@ pub(super) struct FadeStats {
     window_open: u32,
     /// Cube nodes (CPU) new, and removed.
     nodes: [u32; 2],
+    /// GPU cube nodes: began to fade in, began to go, meshed again in place, new
+    /// (`CubeFar::take_fade_events`).
+    gpu_nodes: [u32; 4],
 }
 
 impl FadeStats {
@@ -192,7 +195,12 @@ impl FadeStats {
         }
     }
     /// A frame's drawn far parts, logging the second's totals when it is over.
-    pub(super) fn frame(&mut self, visible: &[Visible], gpu_nodes: Option<[u32; 2]>, open: u32) {
+    pub(super) fn frame(
+        &mut self,
+        visible: &[Visible],
+        gpu_nodes: Option<([u32; 2], [u32; 4])>,
+        open: u32,
+    ) {
         if !self.on {
             return;
         }
@@ -212,8 +220,11 @@ impl FadeStats {
                 }
             }
         }
-        if let Some([fading_in, fading_out]) = gpu_nodes {
+        if let Some(([fading_in, fading_out], events)) = gpu_nodes {
             count[2] += fading_in + fading_out;
+            for (sum, event) in self.gpu_nodes.iter_mut().zip(events) {
+                *sum += event;
+            }
         }
         for i in 0..3 {
             self.max[i] = self.max[i].max(count[i]);
@@ -226,7 +237,7 @@ impl FadeStats {
                 "far fade: {} frames; tiles drawn {} avg, fading max {} ({} frames), in front max {} ({} frames); \
                  cube nodes fading max {} ({} frames); tiles new {} fading, {} whole; removed {} fading out, {} \
                  standing; meshed again {} at once, {} stand-in whole, {} stand-in dithering out; \
-                 windows in front of near sections: {} out, {} in, {} open at most; cpu cube nodes new {}, removed {}",
+                 windows in front of near sections: {} out, {} in, {} open at most; cpu cube nodes new {}, removed {}; gpu cube nodes {} began to fade in, {} began to go, {} meshed again in place, {} new",
                 self.frames,
                 self.drawn[0] / u64::from(self.frames),
                 self.max[0],
@@ -247,6 +258,10 @@ impl FadeStats {
                 self.window_open,
                 self.nodes[0],
                 self.nodes[1],
+                self.gpu_nodes[0],
+                self.gpu_nodes[1],
+                self.gpu_nodes[2],
+                self.gpu_nodes[3],
             );
             *self = Self {
                 on: true,

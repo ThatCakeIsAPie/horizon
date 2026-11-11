@@ -8914,15 +8914,15 @@ impl Renderer {
                 tile.visible(lod::FarKey::Cube(key), camera, &view, now, &mut visible_lods);
             }
             visible_lods.sort_unstable_by_key(|v| (v.distance, v.key));
-            let open = self.fade_stats.on().then(|| {
+            if self.fade_stats.on() {
                 let tiles = self.lods.values();
-                tiles.filter(|t| t.window_open(now)).count() as u32
-            });
-            self.fade_stats.frame(
-                &visible_lods,
-                self.cube_far.as_ref().map(|far| far.fading_nodes()),
-                open.unwrap_or(0),
-            );
+                let open = tiles.filter(|t| t.window_open(now)).count() as u32;
+                let gpu = self
+                    .cube_far
+                    .as_mut()
+                    .map(|far| (far.fading_nodes(), far.take_fade_events()));
+                self.fade_stats.frame(&visible_lods, gpu, open);
+            }
         }
         let mut shadow_visible = std::mem::take(&mut self.shadow_visible);
         shadow_visible.clear();
