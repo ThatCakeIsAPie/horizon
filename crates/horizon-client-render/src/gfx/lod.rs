@@ -431,6 +431,9 @@ pub(super) struct Visible {
     /// (`FRONT`): the mesh drawn with it has the same, and a second layer would
     /// blend into it, opaque.
     pub water: bool,
+    /// It draws the mesh of the entry before it, the shell in front of it: flat draws
+    /// (`flat.rs`) have one instance for a mesh, so only the whole part gets one.
+    pub shares_mesh: bool,
     /// Occlusion culling may test it (`Tile::cull_bounds`): a tile drawn whole,
     /// alone.
     pub testable: bool,
@@ -504,7 +507,7 @@ impl Tile {
             return;
         };
         let origin = origin.as_vec3().to_array();
-        let entry = |fade, stand_in, old, water, testable| Visible {
+        let entry = |fade, stand_in, old, water, testable, shares_mesh| Visible {
             key,
             distance,
             origin,
@@ -512,6 +515,7 @@ impl Tile {
             old,
             stand_in,
             water,
+            shares_mesh,
             testable,
         };
         // Standing in over finer tiles, or dying: one mesh in the tile's place.
@@ -526,9 +530,9 @@ impl Tile {
         let window = self.window.filter(|window| window.active(now));
         let tested = window.is_none() && self.previous.is_none();
         if over {
-            out.push(entry(fade, replaced, replaced, true, window.is_none()));
+            out.push(entry(fade, replaced, replaced, true, window.is_none(), false));
         } else {
-            out.push(entry(fade, false, false, true, tested));
+            out.push(entry(fade, false, false, true, tested, false));
         }
         let Some(window) = window else {
             return;
@@ -547,7 +551,8 @@ impl Tile {
                 None => return,
             }
         };
-        out.push(entry(code, stand_in, false, false, false));
+        let base_stand_in = over && replaced;
+        out.push(entry(code, stand_in, false, false, false, stand_in == base_stand_in));
     }
 }
 
@@ -1342,6 +1347,8 @@ mod tests {
             assert!(parts[0].fade == 0 && parts[0].water && !parts[0].stand_in);
             let (front, level, out, gone) = decode_front(parts[1].fade);
             assert!(front && out && level == 0 && !parts[1].water && !parts[1].stand_in);
+            // One mesh twice: flat draws have an instance for it, the whole part's.
+            assert!(parts[1].shares_mesh && !parts[0].shares_mesh);
             assert!(parts.iter().all(|v| !v.testable));
             assert!(gone > last && gone < 64, "{gone} at {ms} ms");
             last = gone;
@@ -1368,6 +1375,7 @@ mod tests {
         assert!(!parts[0].stand_in && parts[0].fade == 0 && parts[0].water && !parts[0].old);
         let (front, _, out, _) = decode_front(parts[1].fade);
         assert!(parts[1].stand_in && front && out && !parts[1].water);
+        assert!(!parts[1].shares_mesh, "the stand-in is a mesh of its own");
         // The same pattern as before the swap: the code depends on the window alone.
         assert_eq!(parts[1].fade, drawn(&tile(None, window, t0), at(300))[1].fade);
         // Once the window is over only the mesh is left (the stand-in is released by then).

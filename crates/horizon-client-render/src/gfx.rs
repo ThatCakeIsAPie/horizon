@@ -10161,6 +10161,10 @@ impl Renderer {
                                 ))
                             })
                             .chain(visible_lods.iter().filter_map(|v| {
+                                // (a shell over its own mesh has no instance of its own here)
+                                if v.shares_mesh {
+                                    return None;
+                                }
                                 let id = lod::far_tile(lods, lod_cubes, v.key)?.mesh_of(v).flat_id?;
                                 Some((id, lod::instance(v.origin, v.fade)))
                             })),
