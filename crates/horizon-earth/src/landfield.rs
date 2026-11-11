@@ -341,7 +341,7 @@ impl LandCoverStore {
     fn provide_index(&self, fetch: &Fetch, bytes: &[u8]) -> Result<(), ProvideError> {
         let file = fetch.file;
         let short = (bytes.len() as u64) < fetch.range.len;
-        let end = fetch.range.offset + bytes.len() as u64;
+        let end = fetch.range.offset.saturating_add(bytes.len() as u64);
         self.load_pieces_from_disk(file);
         {
             let mut memory = lock(&self.memory);
