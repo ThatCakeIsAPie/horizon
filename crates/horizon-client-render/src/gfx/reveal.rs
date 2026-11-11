@@ -23,6 +23,15 @@ use std::time::Instant;
 pub(super) fn shell_code(level: u8, out: bool) -> u32 {
     REVEAL + 1 + u32::from(level) * 129 + if out { 64 } else { 0 }
 }
+/// The coarsest far cube node (level: voxel of `2^level` blocks) that gets a shell. A shell is
+/// drawn up to 3/8 of a voxel (at most 8% of the distance) toward the camera so it wins over
+/// the cubes behind it; for a node many levels coarser than the terrain it hands over to,
+/// that is a block-shaped slab standing in front of correct near terrain for the whole
+/// window, and cubes keep arriving while far refinement lags. Levels 0 to 2 (voxels of 1, 2
+/// and 4 blocks, the cap of `margin` and of terrain.wgsl's `reveal_leaves`) still look like the
+/// terrain they hand over to; coarser nodes get no window and no shell: the cube is whole at
+/// once over them, as before the dither. Keep `MAX_SHELL_LEVEL` in cube_cull.wgsl equal.
+pub(super) const MAX_SHELL_LEVEL: u8 = 2;
 /// How far a window is grown for a shell's pixels, in blocks (terrain.wgsl's `reveal_leaves`).
 pub(super) fn margin(level: u8) -> f64 {
     f64::from(1u32 << level.min(2))
@@ -161,6 +170,16 @@ impl Table {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn only_fine_nodes_get_shells_and_the_culling_pass_agrees() {
+        assert!(MAX_SHELL_LEVEL <= 2, "margin() and reveal_leaves stop growing at 4 blocks");
+        let wgsl = include_str!("cube_cull.wgsl");
+        assert!(
+            wgsl.contains(&format!("const MAX_SHELL_LEVEL: u32 = {MAX_SHELL_LEVEL}u;")),
+            "cube_cull.wgsl's MAX_SHELL_LEVEL differs"
+        );
+    }
 
     fn cube(x: f64) -> (DVec3, DVec3) {
         (DVec3::new(x, 0.0, 0.0), DVec3::new(x + 16.0, 16.0, 16.0))

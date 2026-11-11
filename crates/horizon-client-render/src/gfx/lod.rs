@@ -213,6 +213,16 @@ pub(super) struct Tile {
     pub cull_slot: u32,
 }
 
+/// Whether a near cube that comes in or leaves opens a reveal window: a far node stands whole over
+/// it (`cover`), fine enough to have a shell (`level`), the cube has quads (`visible`), and
+/// `HORIZON_REVEAL_OFF` (`off`) is not set.
+fn wants_window(cover: Option<bool>, level: Option<u8>, visible: bool, off: bool) -> bool {
+    cover == Some(true)
+        && level.is_some_and(|level| level <= reveal::MAX_SHELL_LEVEL)
+        && visible
+        && !off
+}
+
 /// What far terrain did with its fades, counted behind the environment
 /// variable `HORIZON_FADE_STATS` and logged once a second (`FadeStats::frame`):
 /// how many tiles and cube nodes were drawn with a fade code, and how each kind
@@ -249,6 +259,8 @@ pub(super) struct FadeStats {
     /// Near cubes that came in over a node standing whole (a window), over none, and over one
     /// not whole yet (whole at once); then the same for cubes that left (`Renderer::open_cube_window`).
     pub cubes: [u32; 6],
+    /// Cubes that came in or left with no quads at all (nothing to show), not in `cubes`.
+    pub cubes_empty: [u32; 2],
     /// The most windows open at a frame, and the most shells drawn (CPU nodes).
     windows_max: [u32; 2],
 }
@@ -313,7 +325,7 @@ impl FadeStats {
                  standing; meshed again {} at once, {} stand-in whole, {} stand-in dithering out; \
                  windows in front of near sections: {} out, {} in, {} open at most; cpu cube nodes new {}, removed {}; gpu cube nodes {} began to fade in, {} began to go, {} meshed again in place, {} new; \
                  near cubes: {} came in over a shell, {} over no node, {} over a node not whole yet; {} left under one, {} with no node, {} under one not whole yet; \
-                 at most {} cube windows open, {} cpu shells drawn",
+                 at most {} cube windows open, {} cpu shells drawn; cubes with no quads (not counted above): {} came in, {} left",
                 self.frames,
                 self.drawn[0] / u64::from(self.frames),
                 self.max[0],
@@ -346,6 +358,8 @@ impl FadeStats {
                 self.cubes[5],
                 self.windows_max[0],
                 self.windows_max[1],
+                self.cubes_empty[0],
+                self.cubes_empty[1],
             );
             *self = Self {
                 on: true,
@@ -638,6 +652,7 @@ impl Tile {
         // the two lie at different depths (terrain.wgsl's `fade_depth`).
         if let Some(reveal) = reveal
             && fade == 0
+            && level <= reveal::MAX_SHELL_LEVEL
             && !reveal.is_empty()
         {
             let lo = DVec3::from(key.origin().map(f64::from));
@@ -1299,6 +1314,11 @@ impl Renderer {
     /// Whether the far cube node over section `key`'s place stands whole at `now`: `Some`
     /// with that, or `None` where no node is drawn there.
     fn cube_cover(&self, key: super::SectionKey, now: Instant) -> Option<bool> {
+        self.cube_cover_level(key, now).0
+    }
+
+    /// `cube_cover`, and the level of the node standing whole there, if one does.
+    fn cube_cover_level(&self, key: super::SectionKey, now: Instant) -> (Option<bool>, Option<u8>) {
         let pos = horizon_core::position::SectionPos {
             x: key.0,
             y: (self.layout.min_y() >> 4) + key.1,
@@ -1315,12 +1335,12 @@ impl Renderer {
                 .or_else(|| self.cube_far.as_ref()?.cover(node));
             match whole {
                 // (a node standing whole over it, whatever finer ones came in meanwhile)
-                Some(true) => return Some(true),
+                Some(true) => return (Some(true), Some(level)),
                 Some(false) => cover = Some(false),
                 None => {}
             }
         }
-        cover
+        (cover, None)
     }
 
     /// A cube at section `key` comes in (`out`) or leaves, over a far cube node that
@@ -1333,10 +1353,20 @@ impl Renderer {
         key: super::SectionKey,
         now: Instant,
         out: bool,
+        visible: bool,
     ) -> Option<Instant> {
-        let cover = self.cube_cover(key, now);
-        let shell = cover == Some(true) && !reveal_off();
-        self.fade_stats.cubes[usize::from(!out) * 3 + cover.map_or(1, |whole| usize::from(!whole) * 2)] += 1;
+        let (cover, level) = self.cube_cover_level(key, now);
+        // (a node too coarse to look like the terrain has no shell: the cube is whole at once;
+        // nor has a cube with no quads, all air or buried: the node stays drawn behind it
+        // either way, and its window would only take a slot from the cubes that show)
+        let shell = wants_window(cover, level, visible, reveal_off());
+        // (`visible`: the cube has quads. One with none, all air or buried, pops nothing, and
+        // is counted apart so the counts mean visible pops.)
+        if visible {
+            self.fade_stats.cubes[usize::from(!out) * 3 + cover.map_or(1, |whole| usize::from(!whole) * 2)] += 1;
+        } else {
+            self.fade_stats.cubes_empty[usize::from(!out)] += 1;
+        }
         if !shell {
             return None;
         }
@@ -1372,7 +1402,7 @@ impl Renderer {
             self.cube_held.remove(&(x, z));
             for key in held {
                 self.lod_retiring.remove(&key);
-                match self.open_cube_window(key, now, false) {
+                match self.open_cube_window(key, now, false, true) {
                     Some(since) => self.leave_section(key, since),
                     None => released.extend(self.sections.remove(key)),
                 }
@@ -1412,6 +1442,31 @@ mod tests {
     use super::*;
     use crate::mesher::TerrainVertex;
     const REVEAL_BIT: u32 = reveal::REVEAL;
+
+    #[test]
+    fn only_cubes_with_quads_over_a_fine_whole_node_open_a_window() {
+        let fine = reveal::MAX_SHELL_LEVEL;
+        assert!(wants_window(Some(true), Some(0), true, false));
+        assert!(wants_window(Some(true), Some(fine), true, false));
+        // An empty cube (all air or buried) opens none, so it takes no slot of the table.
+        assert!(!wants_window(Some(true), Some(0), false, false));
+        // Too coarse, not whole yet, no node, or the shells off: none either.
+        assert!(!wants_window(Some(true), Some(fine + 1), true, false));
+        assert!(!wants_window(Some(false), None, true, false));
+        assert!(!wants_window(None, None, true, false));
+        assert!(!wants_window(Some(true), Some(0), true, true));
+        // The table is not touched by cubes that open nothing: only visible ones fill it.
+        let mut reveal = reveal::Reveal::default();
+        let now = Instant::now();
+        for i in 0..200 {
+            let lo = DVec3::new(f64::from(i) * 200.0, 0.0, 0.0);
+            if wants_window(Some(true), Some(0), i % 2 == 0, false) {
+                reveal.open(lo, lo + 16.0, now, true);
+            }
+        }
+        assert_eq!(reveal.len(), 64.min(100));
+        assert_eq!(reveal.evicted, 100 - 64);
+    }
 
     #[test]
     fn tiles_fade_in_on_their_own_grid() {
@@ -1811,7 +1866,7 @@ mod tests {
         let all = Frustum {
             planes: [glam::Vec4::W; 6],
         };
-        let key = FarKey::Cube(CubeKey::new(3, 0, 0, 0));
+        let key = FarKey::Cube(CubeKey::new(2, 0, 0, 0));
         let parts = |tile: &Tile, reveal: &Reveal| {
             let mut out = Vec::new();
             tile.visible(key, DVec3::ZERO, &all, t0, Some(reveal), &mut out);
@@ -1825,13 +1880,19 @@ mod tests {
         reveal.open(DVec3::splat(4.0), DVec3::splat(20.0), t0, true);
         let drawn = parts(&node, &reveal);
         assert_eq!(drawn.len(), 2);
-        assert_eq!(drawn[1].fade, reveal::shell_code(3, true));
+        assert_eq!(drawn[1].fade, reveal::shell_code(2, true));
         assert!(!drawn[1].water && drawn[1].shares_mesh && !drawn[1].testable);
         assert!(drawn[0].fade == 0 && drawn[0].water);
         // The kinds are separate shells.
         reveal.open(DVec3::splat(4.0), DVec3::splat(20.0), t0, false);
         let kinds: Vec<u32> = parts(&node, &reveal).iter().map(|v| v.fade).collect();
-        assert_eq!(kinds[1..], [reveal::shell_code(3, true), reveal::shell_code(3, false)]);
+        assert_eq!(kinds[1..], [reveal::shell_code(2, true), reveal::shell_code(2, false)]);
+        // Nodes coarser than `MAX_SHELL_LEVEL` get no shell: it would be a slab in front of the
+        // terrain it hands over to.
+        let coarse = FarKey::Cube(CubeKey::new(reveal::MAX_SHELL_LEVEL + 1, 0, 0, 0));
+        let mut out = Vec::new();
+        node.visible(coarse, DVec3::ZERO, &all, t0, Some(&reveal), &mut out);
+        assert_eq!(out.len(), 1, "a coarse node draws alone");
         // Far from the node: none. While the node fades in, or goes alone: none.
         let mut far = Reveal::default();
         far.open(DVec3::splat(500.0), DVec3::splat(516.0), t0, true);
@@ -1845,8 +1906,8 @@ mod tests {
         assert_eq!(parts(&leaving, &reveal).len(), 1);
         assert!(!leaving.whole(t0) && node.whole(t0));
         // What terrain.wgsl reads back from the code.
-        let (_, level, out, _) = decode_front(reveal::shell_code(3, true));
-        assert!(reveal::shell_code(3, true) & REVEAL_BIT != 0 && level == 3 && out);
+        let (_, level, out, _) = decode_front(reveal::shell_code(2, true));
+        assert!(reveal::shell_code(2, true) & REVEAL_BIT != 0 && level == 2 && out);
         assert_eq!(reveal::shell_code(22, false) & !(REVEAL_BIT - 1), REVEAL_BIT);
     }
 

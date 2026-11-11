@@ -6039,7 +6039,7 @@ impl Renderer {
             // vanilla's chunks do.
             None if self.cubic_far() => {
                 let now = std::time::Instant::now();
-                self.open_cube_window(key, now, true).map(|_| now)
+                self.open_cube_window(key, now, true, !mesh.empty).map(|_| now)
             }
             None => None,
         };
