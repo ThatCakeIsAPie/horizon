@@ -709,6 +709,21 @@ impl CubeFar {
         self.nodes.contains_key(&key)
     }
 
+    /// Nodes fading in and nodes fading out now, by the times the culling pass
+    /// reads (`HORIZON_FADE_STATS`).
+    pub fn fading_nodes(&self) -> [u32; 2] {
+        let now = self.now_ms();
+        let mut fading = [0; 2];
+        for held in self.nodes.values().filter(|held| held.id.is_some()) {
+            if held.dying.is_some() {
+                fading[1] += 1;
+            } else if held.shown.is_some_and(|at| now.saturating_sub(at) < FADE_MS) {
+                fading[0] += 1;
+            }
+        }
+        fading
+    }
+
     /// The counters.
     pub fn stats(&self) -> FarStats {
         let free = self.pool.free_slots() as u64;

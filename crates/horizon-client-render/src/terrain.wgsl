@@ -280,7 +280,9 @@ fn from_wire(w: TerrainWire) -> TerrainOut {
 // its unit the power of two of a block nearest 1.5 pixels, so it stays on
 // the terrain as the camera moves. `dx` and `dy`: `local`'s screen
 // derivatives.
-fn faded(code: u32, local: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> bool {
+fn faded(whole_code: u32, local: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> bool {
+    // Without `FRONT`, which only says where the piece is drawn (`fade_depth`).
+    let code = whole_code & (FRONT - 1u);
     if code == 0u { return false; }
     // Sixty-fourths of the fade: 1 to 63 fading in, 65 to 128 fading out.
     let step = (code - 1u) % 129u;
@@ -311,6 +313,18 @@ fn dithered_out(shown: f32, local: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> b
     let bayer = array<u32, 16>(0u, 8u, 2u, 10u, 12u, 4u, 14u, 6u, 3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u);
     return (f32(bayer[p.y * 4u + p.x]) + 0.5) / 16.0 >= shown;
 }
+// Added to a tile's fade code (gfx/lod.rs's `FRONT`) to draw it in front of
+// near sections: a far shell that dithers in or out over sections that stay
+// whole (`Tile::previous`'s `StandMode::Out`, `Tile::front_in`), so every hole
+// of its pattern shows finished terrain, never the inside of a section.
+const FRONT: u32 = 4096u;
+// How far toward the camera such a tile is drawn, in whole units of its
+// distance. Far terrain's coarser blocks stand a little out of the real ones
+// or below them (by a block or two near the render distance, more for coarse
+// tiles), and held sections go 2% ahead of the tiles under them: 4% wins over
+// both where the surfaces are within a few blocks, yet leaves alone whatever
+// stands that much nearer in front of the terrain (trees, hills, buildings).
+const FRONT_SCALE: f32 = 1.04;
 // A fading tile or section is drawn a hair toward the camera (depth is
 // reversed: nearer is larger), the newer the more, so it wins where it draws
 // over the solid tiles it replaces. Distant tiles go back by 0.2% of their
@@ -320,9 +334,13 @@ fn dithered_out(shown: f32, local: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> b
 // tile's drew over it, two waters, opaque. A tile's UV step is 1/32, a
 // section's 1/32768 (`terrain_uv`).
 fn fade_depth(clip: vec4<f32>, w: f32) -> vec4<f32> {
-    let code = fade_code(w);
+    let whole_code = fade_code(w);
+    let code = whole_code & (FRONT - 1u);
     let tile = instance_step(w) > 0.001;
     var scale = select(1.0, 1.0 - 2e-3, tile);
+    if (whole_code & FRONT) != 0u {
+        return vec4(clip.xy, clip.z * FRONT_SCALE, clip.w);
+    }
     if code != 0u && (code - 1u) % 129u < 64u {
         scale *= 1.0 + 5e-6 * f32(64u - (code - 1u) % 129u);
     } else if code != 0u && !tile {

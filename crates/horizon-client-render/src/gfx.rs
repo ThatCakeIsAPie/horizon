@@ -577,12 +577,12 @@ struct SectionGpu {
     /// while its instance carries a fade (`drawn_faded`), and GPU culling's
     /// pass leaves it out.
     gpu_fading: bool,
-    /// When it came in over the far terrain it replaces (drawn whole at once,
-    /// `fade`): a section new where far tiles are drawn, which skips vanilla's
-    /// fade-in. Meshed again, it stays as it was.
+    /// When it came in over the far terrain it replaces (drawn whole at once, `fade`; the
+    /// tile under it dithers out in front of it, `Renderer::open_window`): a section new where
+    /// far tiles are drawn, which skips vanilla's fade-in. Meshed again, it stays as it was.
     fading: Option<std::time::Instant>,
-    /// When it began to fade out, its column gone over far terrain that
-    /// stays behind it (`Renderer::leave_section`); released once it has.
+    /// When its column began to go over far terrain that dithers in in front of it
+    /// (`Renderer::leave_section`), which it is held whole until; released once it is.
     leaving: Option<std::time::Instant>,
     /// Animated sprite layers present in this section.
     animated_layers: Box<[u16]>,
@@ -607,8 +607,9 @@ impl SectionGpu {
     /// A near section never dithers over far terrain: the holes of its pattern
     /// showed its own inside (cave walls, the stone under the grass), nearer
     /// than the tile behind, an x-ray of each column coming in or going out.
-    /// It comes in whole over the tile it replaces, which stays behind it until
-    /// `fading` is `lod::FADE` old, and leaves whole after as long.
+    /// The far tile does the dithering instead, in front of it (`Tile::window`):
+    /// out when the section comes in, whole at once, and in when it leaves, held
+    /// whole until the tile is.
     fn fade(&self, retiring: bool) -> u32 {
         if self.leaving.is_some() || retiring {
             lod::HELD
@@ -1407,6 +1408,8 @@ pub struct Renderer {
     hold: hold::Hold<HeldMesh>,
     /// Finished tile meshes `upload_lods` has yet to upload.
     lod_pending: Option<lod::Pending>,
+    /// Fade counters (`HORIZON_FADE_STATS`).
+    fade_stats: lod::FadeStats,
     detail_columns: FxHashMap<(i32, i32), SectionMask>,
     /// Bumped whenever a column becomes or stops being complete.
     detail_revision: u64,
@@ -1470,9 +1473,6 @@ pub struct Renderer {
     /// When `section_uploaded` last gained a section: once the fade time has passed since,
     /// every section is whole and frames skip the per-section lookups.
     newest_upload: Option<std::time::Instant>,
-    /// When a section last began to fade in over far terrain (`SectionGpu::fading`), for the
-    /// same shortcut.
-    newest_lod_fade: Option<std::time::Instant>,
     /// Changes whenever `block_entities` does (unique across renderers).
     block_entity_revision: u64,
     /// The light sources of each section and their revision, for `block_light`.
@@ -5293,6 +5293,7 @@ impl Renderer {
             lod_leaving: Vec::new(),
             hold: Default::default(),
             lod_pending: None,
+            fade_stats: lod::FadeStats::from_env(),
             detail_columns: Default::default(),
             detail_revision: 0,
             arena,
@@ -5323,7 +5324,6 @@ impl Renderer {
             block_entity_membership_revisions: Default::default(),
             section_uploaded: Default::default(),
             newest_upload: None,
-            newest_lod_fade: None,
             block_entity_revision: next_block_entity_revision(),
             light_blocks: Default::default(),
             light_revision: 0,
@@ -6013,8 +6013,10 @@ impl Renderer {
         let fading = match self.sections.find(key) {
             Some(old) => old.fading,
             None if !self.lods.is_empty() => {
+                // New over far terrain: it comes in whole, and the tile that draws
+                // the column dithers out in front of it (`Renderer::open_window`).
                 let now = std::time::Instant::now();
-                self.newest_lod_fade = Some(now);
+                self.open_window((key.0, key.2), now, true);
                 Some(now)
             }
             None => None,
@@ -6615,14 +6617,10 @@ impl Renderer {
                 .newest_upload
                 .is_some_and(|t| (now.saturating_duration_since(t).as_millis() as u64) < fade_ms)
     }
-    /// Whether a section may be fading in or out over far terrain (`SectionGpu::fade`):
-    /// otherwise every section's code is 0.
-    fn sections_fading_over_lods(&self, now: std::time::Instant) -> bool {
-        !self.lod_retiring.is_empty()
-            || !self.lod_leaving.is_empty()
-            || self
-                .newest_lod_fade
-                .is_some_and(|t| now.saturating_duration_since(t) < lod::FADE)
+    /// Whether a section may be held in front of far terrain that comes in under it
+    /// (`SectionGpu::fade`): otherwise every section's code is 0.
+    fn sections_fading_over_lods(&self) -> bool {
+        !self.lod_retiring.is_empty() || !self.lod_leaving.is_empty()
     }
     /// Block entities in sections which can intersect the camera frustum.
     /// The section bounds include the same one-block margin as the per-block
@@ -6736,7 +6734,6 @@ impl Renderer {
         self.block_entity_membership_revisions.clear();
         self.section_uploaded.clear();
         self.newest_upload = None;
-        self.newest_lod_fade = None;
         self.block_entity_revision = next_block_entity_revision();
         self.sections.clear();
         // (a hold on land that is gone ends; the arenas' clearing below takes what waited)
@@ -6977,13 +6974,12 @@ impl Renderer {
     /// chunk as it came, and is released once it has (`release_left`): taken
     /// away at once, the column's detail dropped to the far terrain's in one
     /// frame.
-    fn leave_section(&mut self, key: SectionKey) {
-        let now = std::time::Instant::now();
+    fn leave_section(&mut self, key: SectionKey, since: std::time::Instant) {
         if let Some(section) = self.sections.find_mut(key)
             && section.leaving.is_none()
         {
-            section.leaving = Some(now);
-            self.lod_leaving.push((key, now));
+            section.leaving = Some(since);
+            self.lod_leaving.push((key, since));
             if let Some(gpu) = &mut self.gpu_culling {
                 hold_fading(&mut self.sections, &mut gpu.records, key);
             }
@@ -7033,12 +7029,14 @@ impl Renderer {
         }
         let mut released = Vec::new();
         let mut block_entities = false;
+        let now = std::time::Instant::now();
         for (x, z) in columns {
             if self.detail_columns.remove(&(x, z)) == Some(self.complete_column()) {
                 self.detail_revision += 1;
             }
             self.occlusion.remove_column(x, z);
             let retiring = !self.lod_cutout.is_empty() && self.lod_cutout.contains(&(x, z));
+            let mut window = None;
             for sy in 0..self.layout.sections() as i32 {
                 let key = (x, sy, z);
                 block_entities |= self.block_entities.remove(&key).is_some();
@@ -7055,8 +7053,10 @@ impl Renderer {
                         hold_fading(&mut self.sections, &mut gpu.records, key);
                     }
                 } else if !self.lods.is_empty() && self.sections.contains(key) {
-                    // Far terrain draws the column: it fades out over it.
-                    self.leave_section(key);
+                    // Far terrain draws the column: it dithers in over the
+                    // section, which stays whole until it has.
+                    let since = *window.get_or_insert_with(|| self.open_window((x, z), now, false));
+                    self.leave_section(key, since);
                 } else if let Some(section) = self.sections.remove(key) {
                     released.push(section);
                 }
@@ -8907,13 +8907,17 @@ impl Renderer {
         if frame.title {
             visible.clear();
         } else {
-            visible_lods.extend(self.lods.iter().filter_map(|(&key, tile)| {
-                tile.visible(lod::FarKey::Tile(key), camera, &view, now)
-            }));
-            visible_lods.extend(self.lod_cubes.iter().filter_map(|(&key, tile)| {
-                tile.visible(lod::FarKey::Cube(key), camera, &view, now)
-            }));
+            for (&key, tile) in &self.lods {
+                tile.visible(lod::FarKey::Tile(key), camera, &view, now, &mut visible_lods);
+            }
+            for (&key, tile) in &self.lod_cubes {
+                tile.visible(lod::FarKey::Cube(key), camera, &view, now, &mut visible_lods);
+            }
             visible_lods.sort_unstable_by_key(|v| (v.distance, v.key));
+            self.fade_stats.frame(
+                &visible_lods,
+                self.cube_far.as_ref().map(|far| far.fading_nodes()),
+            );
         }
         let mut shadow_visible = std::mem::take(&mut self.shadow_visible);
         shadow_visible.clear();
@@ -8989,12 +8993,7 @@ impl Renderer {
             }
             for v in &visible_lods {
                 if let Some(tile) = lod::far_tile(&self.lods, &self.lod_cubes, v.key) {
-                    for &layer in &*tile.drawn().animated_layers {
-                        let layer = layer as usize;
-                        self.active_animated_layers[layer / u64::BITS as usize] |=
-                            1_u64 << (layer % u64::BITS as usize);
-                    }
-                    for &layer in &*tile.mesh.animated_layers {
+                    for &layer in &*tile.mesh_of(v).animated_layers {
                         let layer = layer as usize;
                         self.active_animated_layers[layer / u64::BITS as usize] |=
                             1_u64 << (layer % u64::BITS as usize);
@@ -9034,7 +9033,7 @@ impl Renderer {
         // `LevelRenderer.extractSectionDrawGroups`: each section's `getVisibility`. Once
         // nothing is fading (the usual frame), every section is whole without a lookup.
         let fading_in = self.sections_fading_in(fade_ms, now);
-        let fading_over_lods = self.sections_fading_over_lods(now);
+        let fading_over_lods = self.sections_fading_over_lods();
         let fade_code = move |section: &SectionGpu, key: &SectionKey| {
             if fading_over_lods {
                 section.fade(retiring.contains(key))
@@ -9226,9 +9225,12 @@ impl Renderer {
         for (i, v) in visible_lods.iter().enumerate() {
             let tile =
                 lod::far_tile(&self.lods, &self.lod_cubes, v.key).expect("visible resident tile");
-            let s = tile.drawn();
+            let s = tile.mesh_of(v);
             let index = visible.len() + i;
-            let tested = cull.as_ref().and(tile.cull_bounds(v.fade));
+            let tested = cull
+                .as_ref()
+                .and(tile.cull_bounds(v.fade))
+                .filter(|_| v.testable);
             let slot = cull::TILE | tile.cull_slot;
             let first_phase = tested.is_none() || cull.as_ref().is_some_and(|c| c.first(slot));
             let (draws, pages) = if first_phase {
@@ -9362,7 +9364,10 @@ impl Renderer {
             let instance = visible.len() + i;
             let tile = lod::far_tile_mut(&mut self.lods, &mut self.lod_cubes, v.key)
                 .expect("visible resident tile");
-            let s = tile.drawn_mut();
+            if !v.water {
+                continue;
+            }
+            let s = tile.mesh_of_mut(v);
             if let Some((index_page, index_start)) = s.sorted_indices {
                 let scheduled = (instance + count - self.translucency_cursor) % count < budget;
                 if (!s.sort.is_sorted() || scheduled)
@@ -10151,7 +10156,7 @@ impl Renderer {
                                 ))
                             })
                             .chain(visible_lods.iter().filter_map(|v| {
-                                let id = lod::far_tile(lods, lod_cubes, v.key)?.drawn().flat_id?;
+                                let id = lod::far_tile(lods, lod_cubes, v.key)?.mesh_of(v).flat_id?;
                                 Some((id, lod::instance(v.origin, v.fade)))
                             })),
                         |page| sorted.buffer(page).clone(),
@@ -14553,7 +14558,7 @@ mod tests {
     }
     /// A section as `Renderer::upload_mesh` makes one, with `solid` and
     /// `translucent` quads, fading in over far terrain since `fading`.
-    fn section(
+    pub(super) fn section(
         solid: u32,
         translucent: u32,
         fading: Option<std::time::Instant>,
