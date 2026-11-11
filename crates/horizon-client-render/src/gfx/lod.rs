@@ -249,6 +249,8 @@ pub(super) struct FadeStats {
     /// Near cubes that came in over a node standing whole (a window), over none, and over one
     /// not whole yet (whole at once); then the same for cubes that left (`Renderer::open_cube_window`).
     pub cubes: [u32; 6],
+    /// Cubes that came in or left with no quads at all (nothing to show), not in `cubes`.
+    pub cubes_empty: [u32; 2],
     /// The most windows open at a frame, and the most shells drawn (CPU nodes).
     windows_max: [u32; 2],
 }
@@ -313,7 +315,7 @@ impl FadeStats {
                  standing; meshed again {} at once, {} stand-in whole, {} stand-in dithering out; \
                  windows in front of near sections: {} out, {} in, {} open at most; cpu cube nodes new {}, removed {}; gpu cube nodes {} began to fade in, {} began to go, {} meshed again in place, {} new; \
                  near cubes: {} came in over a shell, {} over no node, {} over a node not whole yet; {} left under one, {} with no node, {} under one not whole yet; \
-                 at most {} cube windows open, {} cpu shells drawn",
+                 at most {} cube windows open, {} cpu shells drawn; cubes with no quads (not counted above): {} came in, {} left",
                 self.frames,
                 self.drawn[0] / u64::from(self.frames),
                 self.max[0],
@@ -346,6 +348,8 @@ impl FadeStats {
                 self.cubes[5],
                 self.windows_max[0],
                 self.windows_max[1],
+                self.cubes_empty[0],
+                self.cubes_empty[1],
             );
             *self = Self {
                 on: true,
@@ -1339,13 +1343,20 @@ impl Renderer {
         key: super::SectionKey,
         now: Instant,
         out: bool,
+        visible: bool,
     ) -> Option<Instant> {
         let (cover, level) = self.cube_cover_level(key, now);
         // (a node too coarse to look like the terrain has no shell: the cube is whole at once)
         let shell = cover == Some(true)
             && level.is_some_and(|level| level <= reveal::MAX_SHELL_LEVEL)
             && !reveal_off();
-        self.fade_stats.cubes[usize::from(!out) * 3 + cover.map_or(1, |whole| usize::from(!whole) * 2)] += 1;
+        // (`visible`: the cube has quads. One with none, all air or buried, pops nothing, and
+        // is counted apart so the counts mean visible pops.)
+        if visible {
+            self.fade_stats.cubes[usize::from(!out) * 3 + cover.map_or(1, |whole| usize::from(!whole) * 2)] += 1;
+        } else {
+            self.fade_stats.cubes_empty[usize::from(!out)] += 1;
+        }
         if !shell {
             return None;
         }
@@ -1381,7 +1392,7 @@ impl Renderer {
             self.cube_held.remove(&(x, z));
             for key in held {
                 self.lod_retiring.remove(&key);
-                match self.open_cube_window(key, now, false) {
+                match self.open_cube_window(key, now, false, true) {
                     Some(since) => self.leave_section(key, since),
                     None => released.extend(self.sections.remove(key)),
                 }
