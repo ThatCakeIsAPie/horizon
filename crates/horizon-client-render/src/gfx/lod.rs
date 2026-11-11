@@ -213,6 +213,16 @@ pub(super) struct Tile {
     pub cull_slot: u32,
 }
 
+/// Whether a near cube that comes in or leaves opens a reveal window: a far node stands whole over
+/// it (`cover`), fine enough to have a shell (`level`), the cube has quads (`visible`), and
+/// `HORIZON_REVEAL_OFF` (`off`) is not set.
+fn wants_window(cover: Option<bool>, level: Option<u8>, visible: bool, off: bool) -> bool {
+    cover == Some(true)
+        && level.is_some_and(|level| level <= reveal::MAX_SHELL_LEVEL)
+        && visible
+        && !off
+}
+
 /// What far terrain did with its fades, counted behind the environment
 /// variable `HORIZON_FADE_STATS` and logged once a second (`FadeStats::frame`):
 /// how many tiles and cube nodes were drawn with a fade code, and how each kind
@@ -1346,10 +1356,10 @@ impl Renderer {
         visible: bool,
     ) -> Option<Instant> {
         let (cover, level) = self.cube_cover_level(key, now);
-        // (a node too coarse to look like the terrain has no shell: the cube is whole at once)
-        let shell = cover == Some(true)
-            && level.is_some_and(|level| level <= reveal::MAX_SHELL_LEVEL)
-            && !reveal_off();
+        // (a node too coarse to look like the terrain has no shell: the cube is whole at once;
+        // nor has a cube with no quads, all air or buried: the node stays drawn behind it
+        // either way, and its window would only take a slot from the cubes that show)
+        let shell = wants_window(cover, level, visible, reveal_off());
         // (`visible`: the cube has quads. One with none, all air or buried, pops nothing, and
         // is counted apart so the counts mean visible pops.)
         if visible {
@@ -1432,6 +1442,31 @@ mod tests {
     use super::*;
     use crate::mesher::TerrainVertex;
     const REVEAL_BIT: u32 = reveal::REVEAL;
+
+    #[test]
+    fn only_cubes_with_quads_over_a_fine_whole_node_open_a_window() {
+        let fine = reveal::MAX_SHELL_LEVEL;
+        assert!(wants_window(Some(true), Some(0), true, false));
+        assert!(wants_window(Some(true), Some(fine), true, false));
+        // An empty cube (all air or buried) opens none, so it takes no slot of the table.
+        assert!(!wants_window(Some(true), Some(0), false, false));
+        // Too coarse, not whole yet, no node, or the shells off: none either.
+        assert!(!wants_window(Some(true), Some(fine + 1), true, false));
+        assert!(!wants_window(Some(false), None, true, false));
+        assert!(!wants_window(None, None, true, false));
+        assert!(!wants_window(Some(true), Some(0), true, true));
+        // The table is not touched by cubes that open nothing: only visible ones fill it.
+        let mut reveal = reveal::Reveal::default();
+        let now = Instant::now();
+        for i in 0..200 {
+            let lo = DVec3::new(f64::from(i) * 200.0, 0.0, 0.0);
+            if wants_window(Some(true), Some(0), i % 2 == 0, false) {
+                reveal.open(lo, lo + 16.0, now, true);
+            }
+        }
+        assert_eq!(reveal.len(), 64.min(100));
+        assert_eq!(reveal.evicted, 100 - 64);
+    }
 
     #[test]
     fn tiles_fade_in_on_their_own_grid() {
