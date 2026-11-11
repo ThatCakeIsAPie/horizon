@@ -355,6 +355,20 @@ fn plain(n: f64) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
+/// "1 block = N metres", with "1 metre" in the singular: the wording follows the number as the page shows it,
+/// so a scale that rounds to 1 reads as 1. A language that has the plural sentence but no singular one keeps
+/// the plural, as it did before the singular existed.
+pub(super) fn scale_sentence(scale: f64) -> String {
+    let shown = plain(scale);
+    let one = "horizon.cubic.earth.scale.is.one";
+    let key = if shown == "1" && crate::lang::has(one) {
+        one
+    } else {
+        "horizon.cubic.earth.scale.is"
+    };
+    sentence(key, &[shown])
+}
+
 fn sentence(key: &str, args: &[String]) -> String {
     let args: Vec<Text> = args.iter().cloned().map(Text::literal).collect();
     Text::translate(key, &args).plain()
@@ -420,7 +434,7 @@ fn scale_notes(b: &mut Builder, earth: &Draft) {
     else {
         return;
     };
-    b.note(sentence("horizon.cubic.earth.scale.is", &[plain(scale)]));
+    b.note(scale_sentence(scale));
     let vertical = VerticalMap::new(earth.rest.sea_level_y, scale)
         .with_exaggeration(earth.rest.vertical_exaggeration);
     let (low, high) = vertical.required_y_range();

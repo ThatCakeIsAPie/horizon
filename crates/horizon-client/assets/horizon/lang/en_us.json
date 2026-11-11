@@ -156,6 +156,7 @@
   "horizon.cubic.earth.place.machu_picchu": "Machu Picchu",
   "horizon.cubic.earth.scale.heading": "Scale",
   "horizon.cubic.earth.scale.is": "1 block = %s metres",
+  "horizon.cubic.earth.scale.is.one": "1 block = %s metre",
   "horizon.cubic.earth.scale.needs": "The whole Earth needs y %s to %s at this scale.",
   "horizon.cubic.earth.scale.too_tall": "That does not fit this world's height range (y %s to %s): the tallest mountains or deepest trenches would be cut off. Use a larger scale.",
   "horizon.cubic.earth.server_is": "Tile server: %s",

@@ -3795,7 +3795,7 @@ mod tests {
         let mut s = earth_with(crate::earth_consent::Approved::of(&[]), None);
         let lines = earth_lines(&s);
         assert!(
-            lines.contains(&"1 block = 1 metres".to_owned()),
+            lines.contains(&"1 block = 1 metre".to_owned()),
             "{lines:?}"
         );
         assert!(
@@ -3982,6 +3982,20 @@ mod tests {
     }
 
     #[test]
+    fn the_scale_line_is_singular_only_for_one() {
+        use super::earth::scale_sentence;
+        let line = |scale| english(|| scale_sentence(scale));
+        assert_eq!(line(1.0), "1 block = 1 metre");
+        // A scale the page shows as 1 reads as 1.
+        assert_eq!(line(1.0004), "1 block = 1 metre");
+        assert_eq!(line(2.0), "1 block = 2 metres");
+        assert_eq!(line(0.5), "1 block = 0.5 metres");
+        assert_eq!(line(1.5), "1 block = 1.5 metres");
+        assert_eq!(line(10.0), "1 block = 10 metres");
+        assert_eq!(line(1000.0), "1 block = 1000 metres");
+    }
+
+    #[test]
     fn earths_strings_are_in_the_language_file() {
         let strings: std::collections::HashMap<String, String> =
             serde_json::from_str(include_str!("../../assets/horizon/lang/en_us.json")).unwrap();
@@ -4003,6 +4017,7 @@ mod tests {
             "horizon.cubic.earth.invalid",
             "horizon.cubic.earth.places",
             "horizon.cubic.earth.scale.is",
+            "horizon.cubic.earth.scale.is.one",
             "horizon.cubic.earth.scale.needs",
             "horizon.cubic.earth.scale.too_tall",
             "horizon.cubic.earth.server_is",
