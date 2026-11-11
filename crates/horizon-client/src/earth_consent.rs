@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 /// The file's name in the player's folder.
 pub const FILE: &str = "horizon-earth-servers.txt";
-const HEADER: &str = "# Tile servers this player lets Earth worlds download elevation tiles from, one host a line.\n\
+const HEADER: &str = "# Servers this player lets Earth worlds download elevation tiles and land cover from, one host a line.\n\
 # A world downloads only when it allows downloads and its server's host is listed here.\n\
 # Lines starting with # are ignored. Delete a line to take the approval back.\n";
 
@@ -157,6 +157,42 @@ pub fn pending_host_of(
     crate::earth_net::check_template(url).ok()?;
     let host = crate::earth_net::host_of(url).ok()?;
     (!approved.contains(&host)).then_some(host)
+}
+
+/// The land cover server of a world with `settings` that wants land cover and downloads, whose host the player
+/// has not approved: the host to tell them about. `address` is the land cover folder the build or the player
+/// gives (`earth_landnet::address`). The land cover server is a host of its own: approving the tile server does
+/// not approve it.
+pub fn pending_land_host_of(
+    settings: &horizon_world::cubic::earth::EarthSettings,
+    address: Option<&str>,
+    approved: &Approved,
+) -> Option<String> {
+    let host = crate::earth_landnet::host_for(settings, address)?;
+    (!approved.contains(&host)).then_some(host)
+}
+
+/// Every host a world with `settings` wants to download from: the tile server's, then the land cover server's
+/// (when the world uses land cover and the game has an address for it). Hosts the game would not use are left
+/// out.
+pub fn wanted_hosts(
+    settings: &horizon_world::cubic::earth::EarthSettings,
+    land_address: Option<&str>,
+) -> Vec<String> {
+    let mut hosts = Vec::new();
+    let url = settings.tile_url.trim();
+    if settings.allow_downloads
+        && crate::earth_net::check_template(url).is_ok()
+        && let Ok(host) = crate::earth_net::host_of(url)
+    {
+        hosts.push(host);
+    }
+    if let Some(host) = crate::earth_landnet::host_for(settings, land_address)
+        && !hosts.contains(&host)
+    {
+        hosts.push(host);
+    }
+    hosts
 }
 
 /// Hosts the player was told about this run, and the one not yet told.

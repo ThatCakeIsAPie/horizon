@@ -136,7 +136,7 @@ pub fn host_of(url: &str) -> Result<String, String> {
 }
 
 /// Whether the game may download from `url`: `https://` anywhere, plain `http://` only to this machine.
-fn allowed(url: &str) -> Result<(), AddressProblem> {
+pub(crate) fn allowed(url: &str) -> Result<(), AddressProblem> {
     let (scheme, host) = origin_of(url)?;
     match scheme {
         "https" => Ok(()),
@@ -179,9 +179,25 @@ pub fn check_address(template: &str) -> Result<(), AddressProblem> {
 pub struct HttpTileFetcher {
     /// The template to download from, or why nothing is downloaded.
     source: Result<String, String>,
+    http: Http,
+}
+
+/// What a successful HTTP request answered.
+pub(crate) struct Reply {
+    /// 200, or 206 for a range request that was honoured.
+    pub status: u16,
+    pub body: Vec<u8>,
+    /// The `Content-Range` header, for a 206.
+    pub content_range: Option<String>,
+}
+
+/// The one HTTP stack of the game's Earth downloads (tiles, land cover): a `ureq` agent with neutral headers
+/// (`User-Agent: Horizon/<version>` only: no cookies, no identifier of the player, no referrer), timeouts, a size
+/// cap, and redirects followed by hand, only to addresses the same rules allow and hosts the player approved.
+pub(crate) struct Http {
     agent: ureq::Agent,
     max_bytes: usize,
-    /// The hosts the player approved when the fetcher was made: a redirect may lead only to one of them.
+    /// The hosts the player approved when this was made: a redirect may lead only to one of them.
     approved: Approved,
 }
 
@@ -225,19 +241,9 @@ impl HttpTileFetcher {
         total: Duration,
         max_bytes: usize,
     ) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .user_agent(&format!("Horizon/{}", horizon_core::release::VERSION))
-            .timeout_connect(connect)
-            .timeout_read(read)
-            .timeout(total)
-            // Redirects are followed by hand, to addresses the same rules allow.
-            .redirects(0)
-            .build();
         Self {
             source,
-            agent,
-            max_bytes,
-            approved,
+            http: Http::new(approved, connect, read, total, max_bytes),
         }
     }
 
@@ -246,7 +252,7 @@ impl HttpTileFetcher {
     fn limits(self, timeout: Duration, max_bytes: usize) -> Self {
         Self::over(
             self.source,
-            self.approved,
+            self.http.approved,
             timeout,
             timeout,
             timeout,
@@ -265,20 +271,65 @@ impl HttpTileFetcher {
     }
 
     fn get(&self, template: &str, id: TileId) -> Result<Vec<u8>, FetchError> {
-        let mut url = tile_url(template, id);
+        self.http
+            .get(&tile_url(template, id), "image/png, */*;q=0.5", None)
+            .map(|reply| reply.body)
+    }
+}
+
+impl Http {
+    /// An agent with the game's timeouts; `approved` are the hosts a redirect may lead to.
+    pub(crate) fn new(
+        approved: Approved,
+        connect: Duration,
+        read: Duration,
+        total: Duration,
+        max_bytes: usize,
+    ) -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .user_agent(&format!("Horizon/{}", horizon_core::release::VERSION))
+            .timeout_connect(connect)
+            .timeout_read(read)
+            .timeout(total)
+            // Redirects are followed by hand, to addresses the same rules allow.
+            .redirects(0)
+            .build();
+        Self {
+            agent,
+            max_bytes,
+            approved,
+        }
+    }
+
+    /// GET `url`, for the bytes `first..=last` when `range` says so (the `Range` header). 200 and 206 are
+    /// answers; any other status is classified by [`status_error`]. The caller has checked `url` against
+    /// [`allowed`] and the approved hosts.
+    pub(crate) fn get(
+        &self,
+        url: &str,
+        accept: &str,
+        range: Option<(u64, u64)>,
+    ) -> Result<Reply, FetchError> {
+        let mut url = url.to_owned();
         for _ in 0..=MAX_REDIRECTS {
-            let response = match self
-                .agent
-                .get(&url)
-                .set("Accept", "image/png, */*;q=0.5")
-                .call()
-            {
+            let mut request = self.agent.get(&url).set("Accept", accept);
+            if let Some((first, last)) = range {
+                request = request.set("Range", &format!("bytes={first}-{last}"));
+            }
+            let response = match request.call() {
                 Ok(response) => response,
                 Err(ureq::Error::Status(code, _)) => return Err(status_error(code)),
                 Err(ureq::Error::Transport(t)) => return Err(transport_error(&t)),
             };
             match response.status() {
-                200 => return self.body(response),
+                status @ (200 | 206) => {
+                    let content_range = response.header("Content-Range").map(str::to_owned);
+                    return Ok(Reply {
+                        status,
+                        body: self.body(response)?,
+                        content_range,
+                    });
+                }
                 301 | 302 | 303 | 307 | 308 => {
                     let next = response
                         .header("Location")
@@ -307,7 +358,7 @@ impl HttpTileFetcher {
     fn body(&self, response: ureq::Response) -> Result<Vec<u8>, FetchError> {
         let too_big = || {
             FetchError::Other(format!(
-                "the tile is larger than {} bytes, which is not a tile",
+                "the response is larger than {} bytes, which is not what was asked for",
                 self.max_bytes
             ))
         };
@@ -446,4 +497,4 @@ pub fn open_with(settings: &EarthSettings, root: &Path, approved: &Approved) -> 
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

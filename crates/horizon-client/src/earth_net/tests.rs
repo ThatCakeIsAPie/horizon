@@ -8,9 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// What the test server answers a path with.
-enum Reply {
+pub(crate) enum Reply {
     /// 200 with these bytes (and their length).
     Ok(Vec<u8>),
+    /// 206 with these bytes and this `Content-Range`.
+    Partial(Vec<u8>, String),
     /// 200 with these bytes and no length: the body ends when the connection does.
     Streamed(Vec<u8>),
     Status(u16),
@@ -19,7 +21,7 @@ enum Reply {
     Stall(Duration),
 }
 
-struct Server {
+pub(crate) struct Server {
     port: u16,
     /// Each request as its request line and its headers.
     seen: Arc<Mutex<Vec<(String, Vec<String>)>>>,
@@ -27,7 +29,14 @@ struct Server {
 }
 
 impl Server {
-    fn start(reply: impl Fn(&str) -> Reply + Send + Sync + 'static) -> Self {
+    pub(crate) fn start(reply: impl Fn(&str) -> Reply + Send + Sync + 'static) -> Self {
+        Self::start_seeing(move |path, _| reply(path))
+    }
+
+    /// A server whose answer may depend on the request's headers too.
+    pub(crate) fn start_seeing(
+        reply: impl Fn(&str, &[String]) -> Reply + Send + Sync + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -47,11 +56,11 @@ impl Server {
         Self { port, seen, stop }
     }
 
-    fn template(&self, path: &str) -> String {
+    pub(crate) fn template(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{path}", self.port)
     }
 
-    fn requests(&self) -> Vec<(String, Vec<String>)> {
+    pub(crate) fn requests(&self) -> Vec<(String, Vec<String>)> {
         self.seen.lock().unwrap().clone()
     }
 }
@@ -66,7 +75,7 @@ impl Drop for Server {
 
 fn answer(
     mut stream: TcpStream,
-    reply: &dyn Fn(&str) -> Reply,
+    reply: &dyn Fn(&str, &[String]) -> Reply,
     seen: &Mutex<Vec<(String, Vec<String>)>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -85,13 +94,26 @@ fn answer(
     let target = line.split_whitespace().nth(1).unwrap_or("/").to_owned();
     // The handler decides by the path; the query holds the tile numbers.
     let path = target.split('?').next().unwrap_or("/").to_owned();
+    let answer = reply(&path, &headers);
     seen.lock().unwrap().push((line.trim().to_owned(), headers));
     let head =
         |status: &str, extra: &str| format!("HTTP/1.1 {status}\r\nConnection: close\r\n{extra}");
-    let _ = match reply(&path) {
+    let _ = match answer {
         Reply::Ok(body) => stream
             .write_all(
                 head("200 OK", &format!("Content-Length: {}\r\n\r\n", body.len())).as_bytes(),
+            )
+            .and_then(|()| stream.write_all(&body)),
+        Reply::Partial(body, range) => stream
+            .write_all(
+                head(
+                    "206 Partial Content",
+                    &format!(
+                        "Content-Range: {range}\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    ),
+                )
+                .as_bytes(),
             )
             .and_then(|()| stream.write_all(&body)),
         Reply::Streamed(body) => stream

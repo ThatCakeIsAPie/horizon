@@ -45,3 +45,10 @@ pub const FRIENDS_HELP: &str =
 /// approves its host.
 pub const EARTH_TILES: &str =
     "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
+
+/// The public land cover files Earth worlds with land cover on read (ESA WorldCover 2021 v200, CC BY
+/// 4.0, in the `esa-worldcover` bucket of AWS Open Data; docs/earth.md): the folder the dataset's
+/// paths (`v200/2021/map/ESA_WorldCover_10m_2021_v200_N36W114_Map.tif`) hang from. The game asks for
+/// byte ranges of those files. Offering it downloads nothing: the host needs the player's approval
+/// like the tile server's, and the world must allow downloads.
+pub const EARTH_LAND_COVER: &str = "https://esa-worldcover.s3.eu-central-1.amazonaws.com/";
