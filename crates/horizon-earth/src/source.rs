@@ -210,7 +210,7 @@ impl TileStore {
 
 /// Writes `bytes` to `path` through a temporary file in the same folder and a rename, so a reader never sees a
 /// half-written file.
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = path
         .parent()

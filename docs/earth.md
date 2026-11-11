@@ -97,6 +97,47 @@ The dataset's publisher requires this attribution
 
 The publisher's page also gives the per-source details (licenses, credit lines) behind each item.
 
+## Land cover: the reader (built, not used yet)
+
+The next data layer is land cover from **ESA WorldCover 2021 v200**: 10 m classes (tree cover, shrubland, grassland,
+cropland, built-up, bare, snow and ice, water, wetland, mangroves, moss and lichen) under CC BY 4.0, in 3° by 3°
+GeoTIFF files on a public bucket, read with HTTP range requests. What exists is only the part that needs no network
+and no real data, in `crates/horizon-earth`:
+
+- **`tiff.rs`**: a minimal TIFF reader over byte slices. It reads exactly what those files are (classic TIFF in
+  either byte order, tiled, 8 bits, one sample, DEFLATE with no predictor, a chain of overview levels) and refuses
+  anything else by name. From a prefix of the file (the first 32 KiB holds the whole index) it gives the levels,
+  or says which byte range to fetch next; for a level and a tile index it gives that tile's byte range, and it
+  decodes a tile's bytes to pixels. Every offset and count is bounds-checked, sizes are capped, and a bad file is an
+  error, never a panic or a huge allocation. DEFLATE is `miniz_oxide`, which the `png` crate and the client already
+  use (no new crate in `Cargo.lock`).
+- **`landcover.rs`**: the `LandClass` type (the dataset's raw codes), the file for a latitude and longitude (named by
+  its south-west corner, `N27E084`; the date line wraps and each pole is in its row's file), the pixel inside it,
+  the choice of overview level for a ground resolution, and `LAND_COVER_RULES`, the version of all of that, which
+  names the on-disk cache folder (`worldcover-2021-v200-rules1`) the way `CLEAN_RULES` keys the elevation cleaning.
+- **`landfield.rs`**: `LandCoverStore`, a bounded memory cache of decoded tiles over a disk cache, with no fetcher.
+  A lookup that lacks data answers with the `Fetch` to make (file, byte range, index or tile); the caller fetches
+  the bytes and hands them to `provide`, which refuses anything that does not decode and stores nothing then.
+  `LandCoverField` places it on world blocks through a `Projection`, like the elevation field, with `needs` to list
+  what a rectangle will want for prefetching.
+- **`testing.rs`**: a writer of synthetic tiled TIFFs, so the tests need no real data.
+
+What is **not** built: no downloader and no address (those wait for the owner's decision on the bucket, and an
+address would live in `horizon-addresses`), no use by the generator or the far view (the surface rule does not read
+land cover), and nothing is fetched from anywhere. Not checked against a real file: the half-pixel convention
+(the reader treats a pixel as the area it covers), and whether overview levels keep class boundaries well
+(they are taken as the file gives them).
+
+WorldCover's suggested attribution, when this layer is used (the wording from the land-cover research note, which
+takes it from ESA's data access page, https://esa-worldcover.org/en/data-access; check it against that page before
+it ships, then show it in the Data credits screen and in `THIRD_PARTY_NOTICES.md`):
+
+```
+(c) ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) processed by ESA WorldCover consortium
+```
+
+Citation: Zanaga et al. (2022), ESA WorldCover 10 m 2021 v200, doi:10.5281/zenodo.7254221.
+
 ## Known limits
 
 - **Elevation only, one biome.** There is no land cover, no rivers or roads, no buildings. The surface is grass,
