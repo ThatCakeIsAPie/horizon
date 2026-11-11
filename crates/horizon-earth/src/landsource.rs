@@ -45,13 +45,21 @@ impl LandCoverSource {
         &self.field
     }
 
-    /// Fetches `fetch` and hands it to the store; a file the fetcher says does not exist is marked absent. An
-    /// error means nothing was stored (and nothing was marked), so asking again retries.
+    /// Fetches `fetch` and hands it to the store; a file the fetcher says does not exist is marked absent
+    /// (kept on disk). A fetcher that refuses ([`FetchError::Refused`]: downloads are off or not approved, the
+    /// server says no) is answered as no data for the rest of the run ([`LandCoverStore::mark_unavailable`]),
+    /// so a read never waits for what will not come, and the reason is the caller's to log (this still returns
+    /// the error once, for it). Any other error means nothing was stored (and nothing was marked), so asking
+    /// again retries.
     pub fn satisfy(&self, fetch: &Fetch) -> Result<(), FetchError> {
         match self.fetcher.fetch(fetch.file, fetch.range) {
             Ok(None) | Err(FetchError::NotFound) => {
                 self.field.store().mark_absent(fetch.file);
                 Ok(())
+            }
+            Err(refused @ FetchError::Refused(_)) => {
+                self.field.store().mark_unavailable(fetch);
+                Err(refused)
             }
             Ok(Some(bytes)) => self
                 .field
@@ -98,7 +106,11 @@ impl LandCoverSource {
         for _ in 0..MAX_FETCHES_PER_READ {
             match read() {
                 Ok(value) => return Ok(value),
-                Err(fetch) => self.satisfy(&fetch)?,
+                // A refusal marked what was asked for as no data: the next read answers without it.
+                Err(fetch) => match self.satisfy(&fetch) {
+                    Ok(()) | Err(FetchError::Refused(_)) => {}
+                    Err(e) => return Err(e),
+                },
             }
         }
         Err(FetchError::Other(
@@ -169,5 +181,69 @@ mod tests {
             source.class_at_blocking(0.5, 0.5, 1.0).unwrap(),
             LandClass::Tree
         );
+    }
+
+    #[test]
+    fn a_file_the_source_does_not_have_is_remembered_on_disk_for_the_next_run() {
+        let dir = TempDir::new();
+        let fetcher = Arc::new(MemoryLandCover::new());
+        let first = source(fetcher.clone(), &dir);
+        assert_eq!(first.class_at_blocking(0.5, 0.5, 1.0).unwrap(), LandClass::NoData);
+        assert_eq!(fetcher.fetch_count(), 1);
+        // A new store over the same folder asks nothing: its plain read already says "no file".
+        let again = Arc::new(MemoryLandCover::new());
+        let second = source(again.clone(), &dir);
+        assert_eq!(second.field().class_at_block(0, 0), Lookup::NoFile);
+        assert_eq!(second.class_at_blocking(0.5, 0.5, 1.0).unwrap(), LandClass::NoData);
+        assert_eq!(again.fetch_count(), 0);
+    }
+
+    #[test]
+    fn what_was_fetched_is_read_from_disk_by_the_next_run_without_a_request() {
+        let dir = TempDir::new();
+        let fetcher = Arc::new(MemoryLandCover::new().with_classes(FILE, 256, 64, 2, |_, _| 80));
+        let first = source(fetcher.clone(), &dir);
+        let grid = first.class_grid_blocking(0, 0, 8, 8, 1, 1.0).unwrap();
+        assert_eq!(grid, vec![LandClass::Water; 64]);
+        assert!(fetcher.fetch_count() >= 2);
+        let again = Arc::new(MemoryLandCover::new());
+        let second = source(again.clone(), &dir);
+        assert_eq!(second.class_grid_blocking(0, 0, 8, 8, 1, 1.0).unwrap(), grid);
+        assert_eq!(again.fetch_count(), 0);
+    }
+
+    #[test]
+    fn a_refusal_reads_as_no_data_for_the_run_and_nothing_waits_or_is_written() {
+        let dir = TempDir::new();
+        let fetcher = Arc::new(MemoryLandCover::new().with_classes(FILE, 256, 64, 2, |_, _| 10));
+        fetcher.fail_with(Some(FetchError::Refused("not approved".into())));
+        let source = source(fetcher.clone(), &dir);
+        // The blocking read answers instead of failing or looping: the file's index is "no data".
+        assert_eq!(source.class_at_blocking(0.5, 0.5, 1.0).unwrap(), LandClass::NoData);
+        assert_eq!(fetcher.fetch_count(), 1);
+        // The caller that fetches in the background hears the refusal once, then the same answer.
+        assert_eq!(source.field().class_at_block(0, 0), Lookup::NoFile);
+        // Another run (the player approved meanwhile) asks again: nothing was written.
+        fetcher.fail_with(None);
+        let next = self::source(fetcher.clone(), &dir);
+        assert_eq!(next.class_at_blocking(0.5, 0.5, 1.0).unwrap(), LandClass::Tree);
+    }
+
+    #[test]
+    fn a_refused_tile_is_no_data_while_the_rest_of_the_file_is_read() {
+        let dir = TempDir::new();
+        let fetcher = Arc::new(MemoryLandCover::new().with_classes(FILE, 256, 64, 2, |_, _| 10));
+        let source = source(fetcher.clone(), &dir);
+        // The index first, then refuse the tile.
+        let Lookup::Need(index) = source.field().class_at_block(0, 0) else {
+            panic!("needs the index");
+        };
+        source.satisfy(&index).unwrap();
+        let Lookup::Need(tile) = source.field().class_at_block(0, 0) else {
+            panic!("needs the tile");
+        };
+        fetcher.fail_with(Some(FetchError::Refused("no".into())));
+        assert!(matches!(source.satisfy(&tile), Err(FetchError::Refused(_))));
+        assert_eq!(source.field().class_at_block(0, 0), Lookup::Class(LandClass::NoData));
     }
 }

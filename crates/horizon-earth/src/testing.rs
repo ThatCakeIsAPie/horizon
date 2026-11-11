@@ -496,6 +496,11 @@ impl MemoryLandCover {
         self.with_file(file, encoded.bytes)
     }
 
+    /// The bytes of a file served, for a test that serves them another way.
+    pub fn file_bytes(&self, file: WorldCoverFile) -> Option<Vec<u8>> {
+        self.files.get(&file).cloned()
+    }
+
     /// How many fetches were asked for, failed ones and ones for missing files included.
     pub fn fetch_count(&self) -> usize {
         self.fetches.load(Ordering::SeqCst)
