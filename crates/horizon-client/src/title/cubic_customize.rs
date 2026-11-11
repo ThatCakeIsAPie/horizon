@@ -3928,6 +3928,72 @@ mod tests {
         assert!(crate::earth_consent::Approved::load(dir.path()).contains("elsewhere.example.org"));
     }
 
+    const LAND: &str = "https://land.example.org/";
+
+    fn earth_with_land(approved: crate::earth_consent::Approved) -> State {
+        let mut s = state(CubicKind::Earth, "");
+        s.earth = earth::Draft::with_land(Some(OFFER), Some(LAND), approved);
+        s
+    }
+
+    #[test]
+    fn a_new_world_has_land_cover_on_when_the_game_has_a_source_and_an_old_world_keeps_its_file() {
+        let s = earth_with_land(crate::earth_consent::Approved::of(&[]));
+        assert!(earth_settings(&s).unwrap().land_cover, "on by default");
+        assert!(s.json().contains("\"landCover\": true"));
+        // A game with no source: the box is off and cannot be turned on.
+        let none = earth_with(crate::earth_consent::Approved::of(&[]), Some(OFFER));
+        assert!(!earth_settings(&none).unwrap().land_cover);
+        // A world file without the key stays off whatever the default; one with it keeps it.
+        let mut old = earth_with_land(crate::earth_consent::Approved::of(&[]));
+        old.load_json(r#"{"originLatitude":1,"originLongitude":2}"#).unwrap();
+        assert!(!earth_settings(&old).unwrap().land_cover);
+        old.load_json(r#"{"originLatitude":1,"originLongitude":2,"landCover":true}"#)
+            .unwrap();
+        assert!(earth_settings(&old).unwrap().land_cover);
+    }
+
+    #[test]
+    fn the_land_cover_box_toggles_and_done_approves_its_host_with_the_tile_server() {
+        let dir = horizon_earth::testing::TempDir::new();
+        let mut s = earth_with_land(crate::earth_consent::Approved::load(dir.path()));
+        press_button(&mut s, "horizon.cubic.earth.land_cover");
+        assert!(!earth_settings(&s).unwrap().land_cover);
+        press_button(&mut s, "horizon.cubic.earth.land_cover");
+        assert!(earth_settings(&s).unwrap().land_cover);
+        // Without Allow downloads Done approves nothing.
+        s.finish();
+        assert!(!crate::earth_consent::Approved::load(dir.path()).contains("land.example.org"));
+        press_button(&mut s, "horizon.cubic.earth.downloads");
+        assert!(
+            earth_lines(&s)
+                .iter()
+                .any(|l| l.contains("land.example.org")),
+            "the page names the second host"
+        );
+        s.finish();
+        let list = crate::earth_consent::Approved::load(dir.path());
+        assert!(list.contains("tiles.example.com") && list.contains("land.example.org"));
+        // Land cover off: Done approves the tile server only.
+        let dir = horizon_earth::testing::TempDir::new();
+        let mut s = earth_with_land(crate::earth_consent::Approved::load(dir.path()));
+        press_button(&mut s, "horizon.cubic.earth.land_cover");
+        press_button(&mut s, "horizon.cubic.earth.downloads");
+        s.finish();
+        let list = crate::earth_consent::Approved::load(dir.path());
+        assert!(list.contains("tiles.example.com") && !list.contains("land.example.org"));
+    }
+
+    #[test]
+    fn the_land_cover_credits_are_on_the_credits_view_word_for_word() {
+        let mut s = earth_with_land(crate::earth_consent::Approved::of(&[]));
+        press_button(&mut s, "horizon.cubic.earth.credits.open");
+        let text = earth_lines(&s).join(" ");
+        let wording = earth::land_attribution().trim().split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains(&wording), "{text}");
+        assert!(wording.contains("ESA WorldCover project 2021"));
+    }
+
     #[test]
     fn the_switch_is_unavailable_without_a_usable_address() {
         let mut s = earth_with(crate::earth_consent::Approved::of(&[]), None);
@@ -4034,6 +4100,18 @@ mod tests {
             "horizon.cubic.earth.unapproved",
             "horizon.cubic.earth.edit.approve",
             "horizon.cubic.earth.edit.revoke",
+            "horizon.cubic.earth.edit.approve.land",
+            "horizon.cubic.earth.edit.revoke.land",
+            "horizon.cubic.earth.land_cover.heading",
+            "horizon.cubic.earth.land_cover",
+            "horizon.cubic.earth.land_cover.help",
+            "horizon.cubic.earth.land_cover.no_source",
+            "horizon.cubic.earth.land_cover.on",
+            "horizon.cubic.earth.land_cover.needs_downloads",
+            "horizon.cubic.earth.credits.land_source",
+            "horizon.cubic.earth.credits.land_about",
+            "horizon.cubic.earth.credits.land_required",
+            "horizon.cubic.earth.credits.land_licence",
         ]
         .into_iter()
         .chain(super::earth::PLACES.iter().map(|p| p.0))

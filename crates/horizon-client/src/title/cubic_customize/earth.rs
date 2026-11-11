@@ -47,11 +47,17 @@ pub(super) const PLACES: [(&str, f64, f64); 8] = [
 /// (github.com/tilezen/joerd, docs/attribution.md, "Required attribution"): shown as it is, in English.
 const ATTRIBUTION: &str = include_str!("earth/attribution.txt");
 
+/// The land cover data's required attribution, as ESA words it (esa-worldcover.org/en/data-access): shown as it
+/// is, in English.
+const LAND_ATTRIBUTION: &str = include_str!("earth/land_attribution.txt");
+
 /// What the page knows of the player and the game, apart from the world.
 #[derive(Clone, Debug)]
 pub(super) struct Context {
     /// The tile address the box starts with: the game's own offer (`Hooks::earth_tile_address`), if any.
     pub(super) default_url: Option<String>,
+    /// The land cover folder the game offers (`earth_landnet::address`), if any.
+    pub(super) land_address: Option<String>,
     /// The hosts this player approved.
     pub(super) approved: Approved,
 }
@@ -61,6 +67,7 @@ impl Context {
     fn game() -> Self {
         Self {
             default_url: horizon_hooks::engine::earth_tile_address().map(str::to_owned),
+            land_address: crate::earth_landnet::address(),
             approved: Approved::for_player(),
         }
     }
@@ -98,6 +105,8 @@ pub(super) struct Draft {
     allow_downloads: bool,
     /// The host the player turned the switch on for, on this page.
     consent: Option<String>,
+    /// Whether the world uses land cover.
+    land_cover: bool,
     /// The settings the page does not show, as they were read.
     rest: EarthSettings,
     ctx: Context,
@@ -120,6 +129,9 @@ impl Draft {
         if let Some(url) = draft.ctx.default_url.clone() {
             draft.url = url;
         }
+        // A new world uses land cover when this game has somewhere to get it (an existing world keeps what its
+        // file says, which is off unless it names `landCover`).
+        draft.land_cover = draft.land_host().is_some();
         draft
     }
 
@@ -131,6 +143,7 @@ impl Draft {
             url: settings.tile_url.clone(),
             allow_downloads: settings.allow_downloads,
             consent: None,
+            land_cover: settings.land_cover,
             rest: settings.clone(),
             ctx,
             focus: None,
@@ -160,6 +173,24 @@ impl Draft {
         earth_net::host_of(url).ok()
     }
 
+    /// The land cover server's host, when this game has an address for it that it may use.
+    fn land_host(&self) -> Option<String> {
+        let mut settings = self.rest.clone();
+        settings.land_cover = true;
+        settings.allow_downloads = true;
+        crate::earth_landnet::host_for(&settings, self.ctx.land_address.as_deref())
+    }
+
+    /// Whether land cover is on: the switch is, and the game has a source for it.
+    fn land_on(&self) -> bool {
+        self.land_cover && self.land_host().is_some()
+    }
+
+    /// The land cover switch.
+    fn toggle_land_cover(&mut self) {
+        self.land_cover = !self.land_on() && self.land_host().is_some();
+    }
+
     /// Whether downloads are on: the switch is, for a host the player approved before or just now.
     fn downloads_on(&self) -> bool {
         self.allow_downloads
@@ -186,6 +217,13 @@ impl Draft {
         };
         if let Err(e) = self.ctx.approved.approve(&host) {
             log::warn!("Horizon: could not keep the approval of {host} for Earth tiles: {e}");
+        }
+        // The land cover server is a host of its own, approved the same way, by the same press of Done.
+        if self.land_on()
+            && let Some(land) = self.land_host()
+            && let Err(e) = self.ctx.approved.approve(&land)
+        {
+            log::warn!("Horizon: could not keep the approval of {land} for Earth land cover: {e}");
         }
     }
 
@@ -218,6 +256,7 @@ impl Draft {
         settings.metres_per_block = number(&self.scale, 2)?;
         settings.tile_url = self.url.trim().to_owned();
         settings.allow_downloads = self.downloads_on();
+        settings.land_cover = self.land_on();
         let limit = horizon_earth::projection::MAX_LATITUDE;
         if settings.origin_latitude.abs() > limit {
             return Err(Problem::new(
@@ -413,6 +452,7 @@ pub(super) fn page(b: &mut Builder, state: &State) {
     field(b, 3);
     b.note(tr("horizon.cubic.earth.url.help"));
     downloads(b, earth);
+    land_cover(b, earth);
     b.heading(tr("horizon.cubic.earth.credits.heading"));
     b.note(tr("horizon.cubic.earth.credits.short"));
     b.row(vec![button(tr("horizon.cubic.earth.credits.open"), |s| {
@@ -484,6 +524,35 @@ fn downloads(b: &mut Builder, earth: &Draft) {
     )]);
 }
 
+/// The land cover switch, and the second host the page will contact for it.
+fn land_cover(b: &mut Builder, earth: &Draft) {
+    b.heading(tr("horizon.cubic.earth.land_cover.heading"));
+    for line in wrap(&tr("horizon.cubic.earth.land_cover.help"), LINE) {
+        b.note(line);
+    }
+    let host = earth.land_host();
+    match &host {
+        None => b.note(tr("horizon.cubic.earth.land_cover.no_source")),
+        Some(host) if earth.land_on() => {
+            let key = if earth.downloads_on() {
+                "horizon.cubic.earth.land_cover.on"
+            } else {
+                "horizon.cubic.earth.land_cover.needs_downloads"
+            };
+            for line in wrap(&sentence(key, std::slice::from_ref(host)), LINE) {
+                b.note(line);
+            }
+        }
+        Some(_) => {}
+    }
+    b.row(vec![disabled(
+        toggle("horizon.cubic.earth.land_cover", earth.land_on(), |s, _| {
+            s.earth.toggle_land_cover();
+        }),
+        host.is_none(),
+    )]);
+}
+
 /// The credits view: the data source and the attribution it requires.
 fn credits_page(b: &mut Builder) {
     b.row(vec![button(tr("horizon.cubic.earth.credits.back"), |s| {
@@ -502,6 +571,17 @@ fn credits_page(b: &mut Builder) {
             b.note(format!("{}{line}", if i == 0 { "* " } else { "  " }));
         }
     }
+    b.heading(tr("horizon.cubic.earth.credits.land_source"));
+    for line in wrap(&tr("horizon.cubic.earth.credits.land_about"), LINE) {
+        b.note(line);
+    }
+    b.heading(tr("horizon.cubic.earth.credits.land_required"));
+    for line in wrap(LAND_ATTRIBUTION.trim(), LINE) {
+        b.note(line);
+    }
+    for line in wrap(&tr("horizon.cubic.earth.credits.land_licence"), LINE) {
+        b.note(line);
+    }
     b.space(4.0);
     for line in wrap(&tr("horizon.cubic.earth.credits.idea"), LINE) {
         b.note(line);
@@ -514,11 +594,25 @@ pub(super) fn attribution() -> &'static str {
 }
 
 #[cfg(test)]
+pub(super) fn land_attribution() -> &'static str {
+    LAND_ATTRIBUTION
+}
+
+#[cfg(test)]
 impl Draft {
     /// A page over `approved` and an offered address, for tests.
     pub(super) fn with(default_url: Option<&str>, approved: Approved) -> Self {
+        Self::with_land(default_url, None, approved)
+    }
+    /// [`Draft::with`] for a game that offers land cover at `land_address`.
+    pub(super) fn with_land(
+        default_url: Option<&str>,
+        land_address: Option<&str>,
+        approved: Approved,
+    ) -> Self {
         Self::start(Context {
             default_url: default_url.map(str::to_owned),
+            land_address: land_address.map(str::to_owned),
             approved,
         })
     }
