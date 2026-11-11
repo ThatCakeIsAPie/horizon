@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Real-world terrain: terrarium elevation tiles, a disk and memory tile store, and a Mercator-to-block elevation field. No network, no game types"
 
 [dependencies]
+log = "0.4"
 png = "0.18"
 
 [features]

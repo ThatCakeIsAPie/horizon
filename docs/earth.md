@@ -109,6 +109,14 @@ The publisher's page also gives the per-source details (licenses, credit lines) 
 - **The projection is local.** Blocks map to the globe by a projection tangent at the origin, so far from it
   (hundreds of kilometres at a large scale) distances and directions drift from the real ones.
 - Seas are not charted in detail: ETOPO1 is coarse.
+- **Data cleaning.** The source stitches 1°×1° cells, and along those lines (28°N, for one) whole rows or columns
+  of pixels are thousands of metres off, which showed up as a straight trench. When a tile is decoded, a pixel
+  (or a run of up to two) that differs from its neighbours on both sides along a row or column by more than 32
+  pixel-widths of ground, while the neighbours agree with each other, is replaced by interpolating between them.
+  At a tile's edge, where one side is in another tile, the two inner pixels are extrapolated and the limit is
+  three times higher. The limits scale with the zoom, so real peaks and canyons at coarse zooms stay. Cliffs,
+  coasts and anything wider than two pixels are never touched, so a rare defect can slip through. Far-view
+  caches are keyed by the rule's version (`CLEAN_RULES`).
 
 ## The design in brief
 

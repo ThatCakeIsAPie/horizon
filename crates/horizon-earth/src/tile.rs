@@ -150,11 +150,14 @@ pub struct Tile {
     max: f32,
     cell_min: [f32; GRID * GRID],
     cell_max: [f32; GRID * GRID],
+    repaired: usize,
 }
 
 impl Tile {
-    /// Decodes the bytes of a terrarium PNG (8-bit RGB or RGBA, 256×256); anything else is an error.
-    pub fn decode(png_bytes: &[u8]) -> Result<Self, TileError> {
+    /// Decodes the bytes of a terrarium PNG (8-bit RGB or RGBA, 256×256) taken at zoom `zoom`; anything else is
+    /// an error. Implausible pixels are repaired first ([`crate::clean`]), so the extremes, the coarse grid and
+    /// every reader see cleaned data; the zoom scales what counts as implausible.
+    pub fn decode(png_bytes: &[u8], zoom: u8) -> Result<Self, TileError> {
         let mut reader = png::Decoder::new(Cursor::new(png_bytes)).read_info()?;
         let info = reader.info();
         let (width, height) = (info.width, info.height);
@@ -174,11 +177,19 @@ impl Tile {
                 .ok_or(TileError::WrongSize { width, height })?
         ];
         let frame = reader.next_frame(&mut data)?;
-        let heights = data[..frame.buffer_size()]
+        let mut heights: Vec<f32> = data[..frame.buffer_size()]
             .chunks_exact(channels)
             .map(|p| decode_elevation(p[0], p[1], p[2]))
             .collect();
-        Ok(Self::from_heights(heights))
+        let repaired = crate::clean::clean_tile(&mut heights, zoom);
+        let mut tile = Self::from_heights(heights);
+        tile.repaired = repaired;
+        Ok(tile)
+    }
+
+    /// How many pixels the decoder repaired as implausible.
+    pub fn repaired(&self) -> usize {
+        self.repaired
     }
 
     fn from_heights(heights: Vec<f32>) -> Self {
@@ -199,6 +210,7 @@ impl Tile {
             max,
             cell_min,
             cell_max,
+            repaired: 0,
         }
     }
 
@@ -267,13 +279,10 @@ mod tests {
                 rgb.extend(encode_height(f(x, y)));
             }
         }
-        Tile::decode(&encode_png(
-            256,
-            256,
-            png::ColorType::Rgb,
-            png::BitDepth::Eight,
-            &rgb,
-        ))
+        Tile::decode(
+            &encode_png(256, 256, png::ColorType::Rgb, png::BitDepth::Eight, &rgb),
+            0,
+        )
         .unwrap()
     }
 
@@ -359,13 +368,10 @@ mod tests {
             let [r, g, b] = encode_height(i as f64 / 7.0 - 100.0);
             rgba.extend([r, g, b, 255]);
         }
-        let tile = Tile::decode(&encode_png(
-            256,
-            256,
-            png::ColorType::Rgba,
-            png::BitDepth::Eight,
-            &rgba,
-        ))
+        let tile = Tile::decode(
+            &encode_png(256, 256, png::ColorType::Rgba, png::BitDepth::Eight, &rgba),
+            0,
+        )
         .unwrap();
         let [r, g, b] = encode_height(5.0 / 7.0 - 100.0);
         let want = decode_elevation(r, g, b);
@@ -382,7 +388,7 @@ mod tests {
             &vec![0; 256 * 256],
         );
         assert!(matches!(
-            Tile::decode(&grey),
+            Tile::decode(&grey, 0),
             Err(TileError::WrongFormat { .. })
         ));
         let deep = encode_png(
@@ -393,7 +399,7 @@ mod tests {
             &vec![0; 256 * 256 * 6],
         );
         assert!(matches!(
-            Tile::decode(&deep),
+            Tile::decode(&deep, 0),
             Err(TileError::WrongFormat { .. })
         ));
         let small = encode_png(
@@ -403,7 +409,7 @@ mod tests {
             png::BitDepth::Eight,
             &vec![0; 64 * 64 * 3],
         );
-        let err = Tile::decode(&small).unwrap_err();
+        let err = Tile::decode(&small, 0).unwrap_err();
         assert!(matches!(
             err,
             TileError::WrongSize {
@@ -413,10 +419,10 @@ mod tests {
         ));
         assert!(err.to_string().contains("64×64"), "{err}");
         assert!(matches!(
-            Tile::decode(b"definitely not a png"),
+            Tile::decode(b"definitely not a png", 0),
             Err(TileError::Png(_))
         ));
-        assert!(matches!(Tile::decode(&[]), Err(TileError::Png(_))));
+        assert!(matches!(Tile::decode(&[], 0), Err(TileError::Png(_))));
     }
 
     #[test]

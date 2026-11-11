@@ -150,13 +150,15 @@ impl EarthSettings {
     }
 
     /// A text that changes with whatever decides what the terrain is made of: these settings and the version of
-    /// the surface rule ([`super::surface::RULES`]). Far-view caches are keyed by it, so nodes built under an
+    /// the surface rule ([`super::surface::RULES`]) and the elevation cleaning rule
+    /// ([`horizon_earth::clean::CLEAN_RULES`]). Far-view caches are keyed by it, so nodes built under an
     /// older rule are not shown.
     pub fn terrain_key(&self) -> String {
         format!(
-            "{}#surface{}",
+            "{}#surface{}#clean{}",
             self.to_json_compact(),
-            super::surface::RULES
+            super::surface::RULES,
+            horizon_earth::clean::CLEAN_RULES
         )
     }
 }
@@ -164,6 +166,15 @@ impl EarthSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_terrain_key_carries_the_elevation_cleaning_version() {
+        let key = EarthSettings::at(46.0, 7.5).terrain_key();
+        assert!(
+            key.ends_with(&format!("#clean{}", horizon_earth::clean::CLEAN_RULES)),
+            "{key}"
+        );
+    }
 
     #[test]
     fn a_file_with_only_an_origin_gets_every_default() {

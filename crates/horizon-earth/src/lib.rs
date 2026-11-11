@@ -7,6 +7,7 @@
 //! Missing data is never invented: every query that needs a tile the store does not hold says so with `None`.
 #![forbid(unsafe_code)]
 
+pub mod clean;
 pub mod height;
 pub mod projection;
 pub mod source;

@@ -779,4 +779,41 @@ mod tests {
         assert!(seam.field.range(-4, -4, 4, 4, 8).is_some());
         assert_eq!(seam.fetcher.fetch_count(), 4);
     }
+
+    #[test]
+    fn a_bad_pixel_row_in_a_tile_leaves_no_trace_in_reads_or_ranges() {
+        use crate::projection::pixel_to_latlon;
+        // One pixel row of zoom-15 tile (24295, 13727) reads 4,475 m too low; the terrain is a smooth slope.
+        let pit = pixel_to_latlon(24295.0 * 256.0 + 100.5, 13727.0 * 256.0 + 105.5, 15);
+        let (pit_lat, lat0) = (pit.lat, pit.lat);
+        let height = move |lat: f64, _lon: f64| {
+            let smooth = 7280.0 + (lat - lat0) * 10_000.0;
+            if (lat - pit_lat).abs() < 1e-9 {
+                smooth - 4475.0
+            } else {
+                smooth
+            }
+        };
+        let dir = TempDir::new();
+        let fetcher = Arc::new(MemoryFetcher::new(height));
+        let store = Arc::new(TileStore::new(dir.path(), fetcher, 64));
+        let field = ElevationField::new(
+            store,
+            Projection::local(pit.lat, pit.lon, 1.0).unwrap(),
+            VerticalMap::new(63, 1.0),
+        );
+        // At the pit, a few metres either side, and in a rectangle over it (the rows are about 4 m apart).
+        for dz in [-8.0, -4.0, -2.0, 0.0, 2.0, 4.0, 8.0] {
+            let h = field.height_m_blocking(0.0, dz, 15).unwrap().unwrap();
+            assert!((7200.0..7360.0).contains(&h), "{h} m at dz {dz}");
+        }
+        let (lo, hi) = field.range_blocking(-60, -60, 60, 60, 15).unwrap().unwrap();
+        assert!(lo > 7000.0 && hi < 7500.0, "range {lo}..{hi}");
+        let tile = field
+            .store()
+            .load(TileId::new(15, 24295, 13727).unwrap())
+            .unwrap();
+        assert_eq!(tile.repaired(), 256);
+        assert!(tile.min() > 7000.0, "tile min {}", tile.min());
+    }
 }

@@ -68,6 +68,21 @@ struct Memory {
     clock: u64,
 }
 
+/// Decodes a tile's PNG at its zoom, logging once when pixels were repaired.
+fn decode_tile(id: TileId, bytes: &[u8]) -> Result<Tile, TileError> {
+    let tile = Tile::decode(bytes, id.z)?;
+    if tile.repaired() > 0 {
+        log::debug!(
+            "earth tile {}/{}/{}: repaired {} implausible pixels",
+            id.z,
+            id.x,
+            id.y,
+            tile.repaired()
+        );
+    }
+    Ok(tile)
+}
+
 /// A disk cache of tile PNGs laid out `{z}/{x}/{y}.png`, with a bounded memory cache of decoded tiles in front.
 ///
 /// Safe to share between threads. Two threads that ask for the same missing tile make one fetch.
@@ -123,7 +138,7 @@ impl TileStore {
             return Some(tile);
         }
         let bytes = fs::read(self.path_of(id)).ok()?;
-        let tile = Arc::new(Tile::decode(&bytes).ok()?);
+        let tile = Arc::new(decode_tile(id, &bytes).ok()?);
         self.remember(id, &tile);
         Some(tile)
     }
@@ -156,7 +171,7 @@ impl TileStore {
 
     fn fetch_and_store(&self, id: TileId) -> Result<Arc<Tile>, LoadError> {
         let bytes = self.fetcher.fetch(id).map_err(LoadError::Fetch)?;
-        let tile = Arc::new(Tile::decode(&bytes).map_err(LoadError::Decode)?);
+        let tile = Arc::new(decode_tile(id, &bytes).map_err(LoadError::Decode)?);
         let _ = write_atomically(&self.path_of(id), &bytes);
         self.remember(id, &tile);
         Ok(tile)
