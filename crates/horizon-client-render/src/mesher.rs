@@ -406,6 +406,8 @@ pub struct SectionMesh {
     /// A far mesh was clipped around finer tiles or resident chunks. Keep
     /// the previous GPU mesh while its replacements fade in.
     pub keep: bool,
+    /// A far mesh was clipped around finer tiles (`keep` without the chunks).
+    pub finer: bool,
 }
 impl Default for SectionMesh {
     fn default() -> Self {
@@ -424,6 +426,7 @@ impl Default for SectionMesh {
             sprite_layers: Vec::new(),
             bounds: None,
             keep: false,
+            finer: false,
         }
     }
 }
@@ -462,6 +465,7 @@ impl SectionMesh {
         self.visibility = ALL_VISIBLE;
         self.bounds = None;
         self.keep = false;
+        self.finer = false;
     }
     pub(crate) fn capacity_bytes(&self) -> usize {
         self.solid.capacity() * std::mem::size_of::<TerrainVertex>()

@@ -556,6 +556,10 @@ impl Game<'_> {
                             p.z,
                         ) && shape.has_section(p.y)
                             && world.chunks.get(&(p.x, p.z)).is_some_and(|c| c.lit)
+                            // The octree leaves a cube out once it is on screen: its far node
+                            // stands over it until then, and dithers out in front of it
+                            // (`Renderer::open_cube_window`).
+                            && renderer.cube_shown([p.x, p.y, p.z])
                             && !placeholders.is_some_and(|set| {
                                 set.get(&(p.x, p.z)).is_some_and(|mask| {
                                     usize::try_from(p.y - shape.min_section())

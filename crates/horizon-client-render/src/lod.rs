@@ -1449,6 +1449,7 @@ impl Lod {
                                 crate::lod::packed::lay_out(&mut mesh);
                                 let [ox, _, oz] = job.key.origin();
                                 let size = job.key.size();
+                                mesh.finer = keep_finer;
                                 mesh.keep = keep_finer
                                     || job.covered.iter().any(|&(cx, cz)| {
                                         let x = cx * 16;

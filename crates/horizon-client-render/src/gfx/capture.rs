@@ -89,6 +89,7 @@ fn copy(mesh: &SectionMesh) -> SectionMesh {
         sprite_layers: mesh.sprite_layers.clone(),
         bounds: mesh.bounds,
         keep: mesh.keep,
+        finer: mesh.finer,
     }
 }
 
