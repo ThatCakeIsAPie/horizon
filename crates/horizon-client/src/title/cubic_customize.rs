@@ -3989,7 +3989,7 @@ mod tests {
         let mut s = earth_with_land(crate::earth_consent::Approved::of(&[]));
         press_button(&mut s, "horizon.cubic.earth.credits.open");
         let text = earth_lines(&s).join(" ");
-        let wording = earth::land_attribution().trim().split_whitespace().collect::<Vec<_>>().join(" ");
+        let wording = earth::land_attribution().split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(text.contains(&wording), "{text}");
         assert!(wording.contains("ESA WorldCover project 2021"));
     }
