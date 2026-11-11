@@ -353,6 +353,7 @@ mod sampler {
             store: Arc::new(TileStore::new(&tiles_dir, fetcher.clone(), 64)),
             downloads: true,
             dir: tiles_dir,
+            land: None,
         };
         let generation = CubicGeneration {
             kind: crate::cubic_gen::CubicKind::Earth,

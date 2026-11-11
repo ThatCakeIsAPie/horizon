@@ -13,9 +13,15 @@
 //! * Tiles the far view found missing (`EarthGenerator::request_tiles`: its workers answer "later" and ask, and
 //!   never wait) are fetched first, ahead of the plan.
 //!
+//! * Land cover (`EarthGenerator::land_source`), when the world has it, is fetched on the same thread by the
+//!   same rules: the byte ranges the far view found missing (`EarthGenerator::take_land_requests`; its nodes
+//!   answered "later" and are asked again by the far view's own retry once the bytes are in), and the rounds of
+//!   `land_needs` (the index of each file, then its tiles) for the base-zoom area around the players. Each
+//!   piece goes to `LandCoverSource::satisfy`; a stale request is skipped (`LandCoverStore::is_missing`).
+//!
 //! A tile that fails is left alone for a while (doubling up to five minutes) so a dead server is not hammered;
 //! the generator's own blocking reads keep retrying what they need.
-use horizon_earth::{FetchError, LoadError, TileId};
+use horizon_earth::{Fetch, FetchError, LoadError, TileId};
 use horizon_world::cubic::custom::CustomCubicGenerator;
 use horizon_world::cubic::earth::EarthGenerator;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -105,6 +111,36 @@ pub fn plan(generator: &EarthGenerator, target: &Target) -> Vec<TileId> {
     tiles
 }
 
+/// Rounds of `land_needs` one pass asks for (an index first, then its tiles, and a second file's); each piece that
+/// arrives gives a round back, so a pass goes on while it makes progress and ends when a round finds nothing.
+const LAND_ROUNDS: u32 = 6;
+
+/// The land cover pieces still missing for the base-zoom area around each player, nearest first.
+pub fn land_plan(generator: &EarthGenerator, target: &Target) -> Vec<Fetch> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let near = (target.near_chunks.max(0) + MARGIN_CHUNKS).saturating_mul(16);
+    let radius = if target.far_chunks > 0 { near.max(MIN_RADIUS) } else { near };
+    for &(cx, cz) in &target.centres {
+        let (x, z) = (
+            cx.saturating_mul(16).saturating_add(8),
+            cz.saturating_mul(16).saturating_add(8),
+        );
+        for fetch in generator.land_needs(
+            x.saturating_sub(radius),
+            z.saturating_sub(radius),
+            x.saturating_add(radius),
+            z.saturating_add(radius),
+            1,
+        ) {
+            if seen.insert(fetch) {
+                out.push(fetch);
+            }
+        }
+    }
+    out
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -191,6 +227,8 @@ struct Failure {
 fn run(shared: &Shared, generator: &Weak<CustomCubicGenerator>, gap: Duration) {
     let mut failures: HashMap<TileId, Failure> = HashMap::new();
     let mut failing = false;
+    let mut land_failures: HashMap<Fetch, Failure> = HashMap::new();
+    let mut land_failing = false;
     loop {
         // Wait for a target (or for the idle time to pass, to retry what failed).
         let (target, epoch) = {
@@ -224,7 +262,83 @@ fn run(shared: &Shared, generator: &Weak<CustomCubicGenerator>, gap: Duration) {
             .filter(|id| due(id))
             .collect();
         let mut interrupted = false;
+        let mut land_todo: VecDeque<Fetch> = VecDeque::new();
+        let mut land_rounds = 0;
         loop {
+            // Land cover: what the far view asked for goes first, then the next round of what the area needs.
+            if let Some(land) = earth.land_source() {
+                let now = Instant::now();
+                let due = |f: &Fetch, failures: &HashMap<Fetch, Failure>| {
+                    failures.get(f).is_none_or(|x| x.retry_at <= now)
+                };
+                for fetch in earth.take_land_requests().into_iter().rev() {
+                    if due(&fetch, &land_failures)
+                        && land.field().store().is_missing(&fetch)
+                        && !land_todo.contains(&fetch)
+                    {
+                        land_todo.push_front(fetch);
+                    }
+                }
+                if land_todo.is_empty() && todo.is_empty() && land_rounds < LAND_ROUNDS {
+                    land_rounds += 1;
+                    land_todo.extend(
+                        land_plan(earth, &target)
+                            .into_iter()
+                            .filter(|f| due(f, &land_failures)),
+                    );
+                }
+                if let Some(fetch) = land_todo.pop_front() {
+                    if shared.stop.load(Ordering::SeqCst)
+                        || earth.is_cancelled()
+                        || lock(&shared.wanted).epoch != epoch
+                    {
+                        interrupted = true;
+                        break;
+                    }
+                    if !land.field().store().is_missing(&fetch) {
+                        continue;
+                    }
+                    match land.satisfy(&fetch) {
+                        Ok(()) => {
+                            land_failures.remove(&fetch);
+                            if std::mem::take(&mut land_failing) {
+                                log::info!("Horizon: Earth land cover fetching works again");
+                            }
+                            // A piece came: the next round (an index leads to its tiles) is worth asking for.
+                            land_rounds = land_rounds.saturating_sub(1);
+                        }
+                        // Marked as no data for the run by the source: nothing to retry.
+                        Err(FetchError::Refused(why)) => {
+                            log::warn!("Horizon: Earth land cover is not downloaded: {why}");
+                        }
+                        Err(e) => {
+                            if !land_failing {
+                                land_failing = true;
+                                log::warn!(
+                                    "Horizon: Earth land cover {} bytes {}+{} did not download: {e}",
+                                    fetch.file,
+                                    fetch.range.offset,
+                                    fetch.range.len
+                                );
+                            }
+                            let wait = land_failures
+                                .get(&fetch)
+                                .map_or(RETRY_FIRST, |f| (f.wait * 2).min(RETRY_CAP));
+                            land_failures.insert(
+                                fetch,
+                                Failure {
+                                    retry_at: Instant::now() + wait,
+                                    wait,
+                                },
+                            );
+                        }
+                    }
+                    if !sleep(shared, gap) {
+                        return;
+                    }
+                    continue;
+                }
+            }
             // What the far view asked for since goes first.
             let now = Instant::now();
             for id in earth.take_requests().into_iter().rev() {

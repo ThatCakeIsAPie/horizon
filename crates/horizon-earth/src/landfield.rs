@@ -237,6 +237,31 @@ impl LandCoverStore {
         }
     }
 
+    /// Whether `fetch` is still something the store lacks: a stale request (the bytes arrived meanwhile, the file
+    /// turned out absent, a later piece of the index is the next one wanted) is not, so whoever fetches in the
+    /// background skips it instead of asking the source twice.
+    pub fn is_missing(&self, fetch: &Fetch) -> bool {
+        if self.is_absent(fetch.file) {
+            return false;
+        }
+        let Err(next) = self.index_of(fetch.file) else {
+            // The index is whole: only a tile can still be missing.
+            let Wanted::Tile { level, tile } = fetch.wanted else {
+                return false;
+            };
+            let Ok(index) = self.index_of(fetch.file) else {
+                return false;
+            };
+            let Some(l) = index.levels.get(usize::from(level)) else {
+                return false;
+            };
+            return self
+                .tile_of_local(fetch.file, usize::from(level), l, tile as usize)
+                .is_err();
+        };
+        fetch.wanted == Wanted::Index && next.range == fetch.range
+    }
+
     /// Whether `file` is known to be absent at the source, from memory or from the marker on disk.
     fn is_absent(&self, file: WorldCoverFile) -> bool {
         self.load_pieces_from_disk(file);

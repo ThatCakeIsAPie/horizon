@@ -289,3 +289,76 @@ fn preloading_stops_at_once_when_cancelled_with_a_server_that_always_fails() {
     let (elapsed, _) = worker.join().unwrap();
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
 }
+
+/// A far node that answered "later" because a land class was not held is built once the prefetcher has fetched
+/// the pieces the node's read recorded (the far view asks again by its own retry; here the test asks).
+#[test]
+fn a_far_node_that_waited_for_its_class_is_built_once_the_prefetcher_has_the_data() {
+    use horizon_earth::testing::MemoryLandCover;
+    use horizon_earth::{LandCoverStore, WorldCoverFile};
+
+    let dir = TempDir::new();
+    let land_dir = TempDir::new();
+    let fetcher = Arc::new(MemoryFetcher::new(terrain));
+    let store = Arc::new(TileStore::new(dir.path(), fetcher, 256));
+    let mut settings = EarthSettings::at(LAT, LON);
+    settings.metres_per_block = METRES_PER_BLOCK;
+    settings.land_cover = true;
+    let file = WorldCoverFile::containing(LAT, LON).unwrap();
+    let land = Arc::new(MemoryLandCover::new().with_classes(file, 192, 96, 2, |_, _| 30));
+    let source = settings
+        .land_cover_source(Arc::new(LandCoverStore::new(land_dir.path(), 16)), land.clone())
+        .unwrap();
+    let generator = Arc::new(
+        CustomCubicGenerator::earth_with_land_cover(
+            &settings,
+            store.clone(),
+            Some(source.clone()),
+            default_registry(),
+        )
+        .unwrap(),
+    );
+    let earth = generator.earth_generator().unwrap();
+    // Elevation held, land cover not: the node is later and says so by recording what it lacks.
+    let level = 3;
+    let waits = loop {
+        match earth.node_columns(level, 0, 0) {
+            Err(e) if !e.tiles.is_empty() => {
+                for t in e.tiles {
+                    store.load(t).unwrap();
+                }
+            }
+            Err(e) => break e,
+            Ok(_) => panic!("built without its class"),
+        }
+    };
+    assert!(waits.tiles.is_empty());
+    assert_eq!(land.fetch_count(), 0, "a read only records what it lacks");
+    // The prefetcher takes the record and fetches it (the elevation rig's thread, now with land cover).
+    let prefetcher = Prefetcher::start(&generator, Duration::from_millis(1)).unwrap();
+    prefetcher.follow(around(1, 0));
+    let mut built = false;
+    for _ in 0..500 {
+        match earth.node_columns(level, 0, 0) {
+            Ok(_) => {
+                built = true;
+                break;
+            }
+            Err(e) => {
+                for t in e.tiles {
+                    store.load(t).unwrap();
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(built, "the node was never built");
+    assert!(land.fetch_count() >= 2, "an index and a tile at least");
+    // The pass ends once the area around the player is held (it may fetch a piece or two more for it): the
+    // retries that follow do not ask for the same pieces again and again.
+    std::thread::sleep(Duration::from_millis(400));
+    let count = land.fetch_count();
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(land.fetch_count(), count);
+    prefetcher.stop();
+}

@@ -463,15 +463,22 @@ pub struct EarthTiles {
     pub downloads: bool,
     /// Where this world's tiles are cached.
     pub dir: PathBuf,
+    /// The land cover the generator reads: only for a world that uses it, allows downloads and whose land cover
+    /// host the player approved (`earth_landnet`); `None` makes the world run as if `landCover` were false.
+    pub land: Option<Arc<horizon_earth::LandCoverSource>>,
 }
 
 /// The tile store of a world with `settings`, caching under `root` (see [`cache_root`]), downloading from
 /// the hosts this player approved. Says in the log whether tiles are downloaded.
 pub fn open(settings: &EarthSettings, root: &Path) -> EarthTiles {
-    open_with(settings, root, &Approved::for_player())
+    let mut tiles = open_with(settings, root, &Approved::for_player());
+    if settings.land_cover {
+        tiles.land = crate::earth_landnet::open(settings, &crate::earth_landnet::cache_root()).source;
+    }
+    tiles
 }
 
-/// [`open`] for the hosts `approved`.
+/// [`open`] for the hosts `approved`, without land cover (`earth_landnet::open` makes that).
 pub fn open_with(settings: &EarthSettings, root: &Path, approved: &Approved) -> EarthTiles {
     let fetcher = HttpTileFetcher::new(settings, approved);
     if let Some(host) = crate::earth_consent::pending_host_of(settings, approved) {
@@ -493,6 +500,7 @@ pub fn open_with(settings: &EarthSettings, root: &Path, approved: &Approved) -> 
         store: Arc::new(TileStore::new(&dir, Arc::new(fetcher), MEMORY_TILES)),
         downloads,
         dir,
+        land: None,
     }
 }
 

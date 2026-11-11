@@ -558,7 +558,7 @@ impl CubicLevel {
             queued: (Mutex::new(0usize), Condvar::new()),
         });
         let earth_follow = match &wg.earth {
-            Some(earth) if earth.tiles.downloads => {
+            Some(earth) if earth.tiles.downloads || earth.tiles.land.is_some() => {
                 crate::earth_prefetch::Prefetcher::start(&wg.generator, crate::earth_prefetch::GAP)
             }
             _ => None,
@@ -2599,6 +2599,7 @@ mod tests {
                 store: Arc::new(horizon_earth::TileStore::new(&dir, fetcher, 64)),
                 downloads: true,
                 dir,
+                land: None,
             };
             let generation = CubicGeneration {
                 kind: CubicKind::Earth,
