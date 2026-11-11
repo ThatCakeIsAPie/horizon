@@ -412,6 +412,13 @@ pub(super) fn fade_time() -> Duration {
     })
 }
 
+/// Whether the environment variable `HORIZON_REVEAL_OFF` is set: near cubes then come in and
+/// leave over far cube nodes without shells, as before (for measuring what the shells cost).
+fn reveal_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("HORIZON_REVEAL_OFF").is_some())
+}
+
 /// A tile fading in: 0 drawn whole, else 1 + `level` * 129 +
 /// `shown`, `shown` 1 to 63 sixty-fourths of `FADE` (`fade_out_code`: 65 to
 /// 128, fading out). Chunk by chunk (columns of its own grid, wider for
@@ -1328,7 +1335,7 @@ impl Renderer {
         out: bool,
     ) -> Option<Instant> {
         let cover = self.cube_cover(key, now);
-        let shell = cover == Some(true);
+        let shell = cover == Some(true) && !reveal_off();
         self.fade_stats.cubes[usize::from(!out) * 3 + cover.map_or(1, |whole| usize::from(!whole) * 2)] += 1;
         if !shell {
             return None;

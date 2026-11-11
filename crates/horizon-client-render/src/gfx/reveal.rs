@@ -113,14 +113,19 @@ impl Reveal {
             self.evicted += 1;
         }
         self.opened[usize::from(out)] += 1;
-        self.windows.push(Window { lo, hi, since: now, out });
+        self.windows.push(Window {
+            lo,
+            hi,
+            since: now,
+            out,
+        });
         now
     }
     /// Whether a window of this kind, grown by `margin` blocks, meets the box.
     pub fn touches(&self, lo: DVec3, hi: DVec3, out: bool, margin: f64) -> bool {
-        self.windows.iter().any(|w| {
-            w.out == out && lo.cmple(w.hi + margin).all() && hi.cmpge(w.lo - margin).all()
-        })
+        self.windows
+            .iter()
+            .any(|w| w.out == out && lo.cmple(w.hi + margin).all() && hi.cmpge(w.lo - margin).all())
     }
     /// The windows of both kinds that meet the box: `[out, in]`.
     pub fn touching(&self, lo: DVec3, hi: DVec3, margin: f64) -> [bool; 2] {
@@ -169,7 +174,10 @@ mod tests {
         assert_eq!(reveal.open(lo, hi, t0, true), t0);
         // Next to it, 50 ms later: joined, on the first one's clock.
         let (lo, hi) = cube(16.0);
-        assert_eq!(reveal.open(lo, hi, t0 + Duration::from_millis(50), true), t0);
+        assert_eq!(
+            reveal.open(lo, hi, t0 + Duration::from_millis(50), true),
+            t0
+        );
         assert_eq!(reveal.len(), 1);
         assert_eq!(reveal.windows()[0].hi.x, 32.0);
         // A cube a second later has a window of its own and starts at its own time: the
@@ -197,7 +205,11 @@ mod tests {
         reveal.open(lo, hi, t0, true);
         let (lo, hi) = cube(500.0);
         reveal.open(lo, hi, t0 + Duration::from_millis(300), false);
-        let table = reveal.table(DVec3::new(8.0, 8.0, 8.0), t0 + Duration::from_millis(300), fade);
+        let table = reveal.table(
+            DVec3::new(8.0, 8.0, 8.0),
+            t0 + Duration::from_millis(300),
+            fade,
+        );
         assert_eq!(table.count[0], 2);
         assert_eq!(table.boxes[0], [-8.0, -8.0, -8.0, 0.5]);
         assert_eq!(table.boxes[1], [8.0, 8.0, 8.0, 1.0]);
@@ -205,8 +217,18 @@ mod tests {
         assert_eq!(table.boxes[3][3], 0.0, "the one leaving");
         reveal.expire(t0 + Duration::from_millis(700), fade);
         assert_eq!(reveal.len(), 1, "the first ended");
-        assert!(reveal.touches(DVec3::new(500.0, 0.0, 0.0), DVec3::new(510.0, 8.0, 8.0), false, 0.0));
-        assert!(!reveal.touches(DVec3::new(500.0, 0.0, 0.0), DVec3::new(510.0, 8.0, 8.0), true, 0.0));
+        assert!(reveal.touches(
+            DVec3::new(500.0, 0.0, 0.0),
+            DVec3::new(510.0, 8.0, 8.0),
+            false,
+            0.0
+        ));
+        assert!(!reveal.touches(
+            DVec3::new(500.0, 0.0, 0.0),
+            DVec3::new(510.0, 8.0, 8.0),
+            true,
+            0.0
+        ));
     }
 
     #[test]
@@ -219,6 +241,11 @@ mod tests {
         }
         assert_eq!(reveal.len(), MAX_WINDOWS);
         assert_eq!(reveal.evicted, 3);
-        assert!(reveal.windows().iter().all(|w| w.since >= t0 + Duration::from_millis(600)));
+        assert!(
+            reveal
+                .windows()
+                .iter()
+                .all(|w| w.since >= t0 + Duration::from_millis(600))
+        );
     }
 }
