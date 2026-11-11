@@ -87,7 +87,7 @@ impl ElevationField {
 
     /// [`ElevationField::height_m`] that fetches the tiles it lacks, blocking.
     pub fn height_m_blocking(&self, x: f64, z: f64, zoom: u8) -> Result<Option<f32>, LoadError> {
-        self.sample(x, z, zoom, &mut |id| self.store.load(id).map(Some))
+        self.sample(x, z, zoom, &mut |id| self.store.load_or_sea(id).map(Some))
     }
 
     /// The block height of the surface at block `(x, z)`: the elevation at the block's centre, mapped by the
@@ -132,7 +132,7 @@ impl ElevationField {
         zoom: u8,
     ) -> Result<Option<Vec<f32>>, LoadError> {
         self.grid_with(x0, z0, width, depth, 1.0, zoom, &mut |id| {
-            self.store.load(id).map(Some)
+            self.store.load_or_sea(id).map(Some)
         })
     }
 
@@ -210,7 +210,7 @@ impl ElevationField {
         zoom: u8,
     ) -> Result<Option<(f32, f32)>, LoadError> {
         self.range_with(x0, z0, x1, z1, zoom, &mut |id| {
-            self.store.load(id).map(Some)
+            self.store.load_or_sea(id).map(Some)
         })
     }
 

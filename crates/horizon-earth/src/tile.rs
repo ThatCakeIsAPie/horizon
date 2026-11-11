@@ -187,6 +187,11 @@ impl Tile {
         Ok(tile)
     }
 
+    /// A tile of one height everywhere, in metres.
+    pub fn flat(height_m: f32) -> Self {
+        Self::from_heights(vec![height_m; (TILE_SIZE * TILE_SIZE) as usize])
+    }
+
     /// How many pixels the decoder repaired as implausible.
     pub fn repaired(&self) -> usize {
         self.repaired

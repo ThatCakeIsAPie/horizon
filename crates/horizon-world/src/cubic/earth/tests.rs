@@ -597,6 +597,72 @@ fn a_tile_missing_for_a_cube_far_from_the_loaded_ones_does_not_poison_it() {
     assert!(err.tiles.contains(&want), "{err} lacks {want:?}");
 }
 
+/// Runs `f` while a watchdog sets the cancel flag after ten seconds, so a generator that waits for ever fails
+/// the test (its answer is then air and the flag is set) instead of hanging it.
+fn within_ten_seconds<T>(g: &EarthGenerator, f: impl FnOnce() -> T) -> T {
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let end = Instant::now() + Duration::from_secs(10);
+            while !done.load(Ordering::SeqCst) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !done.load(Ordering::SeqCst) {
+                g.set_cancelled(true);
+            }
+        });
+        let out = f();
+        done.store(true, Ordering::SeqCst);
+        out
+    })
+}
+
+#[test]
+fn a_tile_that_is_refused_does_not_keep_the_generator_waiting() {
+    let rig = rig();
+    let g = &rig.generator;
+    // Downloads are not approved: no retry can bring a tile, so the blocking forms must not wait for one.
+    rig.fetcher.fail_with(Some(FetchError::Refused(
+        "you have not approved downloads from the tile server".into(),
+    )));
+    let mut out = Box::new([0; 4096]);
+    // Cube (0, -1, 0) is the 16 blocks under the sea level (0), over a sea floor 30 m down.
+    let uniform = within_ten_seconds(g, || g.generate_blocking(cube(0, -1, 0), &mut out));
+    assert!(!g.is_cancelled(), "the generator waited for a tile that cannot come");
+    assert_eq!(uniform, Some(rig.blocks.water));
+    assert_eq!(
+        within_ten_seconds(g, || g.surface_y_blocking(3, 3)),
+        Some(rig.settings.sea_level_y - 30)
+    );
+    assert!(!g.is_cancelled());
+    // The stand-in is for the session only: the disk cache holds nothing, and the plain forms still say the
+    // tile is missing, so the far view builds nothing from it.
+    let origin = g.missing_tiles_for_cube(cube(0, 0, 0))[0];
+    assert!(!rig.store.is_local(origin));
+    assert!(g.generate(cube(0, -1, 0), &mut out).is_err());
+    // Asked once per tile, not once per read.
+    assert!(rig.fetcher.fetches_of(origin) <= 1);
+}
+
+#[test]
+fn a_temporary_failure_is_still_waited_out() {
+    let rig = rig();
+    let g = &rig.generator;
+    rig.fetcher
+        .fail_with(Some(FetchError::Temporary("offline".into())));
+    let mut out = Box::new([0; 4096]);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            rig.fetcher.fail_with(None);
+        });
+        // The tile comes back after a while: the cube is the real terrain, not the sea floor.
+        let uniform = g.generate_blocking(cube(0, -1, 0), &mut out);
+        assert!(!g.is_cancelled());
+        assert_ne!(uniform, Some(rig.blocks.water));
+    });
+}
+
 #[test]
 fn a_failing_fetcher_with_the_cancel_flag_set_returns_promptly() {
     let rig = rig();

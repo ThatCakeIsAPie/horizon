@@ -285,7 +285,7 @@ impl HttpTileFetcher {
                         .ok_or_else(|| FetchError::Other("a redirect without a Location".into()))?;
                     url = resolve(&url, next)?;
                     allowed(&url).map_err(|why| {
-                        FetchError::Other(format!(
+                        FetchError::Refused(format!(
                             "the server redirected to an address not allowed: {why}"
                         ))
                     })?;
@@ -293,7 +293,7 @@ impl HttpTileFetcher {
                     if let Ok(host) = host_of(&url)
                         && !self.approved.contains(&host)
                     {
-                        return Err(FetchError::Other(format!(
+                        return Err(FetchError::Refused(format!(
                             "the server redirected to {host}, which is not approved"
                         )));
                     }
@@ -335,7 +335,7 @@ impl TileFetcher for HttpTileFetcher {
     fn fetch(&self, id: TileId) -> Result<Vec<u8>, FetchError> {
         match &self.source {
             Ok(template) => self.get(template, id),
-            Err(why) => Err(FetchError::Other(why.clone())),
+            Err(why) => Err(FetchError::Refused(why.clone())),
         }
     }
 }
@@ -345,6 +345,8 @@ impl TileFetcher for HttpTileFetcher {
 fn status_error(code: u16) -> FetchError {
     match code {
         404 | 410 => FetchError::NotFound,
+        // The server will not give this request a tile, now or on a retry.
+        401 | 403 | 451 => FetchError::Refused(format!("the server answered HTTP {code}")),
         408 | 425 | 429 | 500..=599 => {
             FetchError::Temporary(format!("the server answered HTTP {code}"))
         }
