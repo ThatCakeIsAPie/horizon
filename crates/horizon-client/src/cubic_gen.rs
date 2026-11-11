@@ -191,11 +191,15 @@ impl Generation {
                 ))
             });
             let generator = CustomCubicGenerator::earth(&settings, tiles.store.clone(), registry)?;
+            // One biome, unless the generator reads land cover (no downloader hands it one yet).
+            let columns = generator
+                .earth_biomes()
+                .unwrap_or_else(|| Arc::new(FixedBiome::new(horizon_world::cubic::earth::BIOME)));
             return Ok(Self {
                 kind: choice.kind,
                 generator: Arc::new(generator),
                 settings: None,
-                columns: Arc::new(FixedBiome::new(horizon_world::cubic::earth::BIOME)),
+                columns,
                 climate: None,
                 vegetation: None,
                 structures: None,

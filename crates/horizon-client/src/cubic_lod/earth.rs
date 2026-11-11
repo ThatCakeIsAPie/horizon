@@ -66,16 +66,13 @@ pub(super) fn class(earth: &EarthGenerator, key: CubeKey) -> Result<NodeClass, N
     Ok(class)
 }
 
-/// The columns of node `key` (16 by 16, the voxels' middles): level 0 and 1 at the base zoom (they are made of
-/// cubes), the others at the zoom of their step.
-fn columns(
-    earth: &EarthGenerator,
-    key: CubeKey,
-) -> Result<horizon_world::cubic::earth::far::NodeColumns, NotReady> {
+/// The surfaces of the 16 by 16 columns of node `key` (the voxels' middles): level 0 and 1 at the base zoom (they
+/// are made of cubes), the others at the zoom of their step. Only heights, so land cover is not waited for.
+fn surfaces(earth: &EarthGenerator, key: CubeKey) -> Result<Vec<i32>, NotReady> {
     let origin = key.origin();
     match key.level {
-        0 | 1 => earth.columns_at(origin[0], origin[2], 1 << key.level, 1),
-        level => earth.node_columns(u32::from(level), key.x, key.z),
+        0 | 1 => earth.surfaces_at(origin[0], origin[2], 1 << key.level, 1),
+        level => earth.surfaces_at(origin[0], origin[2], 1 << level, 1 << level),
     }
 }
 
@@ -89,13 +86,13 @@ pub(super) fn cover(
     if key.level > COVER_LEVEL {
         return Ok(None);
     }
-    let cols = columns(earth, key)?;
+    let surfaces = surfaces(earth, key)?;
     let step = 1i32 << key.level;
     let top = key.origin()[1].saturating_add(key.size());
     // The lowest look over the node is the voxel at `top + COVER_LOOKS[0]`; ground reaching it covers the rest.
     let look = EarthGenerator::voxel_floor(top.saturating_add(COVER_LOOKS[0]), step);
     let mut mask = Box::new([0u64; 4]);
-    for (i, &s) in cols.surfaces.iter().enumerate() {
+    for (i, &s) in surfaces.iter().enumerate() {
         if s >= look {
             mask[i >> 6] |= 1 << (i & 63);
         }
@@ -113,6 +110,17 @@ pub(super) fn node(
     kind: &dyn Fn(BlockStateId) -> Kind,
 ) -> Result<CubeNode, NotReady> {
     let origin = key.origin();
+    // With land cover the biomes read the map at a coarse level: have them before building, never wait for them.
+    match key.level {
+        0 => earth.biomes_ready(origin[0], origin[2], 1)?,
+        1 => {}
+        level => {
+            // The columns' middles, and the node's own corner for a node that is one voxel.
+            let step = 1i32 << level;
+            earth.biomes_ready(origin[0] + step / 2, origin[2] + step / 2, step)?;
+            earth.biomes_ready(origin[0], origin[2], step)?;
+        }
+    }
     let state = |id: u32| BlockStateId(if id == 0 { air } else { id });
     let uniform = |id: u32| {
         CubeNode::uniform(

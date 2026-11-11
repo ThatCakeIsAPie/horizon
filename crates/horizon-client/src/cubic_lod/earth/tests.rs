@@ -196,6 +196,116 @@ fn a_node_whose_tile_is_missing_is_not_ready_and_names_the_tile() {
     assert_eq!(rig.fetcher.fetch_count(), 0);
 }
 
+/// With land cover a node is "later" until the class of every column and the biomes it needs are held, never
+/// built from the elevation rule alone; the sampler waits for nothing, and what it lacks is recorded.
+#[test]
+fn with_land_cover_a_node_is_later_until_its_class_is_held_and_then_shows_the_class() {
+    use horizon_earth::testing::MemoryLandCover;
+    use horizon_earth::{LandCoverStore, WorldCoverFile};
+
+    let mut settings = EarthSettings::at(LAT0, LON0);
+    settings.land_cover = true;
+    let dir = TempDir::new();
+    let land_dir = TempDir::new();
+    let store = Arc::new(TileStore::new(
+        dir.path(),
+        Arc::new(MemoryFetcher::new(terrain)),
+        256,
+    ));
+    // Every file of the area says water: the ground above the sea is a lake.
+    let mut land = MemoryLandCover::new();
+    for (lat, lon) in [(45.5, 7.5), (44.5, 7.5), (45.5, 6.5), (44.5, 6.5)] {
+        let file = WorldCoverFile::containing(lat, lon).unwrap();
+        land = land.with_classes(file, 192, 96, 2, |_, _| 80);
+    }
+    let land = Arc::new(land);
+    let source = settings
+        .land_cover_source(
+            Arc::new(LandCoverStore::new(land_dir.path(), 16)),
+            land.clone(),
+        )
+        .unwrap();
+    let blocks = EarthBlocks::from_registry(default_registry()).unwrap();
+    let g = EarthGenerator::new(&settings, store.clone(), blocks)
+        .unwrap()
+        .with_land_cover(source.clone());
+    let biome = |_: i32, _: i32| 0u16;
+    let kind = kind_of(AIR);
+    // The slope east of the coast, a node that holds ground.
+    let (level, x) = (4u8, 20);
+    let step = 1i32 << level;
+    let side = 16 * step;
+    let s_mid = |g: &EarthGenerator| {
+        g.field()
+            .surface_y(x * side + side / 2, side / 2, g.zoom_for_step(step))
+            .unwrap()
+    };
+    for t in g.missing_tiles_for_node(u32::from(level), x, 0) {
+        store.load(t).unwrap();
+    }
+    let key = CubeKey::new(level, x, s_mid(&g).div_euclid(side), 0);
+    // The biomes read a coarse elevation zoom of their own: have those tiles too, so that only land cover lacks.
+    let err = loop {
+        match node(&g, key, AIR, &biome, &kind) {
+            Err(e) if !e.tiles.is_empty() => {
+                for t in e.tiles {
+                    store.load(t).unwrap();
+                }
+            }
+            Err(e) => break e,
+            Ok(_) => panic!("built without land cover"),
+        }
+    };
+    // Elevation is held, land cover is not: later, and nothing was fetched, only recorded.
+    assert!(err.tiles.is_empty(), "{err}");
+    assert_eq!(land.fetch_count(), 0);
+    let mut asked = g.take_land_requests();
+    assert!(!asked.is_empty());
+    // The downloader's round trips: fetch what was recorded, hand it over, ask again.
+    let mut made = None;
+    for _ in 0..40 {
+        for fetch in asked.drain(..) {
+            source.satisfy(&fetch).unwrap();
+        }
+        match node(&g, key, AIR, &biome, &kind) {
+            Ok(n) => {
+                made = Some(n);
+                break;
+            }
+            Err(missing) => {
+                for t in missing.tiles {
+                    store.load(t).unwrap();
+                }
+                asked = g.take_land_requests();
+            }
+        }
+    }
+    let made = made.expect("the node was built once its data was held");
+    // The ground is a lake: the voxel holding each surface is water, not grass.
+    let o = key.origin();
+    let (mut water, mut grass) = (0, 0);
+    for i in 0..4096 {
+        let v = made.at(i);
+        water += usize::from(v.state.0 == blocks.water);
+        grass += usize::from(v.state.0 == blocks.grass_block);
+    }
+    assert!(
+        water > 0 && grass == 0,
+        "water {water}, grass {grass} in {o:?}"
+    );
+    // Without land cover the same node over the same tiles shows grass.
+    let mut off = settings.clone();
+    off.land_cover = false;
+    let plain = EarthGenerator::new(&off, store.clone(), blocks).unwrap();
+    let plain_node = node(&plain, key, AIR, &biome, &kind).unwrap();
+    assert!((0..4096).any(|i| plain_node.at(i).state.0 == blocks.grass_block));
+    // The sky cover reads heights only: it is ready without any land cover.
+    let fresh = EarthGenerator::new(&settings, store.clone(), blocks)
+        .unwrap()
+        .with_land_cover(source.clone());
+    assert!(cover(&fresh, key).is_ok());
+}
+
 /// An Earth level (and its far sampler) over synthetic tiles, when the game data is there.
 mod sampler {
     use super::*;

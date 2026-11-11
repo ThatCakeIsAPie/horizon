@@ -487,6 +487,9 @@ impl EarthGenerator {
         s: i32,
         step: i32,
     ) -> Result<SurfaceKind, Gap> {
+        if self.land.is_none() {
+            return Ok(self.surface_kind(x, z, s));
+        }
         Ok(self.kinds_core(a, [x, z], [1, 1], step, step, &[s])?[0])
     }
 
