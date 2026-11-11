@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use crate::landcover::{FILE_DEGREES, WorldCoverFile};
+use crate::landsource::LandCoverFetcher;
 use crate::projection::pixel_to_latlon;
 use crate::source::{FetchError, TileFetcher};
 use crate::tiff::{ByteRange, Level};
@@ -449,4 +451,77 @@ pub fn serve_range(file: &[u8], range: ByteRange) -> &[u8] {
     let start = (range.offset as usize).min(file.len());
     let end = (range.end() as usize).min(file.len());
     &file[start..end]
+}
+
+/// A [`LandCoverFetcher`] over synthetic files held in memory: it serves byte ranges as a range request does,
+/// answers "no such file" for a file it was not given, counts what it is asked for, and can be told to fail.
+#[derive(Default)]
+pub struct MemoryLandCover {
+    files: HashMap<WorldCoverFile, Vec<u8>>,
+    fetches: AtomicUsize,
+    per_file: Mutex<HashMap<WorldCoverFile, usize>>,
+    failure: Mutex<Option<FetchError>>,
+}
+
+impl MemoryLandCover {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Serves `bytes` as `file`.
+    pub fn with_file(mut self, file: WorldCoverFile, bytes: Vec<u8>) -> Self {
+        self.files.insert(file, bytes);
+        self
+    }
+
+    /// Serves a miniature `file`: `width` pixels square in tiles of `tile` with `overviews` overview levels,
+    /// every pixel the code `class(latitude, longitude)` gives at the pixel's centre (overviews are sampled the
+    /// same way, at their own pixel centres).
+    pub fn with_classes(
+        self,
+        file: WorldCoverFile,
+        width: u32,
+        tile: u32,
+        overviews: usize,
+        class: impl Fn(f64, f64) -> u8,
+    ) -> Self {
+        let spec = TiffSpec::new(width, width, tile, overviews);
+        let degrees = f64::from(FILE_DEGREES);
+        let encoded = encode_tiff(&spec, &|level, x, y| {
+            let (w, h) = spec.level_size(level);
+            let lat = file.north() - (f64::from(y) + 0.5) / f64::from(h) * degrees;
+            let lon = f64::from(file.west) + (f64::from(x) + 0.5) / f64::from(w) * degrees;
+            class(lat, lon)
+        });
+        self.with_file(file, encoded.bytes)
+    }
+
+    /// How many fetches were asked for, failed ones and ones for missing files included.
+    pub fn fetch_count(&self) -> usize {
+        self.fetches.load(Ordering::SeqCst)
+    }
+
+    /// How many fetches asked for this file.
+    pub fn fetches_of(&self, file: WorldCoverFile) -> usize {
+        lock(&self.per_file).get(&file).copied().unwrap_or(0)
+    }
+
+    /// Makes every fetch fail with `error` (or succeed again with `None`).
+    pub fn fail_with(&self, error: Option<FetchError>) {
+        *lock(&self.failure) = error;
+    }
+}
+
+impl LandCoverFetcher for MemoryLandCover {
+    fn fetch(&self, file: WorldCoverFile, range: ByteRange) -> Result<Option<Vec<u8>>, FetchError> {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.per_file).entry(file).or_default() += 1;
+        if let Some(error) = lock(&self.failure).clone() {
+            return Err(error);
+        }
+        Ok(self
+            .files
+            .get(&file)
+            .map(|bytes| serve_range(bytes, range).to_vec()))
+    }
 }
