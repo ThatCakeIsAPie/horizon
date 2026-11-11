@@ -36,7 +36,7 @@ use super::{
 };
 use crate::{
     fast_hash::FxHashMap,
-    lod::cube::{CubeKey, GpuContent, GpuNode},
+    lod::cube::{CubeKey, GpuContent, GpuNode, MAX_CUBE_LEVEL},
 };
 use glam::{DVec3, Vec4};
 use std::{borrow::Cow, collections::VecDeque, time::Instant};
@@ -46,8 +46,15 @@ pub const NODE_WORDS: usize = 32;
 /// Nodes the table holds: a plan of `lod::cube::NODE_BUDGET` nodes and the nodes it
 /// replaces while it comes in (about 350 bytes of buffers each).
 pub const MAX_NODES: u32 = 1 << 18;
-/// Fade time in milliseconds (`lod::FADE`).
-const FADE_MS: u32 = 600;
+/// Fade time in milliseconds (`lod::fade_time`, which `HORIZON_FADE_SLOW` stretches).
+fn fade_ms() -> u32 {
+    super::lod::fade_time().as_millis() as u32
+}
+/// Draws a node's solid pass can hold: its six directions, and a shell of each kind
+/// (`cube_cull.wgsl`) in front of near cubes coming in or leaving.
+const SOLID_DRAWS: u64 = 12;
+/// Instance slots a node has: its own, and a shell dithering out, and one dithering in.
+const SLOTS: u64 = 3;
 const NOT_SET: u32 = u32::MAX;
 /// The arena is at most this many quads (256 MiB), or what the device binds.
 const MAX_ARENA_QUADS: u32 = 32 << 20;
@@ -79,6 +86,10 @@ struct Held {
     total: u32,
     shown: Option<u32>,
     dying: Option<u32>,
+    /// It goes with nothing to replace it (out of range): it fades out.
+    alone: bool,
+    /// It is in `CubeFar::live`: drawn, and not going.
+    counted: bool,
     /// The plan it came with (`CubeFar::queue`), which fades it in once it is whole.
     plan: u64,
 }
@@ -94,7 +105,10 @@ struct FrameUniform {
     nodes: u32,
     /// The sea's surface (sea level + 1): far water is drawn up to it.
     water_top: i32,
-    pad: u32,
+    fade_ms: u32,
+    /// The windows near cubes come in and leave in (`reveal::Table`).
+    reveal: [[f32; 4]; 2 * super::reveal::MAX_WINDOWS],
+    reveal_count: [u32; 4],
 }
 
 /// The state a [`CubeFar`] needs from the renderer to build its pipelines.
@@ -124,26 +138,89 @@ impl DrawSetup<'_> {
     }
 }
 
+/// The nodes drawn and not going, with how many lie at or below each node and each node above
+/// them.
+#[derive(Default)]
+struct Live {
+    own: std::collections::HashSet<CubeKey>,
+    below: FxHashMap<CubeKey, u32>,
+}
+
+impl Live {
+    fn add(&mut self, key: CubeKey) {
+        if self.own.insert(key) {
+            let mut up = key;
+            loop {
+                *self.below.entry(up).or_default() += 1;
+                if up.level >= MAX_CUBE_LEVEL {
+                    break;
+                }
+                up = up.parent();
+            }
+        }
+    }
+    fn remove(&mut self, key: CubeKey) {
+        if self.own.remove(&key) {
+            let mut up = key;
+            loop {
+                if let Some(n) = self.below.get_mut(&up) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.below.remove(&up);
+                    }
+                }
+                if up.level >= MAX_CUBE_LEVEL {
+                    break;
+                }
+                up = up.parent();
+            }
+        }
+    }
+    /// Whether another live node lies inside `key` or over it (or is it).
+    fn replaced(&self, key: CubeKey) -> bool {
+        if self.below.get(&key).is_some_and(|&n| n > 0) {
+            return true;
+        }
+        let mut up = key;
+        while up.level < MAX_CUBE_LEVEL {
+            up = up.parent();
+            if self.own.contains(&up) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// The plans queued (`CubeFar::queue`) and how many nodes of each are not in yet
 /// (waiting for the mesher, or in it).
 #[derive(Default)]
-struct Plans {
+pub(super) struct Plans {
     /// The last plan, counted from 1.
     current: u64,
     outstanding: std::collections::BTreeMap<u64, u32>,
 }
 
 impl Plans {
-    fn begin(&mut self) -> u64 {
+    pub(super) fn begin(&mut self) -> u64 {
         self.current += 1;
         self.current
     }
+    /// The plan a batch of `nodes` nodes belongs to: a new one, or with none the one that
+    /// follows (keys retired alone go with it).
+    pub(super) fn for_batch(&mut self, nodes: usize) -> u64 {
+        if nodes == 0 {
+            self.current + 1
+        } else {
+            self.begin()
+        }
+    }
     /// A node of `plan` waits.
-    fn add(&mut self, plan: u64) {
+    pub(super) fn add(&mut self, plan: u64) {
         *self.outstanding.entry(plan).or_default() += 1;
     }
     /// A node of `plan` is in, or gone.
-    fn land(&mut self, plan: u64) {
+    pub(super) fn land(&mut self, plan: u64) {
         if let Some(left) = self.outstanding.get_mut(&plan) {
             *left -= 1;
             if *left == 0 {
@@ -153,7 +230,7 @@ impl Plans {
     }
     /// The plans below this one are whole: every node of theirs is in, and so is every
     /// node of the plans before them.
-    fn whole(&self) -> u64 {
+    pub(super) fn whole(&self) -> u64 {
         self.outstanding.keys().next().copied().unwrap_or(u64::MAX)
     }
 }
@@ -180,6 +257,9 @@ pub struct CubeFar {
     translucent: wgpu::RenderPipeline,
     counts: bool,
     nodes: FxHashMap<CubeKey, Held>,
+    /// The nodes drawn and not going: a node that goes is replaced when one lies inside it
+    /// or over it (`Live::replaced`).
+    live: Live,
     free_ids: Vec<u32>,
     next_id: u32,
     /// Nodes waiting for the mesher, with the plan each came with.
@@ -250,11 +330,15 @@ impl CubeFar {
             u64::from(MAX_NODES) * (NODE_WORDS as u64) * 4,
             st | dst,
         );
-        let instances = buffer("Cube far instances", u64::from(MAX_NODES) * 32, st);
+        let instances = buffer("Cube far instances", u64::from(MAX_NODES) * 32 * SLOTS, st);
         let biomes = buffer("Cube far biomes", 256 * 16, st | dst);
         let args_bytes = u64::from(MAX_NODES) * 6 * 16;
         let indirect = wgpu::BufferUsages::INDIRECT;
-        let solid_args = buffer("Cube far solid draws", args_bytes, st | indirect | dst);
+        let solid_args = buffer(
+            "Cube far solid draws",
+            args_bytes / 6 * SOLID_DRAWS,
+            st | indirect | dst,
+        );
         let translucent_args = buffer("Cube far water draws", args_bytes, st | indirect | dst);
         let draw_counts = buffer("Cube far draw counts", 8, st | indirect | dst);
         let frame_buffer = buffer(
@@ -437,6 +521,7 @@ impl CubeFar {
             translucent,
             counts: setup.counts,
             nodes: FxHashMap::default(),
+            live: Live::default(),
             free_ids: Vec::new(),
             next_id: 0,
             pending: FxHashMap::default(),
@@ -501,11 +586,7 @@ impl CubeFar {
     /// does, then hands the nodes that replace them over, in `queue_gpu_cube_lods`) go
     /// with the plan that follows, so they stay until it is in.
     pub fn queue(&mut self, nodes: Vec<GpuNode>, removed: Vec<CubeKey>) {
-        let plan = if nodes.is_empty() {
-            self.plans.current + 1
-        } else {
-            self.plans.begin()
-        };
+        let plan = self.plans.for_batch(nodes.len());
         for node in nodes {
             self.removed.remove(&node.key);
             let key = node.key;
@@ -562,6 +643,9 @@ impl CubeFar {
     fn install(&mut self, key: CubeKey, plan: u64, start: u32, total: u32, ranges: [(u32, u32); 12]) {
         let shown = self.nodes.remove(&key).and_then(|old| {
             self.drop_held(&old);
+            if old.counted {
+                self.live.remove(key);
+            }
             self.fade_events[2] += 1;
             old.shown.filter(|_| old.dying.is_none())
         });
@@ -604,9 +688,14 @@ impl CubeFar {
                 total,
                 shown,
                 dying: None,
+                alone: false,
+                counted: id.is_some(),
                 plan,
             },
         );
+        if id.is_some() {
+            self.live.add(key);
+        }
     }
 
     fn drop_held(&mut self, held: &Held) {
@@ -620,6 +709,9 @@ impl CubeFar {
     fn remove(&mut self, key: CubeKey) {
         if let Some(held) = self.nodes.remove(&key) {
             self.drop_held(&held);
+            if held.counted {
+                self.live.remove(key);
+            }
         }
     }
 
@@ -675,7 +767,7 @@ impl CubeFar {
         let faded: Vec<CubeKey> = self
             .nodes
             .iter()
-            .filter(|(_, n)| n.dying.is_some_and(|d| now.saturating_sub(d) >= FADE_MS))
+            .filter(|(_, n)| n.dying.is_some_and(|d| now.saturating_sub(d) >= fade_ms()))
             .map(|(&k, _)| k)
             .collect();
         for key in faded {
@@ -787,10 +879,25 @@ impl CubeFar {
             if held.dying.is_some() {
                 continue;
             }
+            let was_counted = std::mem::take(&mut held.counted);
+            if was_counted {
+                self.live.remove(key);
+            }
+            let alone = !self.live.replaced(key);
+            let Some(held) = self.nodes.get_mut(&key) else {
+                continue;
+            };
             held.dying = Some(now);
+            held.alone = alone;
             self.fade_events[1] += u32::from(held.id.is_some());
             match held.id {
-                Some(id) => self.word(id, 5, now),
+                Some(id) => {
+                    self.word(id, 5, now);
+                    if alone {
+                        // Fades out where it stands (cube_cull.wgsl's flag).
+                        self.word(id, 6, 1 | 2);
+                    }
+                }
                 // Nothing drawn: nothing to fade.
                 None => self.remove(key),
             }
@@ -802,6 +909,23 @@ impl CubeFar {
         self.nodes.contains_key(&key)
     }
 
+    /// Whether `key` is drawn, and then whether it stands whole at present: faded in, not
+    /// going alone (a shell may dither in front of near cubes over it).
+    pub fn cover(&self, key: CubeKey) -> Option<bool> {
+        let held = self.nodes.get(&key)?;
+        held.id?;
+        let since = held.shown?;
+        Some(
+            self.now_ms().saturating_sub(since) >= fade_ms()
+                && !(held.dying.is_some() && held.alone),
+        )
+    }
+
+    /// Nodes in the table (`HORIZON_FADE_STATS`, whether far nodes stand here).
+    pub fn drawn(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Nodes fading in and nodes fading out now, by the times the culling pass
     /// reads (`HORIZON_FADE_STATS`).
     pub fn fading_nodes(&self) -> [u32; 2] {
@@ -810,7 +934,7 @@ impl CubeFar {
         for held in self.nodes.values().filter(|held| held.id.is_some()) {
             if held.dying.is_some() {
                 fading[1] += 1;
-            } else if held.shown.is_some_and(|at| now.saturating_sub(at) < FADE_MS) {
+            } else if held.shown.is_some_and(|at| now.saturating_sub(at) < fade_ms()) {
                 fading[0] += 1;
             }
         }
@@ -844,6 +968,7 @@ impl CubeFar {
         self.order.clear();
         self.removed.clear();
         self.meshing.clear();
+        self.live = Live::default();
         self.plans = Plans::default();
         self.discard = !self.mesher.idle();
         let keys: Vec<CubeKey> = self.nodes.keys().copied().collect();
@@ -853,11 +978,12 @@ impl CubeFar {
     }
 
     /// The culling pass for this frame: `planes` the camera-relative frustum.
-    pub fn prepare(
+    pub(super) fn prepare(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         camera: DVec3,
         planes: [Vec4; 6],
+        reveal: &super::reveal::Table,
     ) {
         if self.next_id == 0 {
             return;
@@ -875,7 +1001,9 @@ impl CubeFar {
             now: self.now_ms(),
             nodes: self.next_id,
             water_top: self.water_top,
-            pad: 0,
+            fade_ms: fade_ms(),
+            reveal: reveal.boxes,
+            reveal_count: reveal.count,
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
@@ -883,7 +1011,7 @@ impl CubeFar {
         if !self.counts {
             // Draws past the count are empty ones.
             let bytes = u64::from(self.next_id) * 6 * 16;
-            encoder.clear_buffer(&self.solid_args, 0, Some(bytes));
+            encoder.clear_buffer(&self.solid_args, 0, Some(bytes / 6 * SOLID_DRAWS));
             encoder.clear_buffer(&self.translucent_args, 0, Some(bytes));
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -912,7 +1040,7 @@ impl CubeFar {
         } else {
             &self.solid_args
         };
-        let max = self.next_id * 6;
+        let max = self.next_id * if water { 6 } else { SOLID_DRAWS as u32 };
         if self.counts {
             pass.multi_draw_indirect_count(args, 0, &self.draw_counts, u64::from(water) * 4, max);
         } else {
@@ -967,6 +1095,36 @@ mod tests {
         assert_eq!(shown, 49, "each plan but the newest faded in while the camera moved");
     }
 
+    /// A node that goes with nothing in its place (out of range) fades out where it stands;
+    /// one with nodes inside it or over it is replaced, and stays whole under them.
+    #[test]
+    fn a_node_goes_alone_unless_something_drawn_covers_its_place() {
+        let key = |level, x, y, z| CubeKey::new(level, x, y, z);
+        let mut live = Live::default();
+        let old = key(2, 4, 0, 4);
+        live.add(old);
+        live.remove(old); // it goes now
+        assert!(!live.replaced(old), "nothing else: alone");
+        // Its children came in (a finer plan): replaced.
+        live.add(old.children()[3]);
+        assert!(live.replaced(old));
+        live.remove(old.children()[3]);
+        assert!(!live.replaced(old));
+        // The node over it (a coarser plan): replaced, however high.
+        let over = old.parent().parent();
+        live.add(over);
+        assert!(live.replaced(old));
+        // A neighbour is no replacement.
+        live.remove(over);
+        live.add(key(2, 5, 0, 4));
+        live.add(key(3, 0, 0, 0));
+        assert!(!live.replaced(old));
+        assert!(live.below.len() > 2 && live.own.len() == 2);
+        live.remove(key(2, 5, 0, 4));
+        live.remove(key(3, 0, 0, 0));
+        assert!(live.below.is_empty() && live.own.is_empty(), "nothing is left counted");
+    }
+
     #[test]
     fn the_drawing_shader_validates_with_the_terrain_shader() {
         let module = naga::front::wgsl::parse_str(&shader_source()).unwrap();
@@ -991,8 +1149,11 @@ mod tests {
 
     #[test]
     fn the_frame_uniform_matches_the_shaders_layout() {
-        // 6 planes, then vec4<i32> and vec4<f32> on 16-byte boundaries, then 4 words.
-        assert_eq!(std::mem::size_of::<FrameUniform>(), 96 + 16 + 16 + 16);
+        // 6 planes, then vec4<i32> and vec4<f32> on 16-byte boundaries, then 4 words, then
+        // the windows' 128 vec4s and their count.
+        assert_eq!(std::mem::size_of::<FrameUniform>(), 96 + 16 + 16 + 16 + 128 * 16 + 16);
+        // The shaders' constant for the slots past a node's own.
+        assert!(include_str!("cube_cull.wgsl").contains(&format!("MAX_NODES: u32 = {MAX_NODES}u")));
         assert_eq!(NODE_WORDS, 8 + 12 * 2);
     }
 }

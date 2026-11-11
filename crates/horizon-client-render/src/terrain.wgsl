@@ -44,6 +44,10 @@ struct Globals {
     hdr_light: vec4<f32>,
     hdr_settings: vec4<f32>,
     hdr_shares: vec4<f32>,
+    // The windows far cube shells dither in (gfx/reveal.rs): per window the camera-relative
+    // box's low corner and how far the window is, then its high corner and 1 when cubes came in.
+    reveal: array<vec4<f32>, 128>,
+    reveal_count: vec4<u32>,
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var sprites: texture_2d_array<f32>;
@@ -281,20 +285,44 @@ fn from_wire(w: TerrainWire) -> TerrainOut {
 // the terrain as the camera moves. `dx` and `dy`: `local`'s screen
 // derivatives.
 fn faded(whole_code: u32, local: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> bool {
-    // Without `FRONT`, which only says where the piece is drawn (`fade_depth`).
+    // Without `FRONT` and `REVEAL`, which only say where the piece is drawn (`fade_depth`).
     let code = whole_code & (FRONT - 1u);
     if code == 0u { return false; }
     // Sixty-fourths of the fade: 1 to 63 fading in, 65 to 128 fading out.
     let step = (code - 1u) % 129u;
     let out = step >= 64u;
     let progress = f32(select(step, step - 64u, out)) / 64.0;
-    let size = exp2(f32(max((code - 1u) / 129u, 4u)));
+    return faded_at((code - 1u) / 129u, out, progress, local, dx, dy);
+}
+// `faded` for a level and how far (0 to 1) the fade is.
+fn faded_at(level: u32, out: bool, progress: f32, local: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> bool {
+    let size = exp2(f32(max(level, 4u)));
     let cell = bitcast<vec2<u32>>(vec2<i32>(floor(local.xz / size)));
     var h = cell.x * 73856093u ^ cell.y * 19349663u;
     h = (h ^ (h >> 13u)) * 0x5bd1e995u;
     let start = f32((h ^ (h >> 15u)) & 1023u) / 2048.0;
     let ramp = clamp((progress - start) * 2.0, 0.0, 1.0);
     return dithered_out(select(ramp, 1.0 - ramp, out), local, dx, dy);
+}
+// Whether a far cube shell (`REVEAL`) leaves this pixel out: the pixel, at camera-relative
+// `pos`, dithers on the clock of the window it lies in (gfx/reveal.rs), the one furthest
+// along where several meet; in none it is not drawn, the mesh behind it being the same.
+// A window is grown by a voxel of the shell (at most 4 blocks): its coarse surface lies a
+// little off the real one.
+fn reveal_leaves(code: u32, pos: vec3<f32>, local: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> bool {
+    let level = (code - 1u) / 129u;
+    let out = ((code - 1u) % 129u) >= 64u;
+    let margin = vec3(min(exp2(f32(level)), 4.0));
+    var best = -1.0;
+    for (var i = 0u; i < min(globals.reveal_count.x, 64u); i++) {
+        let lo = globals.reveal[i * 2u];
+        let hi = globals.reveal[i * 2u + 1u];
+        if (hi.w > 0.5) == out && all(pos >= lo.xyz - margin) && all(pos <= hi.xyz + margin) {
+            best = max(best, lo.w);
+        }
+    }
+    if best < 0.0 { return true; }
+    return faded_at(level, out, best, local, dx, dy);
 }
 // Whether a face `shown` of the way in leaves this pixel out: a 4x4 ordered
 // pattern in the face's plane, its unit the power of two of a block nearest 1.5
@@ -318,6 +346,10 @@ fn dithered_out(shown: f32, local: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> b
 // whole (`Tile::previous`'s `StandMode::Out`, `Tile::front_in`), so every hole
 // of its pattern shows finished terrain, never the inside of a section.
 const FRONT: u32 = 4096u;
+// Added to a far cube shell's code (gfx/reveal.rs): it dithers on the clocks of the windows
+// of the near cubes that come in or leave (`reveal_leaves`), and carries its camera-relative
+// position in `spherical`, `height` and `cylindrical`.
+const REVEAL: u32 = 8192u;
 // How far toward the camera such a tile is drawn, in whole units of its
 // distance, so it wins where it and the sections it dithers over are at the
 // same depth or a little apart: far terrain's coarser blocks stand a little out
@@ -346,6 +378,18 @@ fn fade_depth(clip: vec4<f32>, w: f32) -> vec4<f32> {
     let code = whole_code & (FRONT - 1u);
     let tile = instance_step(w) > 0.001;
     var scale = select(1.0, 1.0 - 2e-3, tile);
+    if (whole_code & REVEAL) != 0u {
+        // A shell ahead of the cubes it dithers over by three eighths of a voxel of its own, which a
+        // surface's coarse stand-in is off the real one by, and not more: a face inside
+        // the shell lies a whole voxel behind its surface or deeper, and must not win over
+        // the cube's surface in the holes (gfx/lod.rs `shells_stay_out_of_caves`). Cubes
+        // that leave are held 2% ahead of far terrain: the shell is ahead of those.
+        // (the sliver of the distance is only for depth precision)
+        let out = ((code - 1u) % 129u) >= 64u;
+        let voxel = exp2(f32((code - 1u) / 129u));
+        let pull = select(0.0205, 0.0005, out) + min(0.375 * voxel / max(clip.w, 1.0), 0.08);
+        return vec4(clip.xy, clip.z * (1.0 + pull), clip.w);
+    }
     if (whole_code & FRONT) != 0u {
         return vec4(clip.xy, clip.z * front_scale(code), clip.w);
     }
@@ -728,6 +772,11 @@ fn terrain_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f3
     out.spherical = length(pos);
     out.cylindrical = max(length(pos.xz), abs(pos.y));
     out.fade = fade_code(w);
+    if (out.fade & REVEAL) != 0u {
+        // (the fragment stage works its own distances out from them)
+        out.spherical = pos.x;
+        out.cylindrical = pos.z;
+    }
     const CHUNK_FULLY_VISIBLE_RANGE: f32 = 16.0;
     out.visibility = mix(1.0, instance_visibility(w),
         clamp((length(pos) - CHUNK_FULLY_VISIBLE_RANGE) / CHUNK_FULLY_VISIBLE_RANGE, 0.0, 1.0));
@@ -781,13 +830,19 @@ fn hdr_mark(tier: u32, y: f32) -> f32 {
     if in.height < globals.fog_ends.w { discard; }
     return solid_color(in);
 }
-fn solid_color(in: TerrainOut) -> vec4<f32> {
+fn solid_color(in_: TerrainOut) -> vec4<f32> {
+    var in = in_;
     let dx = dpdx(in.local);
     let dy = dpdy(in.local);
     if HDR_LIGHTING && globals.hdr_light.z != 0.0 {
         hdr_normal = normalize(cross(dy, dx));
     }
-    if faded(in.fade, in.local, dx, dy) { discard; }
+    if (in.fade & REVEAL) != 0u {
+        let pos = vec3(in.spherical, in.height, in.cylindrical);
+        if reveal_leaves(in.fade & (FRONT - 1u), pos, in.local, dx, dy) { discard; }
+        in.spherical = length(pos);
+        in.cylindrical = max(length(pos.xz), abs(pos.y));
+    } else if faded(in.fade, in.local, dx, dy) { discard; }
     // The chunk fade-in (terrain.fsh mixes toward the fog colour, a flash of sky
     // where a chunk comes in): dithered in, as far terrain fades.
     if in.visibility < 1.0 && dithered_out(in.visibility, in.local, dx, dy) { discard; }

@@ -5,6 +5,7 @@ use super::{
     cube_gen::GpuBackend,
     surface_tile::{self, TileInfo as SurfaceInfo, TileKey as SurfaceKey},
 };
+use super::reveal::{self, Reveal};
 use crate::{
     fast_hash::{FxHashMap, FxHashSet},
     lod::{
@@ -102,28 +103,91 @@ pub(super) fn far_tile_mut<'a>(
     }
 }
 
-/// Finished node meshes not uploaded yet and the nodes to retire once they are in.
+/// Finished node meshes not uploaded yet, each with the job (`CubeJobs`) it came in.
 #[derive(Default)]
 pub(super) struct CubePending {
-    meshes: FxHashMap<CubeKey, SectionMesh>,
+    meshes: FxHashMap<CubeKey, (SectionMesh, u64)>,
     order: VecDeque<CubeKey>,
-    removed: FxHashSet<CubeKey>,
 }
 
 impl CubePending {
-    /// As [`Pending::add`]: newer meshes replace waiting ones, nodes meshed
-    /// again are not removed, nodes removed drop their waiting meshes.
-    fn add(&mut self, meshes: Vec<(CubeKey, SectionMesh)>, removed: Vec<CubeKey>) {
+    /// Newer meshes replace waiting ones; nodes removed drop their waiting meshes. Returns the
+    /// jobs of the meshes dropped, which are not coming.
+    fn add(
+        &mut self,
+        meshes: Vec<(CubeKey, SectionMesh)>,
+        job: u64,
+        removed: &[CubeKey],
+    ) -> Vec<u64> {
+        let mut dropped = Vec::new();
         for (key, mesh) in meshes {
-            self.removed.remove(&key);
-            if self.meshes.insert(key, mesh).is_none() {
-                self.order.push_back(key);
+            match self.meshes.insert(key, (mesh, job)) {
+                Some((_, old)) => dropped.push(old),
+                None => self.order.push_back(key),
             }
         }
         for key in removed {
-            self.meshes.remove(&key);
-            self.removed.insert(key);
+            dropped.extend(self.meshes.remove(key).map(|(_, job)| job));
         }
+        dropped
+    }
+}
+
+/// The jobs `queue_cube_lods` hands over, a job the nodes finished in one `CubeLod::update` and
+/// the nodes it lets go, and when each part fades. A job fades in, and its replaced nodes go,
+/// once every node of it and of the jobs before it is uploaded: not once nothing at all is waiting
+/// (a camera that keeps moving keeps a job or two behind, and the far terrain would stand
+/// as it was, then change at once, as `cube_far::Plans` fixed for the GPU nodes).
+#[derive(Default)]
+pub(super) struct CubeJobs {
+    plans: cube_far::Plans,
+    /// Nodes uploaded and not yet fading in, with their jobs.
+    unshown: FxHashMap<CubeKey, u64>,
+    /// Nodes to retire, with the job that replaces them.
+    removed: FxHashMap<CubeKey, u64>,
+}
+
+impl CubeJobs {
+    /// A job of `meshes` meshes and the nodes `removed` with it: its number.
+    fn queue(&mut self, meshes: usize, removed: &[CubeKey]) -> u64 {
+        let job = self.plans.for_batch(meshes);
+        (0..meshes).for_each(|_| self.plans.add(job));
+        for &key in removed {
+            self.removed.insert(key, job);
+        }
+        job
+    }
+    /// Meshes of these jobs are not coming (replaced while waiting, or removed).
+    fn dropped(&mut self, jobs: impl IntoIterator<Item = u64>) {
+        jobs.into_iter().for_each(|job| self.plans.land(job));
+    }
+    /// A mesh of `job` is uploaded: a node new to the view waits to fade in.
+    fn uploaded(&mut self, key: CubeKey, job: u64, new: bool) {
+        self.plans.land(job);
+        self.removed.remove(&key);
+        if new {
+            self.unshown.insert(key, job);
+        }
+    }
+    fn forget(&mut self, key: CubeKey) {
+        self.unshown.remove(&key);
+        self.removed.remove(&key);
+    }
+    /// The nodes to begin fading in and those to retire now: the jobs that are whole.
+    fn due(&mut self) -> (Vec<CubeKey>, Vec<CubeKey>) {
+        let whole = self.plans.whole();
+        let take = |map: &mut FxHashMap<CubeKey, u64>| {
+            let keys: Vec<CubeKey> = map
+                .iter()
+                .filter(|&(_, &job)| job < whole)
+                .map(|(&key, _)| key)
+                .collect();
+            keys.iter().for_each(|key| {
+                map.remove(key);
+            });
+            keys
+        };
+        (take(&mut self.unshown), take(&mut self.removed))
     }
 }
 
@@ -182,6 +246,11 @@ pub(super) struct FadeStats {
     /// GPU cube nodes: began to fade in, began to go, meshed again in place, new
     /// (`CubeFar::take_fade_events`).
     gpu_nodes: [u32; 4],
+    /// Near cubes that came in over a node standing whole (a window), over none, and over one
+    /// not whole yet (whole at once); then the same for cubes that left (`Renderer::open_cube_window`).
+    pub cubes: [u32; 6],
+    /// The most windows open at a frame, and the most shells drawn (CPU nodes).
+    windows_max: [u32; 2],
 }
 
 impl FadeStats {
@@ -200,6 +269,7 @@ impl FadeStats {
         visible: &[Visible],
         gpu_nodes: Option<([u32; 2], [u32; 4])>,
         open: u32,
+        windows: u32,
     ) {
         if !self.on {
             return;
@@ -208,9 +278,12 @@ impl FadeStats {
         let began = *self.began.get_or_insert(now);
         self.frames += 1;
         self.window_open = self.window_open.max(open);
+        self.windows_max[0] = self.windows_max[0].max(windows);
         let mut count = [0u32; 3];
         let mut drawn = [0u64; 2];
+        let mut shells = 0;
         for v in visible {
+            shells += u32::from(v.fade & reveal::REVEAL != 0);
             let cube = matches!(v.key, FarKey::Cube(_));
             drawn[usize::from(cube)] += 1;
             if v.fade != 0 {
@@ -220,6 +293,7 @@ impl FadeStats {
                 }
             }
         }
+        self.windows_max[1] = self.windows_max[1].max(shells);
         if let Some(([fading_in, fading_out], events)) = gpu_nodes {
             count[2] += fading_in + fading_out;
             for (sum, event) in self.gpu_nodes.iter_mut().zip(events) {
@@ -237,7 +311,9 @@ impl FadeStats {
                 "far fade: {} frames; tiles drawn {} avg, fading max {} ({} frames), in front max {} ({} frames); \
                  cube nodes fading max {} ({} frames); tiles new {} fading, {} whole; removed {} fading out, {} \
                  standing; meshed again {} at once, {} stand-in whole, {} stand-in dithering out; \
-                 windows in front of near sections: {} out, {} in, {} open at most; cpu cube nodes new {}, removed {}; gpu cube nodes {} began to fade in, {} began to go, {} meshed again in place, {} new",
+                 windows in front of near sections: {} out, {} in, {} open at most; cpu cube nodes new {}, removed {}; gpu cube nodes {} began to fade in, {} began to go, {} meshed again in place, {} new; \
+                 near cubes: {} came in over a shell, {} over no node, {} over a node not whole yet; {} left under one, {} with no node, {} under one not whole yet; \
+                 at most {} cube windows open, {} cpu shells drawn",
                 self.frames,
                 self.drawn[0] / u64::from(self.frames),
                 self.max[0],
@@ -262,6 +338,14 @@ impl FadeStats {
                 self.gpu_nodes[1],
                 self.gpu_nodes[2],
                 self.gpu_nodes[3],
+                self.cubes[0],
+                self.cubes[1],
+                self.cubes[2],
+                self.cubes[3],
+                self.cubes[4],
+                self.cubes[5],
+                self.windows_max[0],
+                self.windows_max[1],
             );
             *self = Self {
                 on: true,
@@ -448,6 +532,13 @@ impl Tile {
             _ => &self.mesh,
         }
     }
+    /// Whether it stands drawn whole at `now` (a shell may dither in front of near cubes
+    /// over it): faded in, and not going alone.
+    pub fn whole(&self, now: Instant) -> bool {
+        self.shown
+            .is_some_and(|since| now.saturating_duration_since(since) >= fade_time())
+            && !(self.dying.is_some() && self.alone)
+    }
     /// Whether a window is open at `now` (`HORIZON_FADE_STATS`).
     pub fn window_open(&self, now: Instant) -> bool {
         self.window.is_some_and(|window| window.active(now))
@@ -492,6 +583,7 @@ impl Tile {
         camera: DVec3,
         frustum: &Frustum,
         now: Instant,
+        reveal: Option<&Reveal>,
         out: &mut Vec<Visible>,
     ) {
         let level = key.level();
@@ -533,6 +625,22 @@ impl Tile {
             out.push(entry(fade, replaced, replaced, true, window.is_none(), false));
         } else {
             out.push(entry(fade, false, false, true, tested, false));
+        }
+        // A far cube node standing whole is drawn again, a shell, where near cubes come in
+        // or leave in front of it (`Renderer::open_cube_window`): once for each kind, since
+        // the two lie at different depths (terrain.wgsl's `fade_depth`).
+        if let Some(reveal) = reveal
+            && fade == 0
+            && !reveal.is_empty()
+        {
+            let lo = DVec3::from(key.origin().map(f64::from));
+            let [min, max] = [lo + self.bounds.min.as_dvec3(), lo + self.bounds.max.as_dvec3()];
+            let touching = reveal.touching(min, max, reveal::margin(level));
+            for out_kind in [true, false] {
+                if touching[usize::from(!out_kind)] {
+                    out.push(entry(reveal::shell_code(level, out_kind), false, false, false, false, true));
+                }
+            }
         }
         let Some(window) = window else {
             return;
@@ -692,7 +800,7 @@ impl Renderer {
 
     /// A node meshed again keeps its slot and fade; a new one waits for the
     /// rest of its job (`upload_cube_lods`) before it fades in.
-    fn upload_cube_lod(&mut self, key: CubeKey, mesh: &SectionMesh) {
+    fn upload_cube_lod(&mut self, key: CubeKey, mesh: &SectionMesh, job: u64) {
         let (old_slot, shown) = match self.lod_cubes.remove(&key) {
             Some(old) => {
                 let kept = (old.cull_slot, old.shown.filter(|_| old.dying.is_none()));
@@ -704,6 +812,8 @@ impl Renderer {
                 (None, None)
             }
         };
+        // (a node new to the view, or one meshed again before it faded in, waits for its job)
+        self.cube_jobs.uploaded(key, job, shown.is_none());
         match Bounds::mesh(mesh).zip(self.upload_mesh(mesh)) {
             Some((bounds, mesh)) => {
                 let cull_slot = old_slot.unwrap_or_else(|| {
@@ -873,6 +983,7 @@ impl Renderer {
     }
 
     pub fn remove_cube_lod(&mut self, key: CubeKey) {
+        self.cube_jobs.forget(key);
         if let Some(tile) = self.lod_cubes.remove(&key) {
             self.lod_cull_free.push(tile.cull_slot);
             self.release_tile(tile);
@@ -882,6 +993,8 @@ impl Renderer {
     /// Drops every cube tile and what waits to upload.
     pub fn clear_cube_lods(&mut self) {
         self.cube_pending = None;
+        self.cube_jobs = Default::default();
+        self.reveal.clear();
         if let Some(far) = &mut self.cube_far {
             far.clear();
         }
@@ -910,9 +1023,12 @@ impl Renderer {
         if let Some(far) = &mut self.cube_far {
             far.queue(Vec::new(), removed.clone());
         }
-        self.cube_pending
+        let job = self.cube_jobs.queue(meshes.len(), &removed);
+        let dropped = self
+            .cube_pending
             .get_or_insert_default()
-            .add(meshes, removed);
+            .add(meshes, job, &removed);
+        self.cube_jobs.dropped(dropped);
     }
 
     /// Uploads queued node meshes for about `budget` (at least one). Once all
@@ -923,6 +1039,9 @@ impl Renderer {
         if let Some(far) = &mut self.cube_far {
             far.upload();
         }
+        self.reveal.expire(start, fade_time());
+        self.release_held_cubes(start);
+        self.release_left(start);
         let faded: Vec<_> = self
             .lod_cubes
             .iter()
@@ -936,24 +1055,28 @@ impl Renderer {
             let next = std::iter::from_fn(|| pending.order.pop_front())
                 .find(|key| pending.meshes.contains_key(key));
             let Some(key) = next else {
-                let pending = self.cube_pending.take().expect("pending nodes");
-                for tile in self.lod_cubes.values_mut() {
-                    tile.shown.get_or_insert(start);
-                }
-                for key in pending.removed {
-                    if let Some(tile) = self.lod_cubes.get_mut(&key)
-                        && tile.dying.is_none()
-                    {
-                        self.fade_stats.nodes[1] += 1;
-                        tile.dying = Some(start);
-                    }
-                }
-                return;
+                self.cube_pending = None;
+                break;
             };
-            let mesh = pending.meshes.remove(&key).expect("pending node");
-            self.upload_cube_lod(key, &mesh);
+            let (mesh, job) = pending.meshes.remove(&key).expect("pending node");
+            self.upload_cube_lod(key, &mesh, job);
             if start.elapsed() >= budget {
-                return;
+                break;
+            }
+        }
+        // The jobs that are whole: their nodes fade in, and the nodes they replace go.
+        let (shown, removed) = self.cube_jobs.due();
+        for key in shown {
+            if let Some(tile) = self.lod_cubes.get_mut(&key) {
+                tile.shown.get_or_insert(start);
+            }
+        }
+        for key in removed {
+            if let Some(tile) = self.lod_cubes.get_mut(&key)
+                && tile.dying.is_none()
+            {
+                self.fade_stats.nodes[1] += 1;
+                tile.dying = Some(start);
             }
         }
     }
@@ -1161,6 +1284,96 @@ impl Renderer {
         }
     }
 
+    /// Whether far cube nodes are drawn here, on the CPU or the GPU path.
+    pub(super) fn cubic_far(&self) -> bool {
+        !self.lod_cubes.is_empty() || self.cube_far.as_ref().is_some_and(|far| far.drawn() > 0)
+    }
+
+    /// Whether the far cube node over section `key`'s place stands whole at `now`: `Some`
+    /// with that, or `None` where no node is drawn there.
+    fn cube_cover(&self, key: super::SectionKey, now: Instant) -> Option<bool> {
+        let pos = horizon_core::position::SectionPos {
+            x: key.0,
+            y: (self.layout.min_y() >> 4) + key.1,
+            z: key.2,
+        };
+        let mut cover = None;
+        for level in 0..=crate::lod::cube::MAX_CUBE_LEVEL {
+            let node = CubeKey::containing(level, pos);
+            let whole = self
+                .lod_cubes
+                .get(&node)
+                .filter(|tile| tile.shown.is_some())
+                .map(|tile| tile.whole(now))
+                .or_else(|| self.cube_far.as_ref()?.cover(node));
+            match whole {
+                // (a node standing whole over it, whatever finer ones came in meanwhile)
+                Some(true) => return Some(true),
+                Some(false) => cover = Some(false),
+                None => {}
+            }
+        }
+        cover
+    }
+
+    /// A cube at section `key` comes in (`out`) or leaves, over a far cube node that
+    /// stands whole there: a window for the node's shell to dither in front of it
+    /// (`reveal`, `Tile::visible`, `CubeFar::prepare`). The cube itself never dithers.
+    /// Returns when the window began, which a cube that leaves is held until; none (and no
+    /// window) where no node stands whole to dither: the cube is whole at once, or goes.
+    pub(super) fn open_cube_window(
+        &mut self,
+        key: super::SectionKey,
+        now: Instant,
+        out: bool,
+    ) -> Option<Instant> {
+        let cover = self.cube_cover(key, now);
+        let shell = cover == Some(true);
+        self.fade_stats.cubes[usize::from(!out) * 3 + cover.map_or(1, |whole| usize::from(!whole) * 2)] += 1;
+        if !shell {
+            return None;
+        }
+        let lo = DVec3::new(
+            f64::from(key.0) * 16.0,
+            f64::from(self.layout.min_y() + key.1 * 16),
+            f64::from(key.2) * 16.0,
+        );
+        Some(self.reveal.open(lo, lo + 16.0, now, out))
+    }
+
+    /// Cubes of removed columns, held whole while far nodes come in under them
+    /// (`remove_columns`), let go once a node stands whole under each: the nodes dither
+    /// in in front of them and they are released with the windows (`release_left`).
+    /// Held for `HOLD` at most: past it they go at once.
+    fn release_held_cubes(&mut self, now: Instant) {
+        if self.cube_held.is_empty() {
+            return;
+        }
+        const HOLD: Duration = Duration::from_secs(5);
+        let columns: Vec<((i32, i32), Instant)> =
+            self.cube_held.iter().map(|(&c, &at)| (c, at)).collect();
+        let mut released = Vec::new();
+        for ((x, z), removed) in columns {
+            let held: Vec<super::SectionKey> = (0..self.layout.sections() as i32)
+                .map(|sy| (x, sy, z))
+                .filter(|key| self.lod_retiring.contains(key))
+                .collect();
+            let timed_out = now.saturating_duration_since(removed) >= HOLD;
+            if !timed_out && !held.iter().all(|&key| self.cube_cover(key, now) == Some(true)) {
+                continue;
+            }
+            self.cube_held.remove(&(x, z));
+            for key in held {
+                self.lod_retiring.remove(&key);
+                match self.open_cube_window(key, now, false) {
+                    Some(since) => self.leave_section(key, since),
+                    None => released.extend(self.sections.remove(key)),
+                }
+            }
+        }
+        self.release_meshes(released);
+    }
+
     /// Near sections of `column` come in over far terrain (`out`), or leave it,
     /// held whole until it has come in over them (`leave_section`): the tile
     /// that draws the column draws its shell a second time in front of them,
@@ -1191,6 +1404,7 @@ impl Renderer {
 mod tests {
     use super::*;
     use crate::mesher::TerrainVertex;
+    const REVEAL_BIT: u32 = reveal::REVEAL;
 
     #[test]
     fn tiles_fade_in_on_their_own_grid() {
@@ -1317,7 +1531,7 @@ mod tests {
             planes: [glam::Vec4::W; 6],
         };
         let mut out = Vec::new();
-        tile.visible(FarKey::Tile(TileKey { x: 0, z: 0, level: 0 }), DVec3::ZERO, &all, now, &mut out);
+        tile.visible(FarKey::Tile(TileKey { x: 0, z: 0, level: 0 }), DVec3::ZERO, &all, now, None, &mut out);
         out
     }
     /// What terrain.wgsl's `faded` and `fade_depth` read back from a code: whether it is drawn in
@@ -1579,5 +1793,176 @@ mod tests {
         // Whatever stands 10% nearer hides the shell in every case.
         assert!([out, out_coarse, into_held].iter().all(|&shell| shell < nearer));
         assert!(plain < whole && plain_out < whole);
+    }
+
+    /// A far cube node standing whole is drawn again as a shell where a window of near cubes
+    /// meets it, one for each kind, and not where none does, nor while it fades in.
+    #[test]
+    fn a_cube_node_draws_a_shell_where_a_window_meets_it() {
+        use crate::lod::cube::CubeKey;
+        let t0 = Instant::now();
+        let all = Frustum {
+            planes: [glam::Vec4::W; 6],
+        };
+        let key = FarKey::Cube(CubeKey::new(3, 0, 0, 0));
+        let parts = |tile: &Tile, reveal: &Reveal| {
+            let mut out = Vec::new();
+            tile.visible(key, DVec3::ZERO, &all, t0, Some(reveal), &mut out);
+            out
+        };
+        let node = tile(None, None, t0);
+        let mut reveal = Reveal::default();
+        assert_eq!(parts(&node, &reveal).len(), 1, "no window: the node alone");
+        // A cube that came in at the node's corner: a shell dithering out, no water, over the
+        // node's own mesh, at its level.
+        reveal.open(DVec3::splat(4.0), DVec3::splat(20.0), t0, true);
+        let drawn = parts(&node, &reveal);
+        assert_eq!(drawn.len(), 2);
+        assert_eq!(drawn[1].fade, reveal::shell_code(3, true));
+        assert!(!drawn[1].water && drawn[1].shares_mesh && !drawn[1].testable);
+        assert!(drawn[0].fade == 0 && drawn[0].water);
+        // The kinds are separate shells.
+        reveal.open(DVec3::splat(4.0), DVec3::splat(20.0), t0, false);
+        let kinds: Vec<u32> = parts(&node, &reveal).iter().map(|v| v.fade).collect();
+        assert_eq!(kinds[1..], [reveal::shell_code(3, true), reveal::shell_code(3, false)]);
+        // Far from the node: none. While the node fades in, or goes alone: none.
+        let mut far = Reveal::default();
+        far.open(DVec3::splat(500.0), DVec3::splat(516.0), t0, true);
+        assert_eq!(parts(&node, &far).len(), 1);
+        let mut fading = tile(None, None, t0);
+        fading.shown = Some(t0);
+        assert_eq!(parts(&fading, &reveal).len(), 1);
+        let mut leaving = tile(None, None, t0);
+        leaving.dying = Some(t0);
+        leaving.alone = true;
+        assert_eq!(parts(&leaving, &reveal).len(), 1);
+        assert!(!leaving.whole(t0) && node.whole(t0));
+        // What terrain.wgsl reads back from the code.
+        let (_, level, out, _) = decode_front(reveal::shell_code(3, true));
+        assert!(reveal::shell_code(3, true) & REVEAL_BIT != 0 && level == 3 && out);
+        assert_eq!(reveal::shell_code(22, false) & !(REVEAL_BIT - 1), REVEAL_BIT);
+    }
+
+    /// terrain.wgsl's depth rule for cube shells (`REVEAL`): ahead of the cubes they dither
+    /// over by three eighths of a voxel of their own and a sliver of the distance, and no more:
+    /// a shell is closed, and a face inside it lies a voxel behind its surface at the least,
+    /// which must not win over a near surface (at most half a voxel behind the shell's, as
+    /// far terrain's coarse stand-in is off the real one) in the holes of its pattern: the cave
+    /// under the grass, seen through. Run on the GPU with the terrain shader's own function.
+    #[test]
+    fn a_cube_shell_does_not_show_what_lies_inside_it_through_its_holes() {
+        let t0 = Instant::now();
+        let node = |code: u32| instance([0.0; 3], code)[3];
+        let section = |fade: u32| super::super::section_instance([0.0; 3], fade, 1.0)[3];
+        let mut cases = Vec::new();
+        let grid: Vec<(u8, f32)> = (0u8..=8)
+            .flat_map(|level| [16.0f32, 64.0, 128.0, 200.0, 300.0].map(move |d| (level, d)))
+            .collect();
+        for &(level, d) in &grid {
+            let v = (1u32 << level) as f32;
+            // The shell's surface, a face a voxel inside it, and a section's at the same place.
+            for out in [true, false] {
+                cases.push((d, node(reveal::shell_code(level, out))));
+                cases.push((d + v, node(reveal::shell_code(level, out))));
+            }
+            cases.push((d, section(0)));
+            cases.push((d, section(HELD)));
+            // A section's surface half a voxel behind the shell's, or at once with it (level 0).
+            cases.push((d + 0.5 * v, section(0)));
+            cases.push((d + 0.5 * v, section(HELD)));
+            cases.push((d * 0.9, section(0)));
+        }
+        let Some(depth) = depths(&cases) else {
+            eprintln!("SKIP cube shell depth: no GPU");
+            return;
+        };
+        let _ = t0;
+        for (i, &(level, d)) in grid.iter().enumerate() {
+            let [out_top, out_in, in_top, in_inside, whole, held, whole_half, held_half, nearer] =
+                depth[i * 9..i * 9 + 9]
+            else {
+                unreachable!()
+            };
+            let v = (1u32 << level) as f32;
+            let what = format!("level {level} at {d}");
+            // Ahead of what it dithers over where the two are level: out over sections that
+            // came in whole, in over cubes held (2% ahead of far terrain).
+            assert!(out_top > whole, "{what}: {out_top} vs {whole}");
+            assert!(in_top > held, "{what}: {in_top} vs {held}");
+            // What stands clearly (10%) nearer than the shell hides it.
+            assert!(out_top < nearer && in_top < nearer, "{what}");
+            // Where the coarse surface is at most half a voxel off (none at level 0) and
+            // the shell's own distance is within what nodes of its level are drawn at (nodes
+            // split with distance: a voxel is at most 1/100 of it at the far detail setting that
+            // splits least), a face a voxel inside the
+            // shell does not win over the section's surface behind its top.
+            let off = if level == 0 { 0.0 } else { 0.5 * v };
+            if level == 0 || d >= 100.0 * v {
+                let (section_depth, held_depth) = if level == 0 { (whole, held) } else { (whole_half, held_half) };
+                assert!(out_in < section_depth, "{what} (v {v}, off {off}): {out_in} vs {section_depth}");
+                assert!(in_inside < held_depth, "{what} (v {v}, off {off}): {in_inside} vs {held_depth}");
+            }
+        }
+    }
+
+    /// A camera that keeps moving hands over jobs faster than they upload (a slow node source:
+    /// `CubeSampler::node` may answer later, so the meshes trickle in): the rule that waited
+    /// for nothing at all to be waiting never faded a node in or out until the backlog drained;
+    /// each job fades once it and the jobs before it are uploaded.
+    #[test]
+    fn cube_jobs_fade_as_they_complete_under_a_camera_that_keeps_moving() {
+        use crate::lod::cube::CubeKey;
+        let mut jobs = CubeJobs::default();
+        let mut queue = VecDeque::new();
+        let (mut frames_idle, mut shown, mut retired) = (0, 0, 0);
+        let mut next = 0;
+        // The nodes uploaded and not yet let go.
+        let mut standing: VecDeque<CubeKey> = VecDeque::new();
+        for _ in 0..100 {
+            // Five new nodes a frame, which replace the oldest standing five; four upload a frame.
+            let fresh: Vec<CubeKey> = (0..5)
+                .map(|_| {
+                    next += 1;
+                    CubeKey::new(0, next, 0, 0)
+                })
+                .collect();
+            let gone: Vec<CubeKey> = if standing.len() > 20 {
+                standing.drain(..5).collect()
+            } else {
+                Vec::new()
+            };
+            let job = jobs.queue(fresh.len(), &gone);
+            queue.extend(fresh.iter().map(|&key| (key, job)));
+            for _ in 0..4 {
+                if let Some((key, job)) = queue.pop_front() {
+                    jobs.uploaded(key, job, true);
+                    standing.push_back(key);
+                }
+            }
+            frames_idle += usize::from(queue.is_empty());
+            let (show, retire) = jobs.due();
+            shown += show.len();
+            retired += retire.len();
+        }
+        assert_eq!(frames_idle, 0, "the backlog never drains, so the old rule never fades");
+        assert!(shown >= 300, "{shown} nodes faded in while the camera moved");
+        assert!(retired >= 200, "{retired} nodes went");
+        // A job with a node still out holds its own fade and every later one: no hole.
+        let mut jobs = CubeJobs::default();
+        let a = CubeKey::new(0, 1, 0, 0);
+        let b = CubeKey::new(0, 2, 0, 0);
+        let old = CubeKey::new(1, 0, 0, 0);
+        let first = jobs.queue(2, &[]);
+        let second = jobs.queue(1, &[old]);
+        let c = CubeKey::new(0, 3, 0, 0);
+        jobs.uploaded(a, first, true);
+        assert_eq!(jobs.due(), (vec![], vec![]), "the first job is not whole");
+        jobs.uploaded(c, first, true);
+        let (mut show, retire) = jobs.due();
+        show.sort();
+        assert_eq!((show, retire), (vec![a, c], vec![]), "the second job still has a node out");
+        // The second, the last, has its node in: it fades in and what it replaces goes.
+        jobs.uploaded(b, second, true);
+        assert_eq!(jobs.due(), (vec![b], vec![old]));
     }
 }

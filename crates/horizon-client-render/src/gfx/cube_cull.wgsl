@@ -8,8 +8,12 @@
 
 const NODE_WORDS: u32 = 32u;
 const NOT_SET: u32 = 0xffffffffu;
-const FADE_MS: f32 = 600.0;
 const TILE_STEP: f32 = 0.03125;
+// Nodes the table holds (cube_far.rs `MAX_NODES`): a node's instance slots are its own and,
+// past that many each, a shell dithering out and a shell dithering in.
+const MAX_NODES: u32 = 262144u;
+// Added to a shell's fade code (terrain.wgsl's `REVEAL`).
+const REVEAL: u32 = 8192u;
 
 struct Frame {
     planes: array<vec4<f32>, 6>,
@@ -19,7 +23,13 @@ struct Frame {
     nodes: u32,
     // The sea's surface (sea level + 1), in blocks.
     water_top: i32,
-    pad1: u32,
+    // The fade time in ms (`lod::fade_time`).
+    fade_ms: u32,
+    // The windows near cubes come in and leave in (gfx/reveal.rs): per window the
+    // camera-relative box's low corner and how far along it is, then its high corner and 1
+    // when cubes came in. How many are set.
+    reveal: array<vec4<f32>, 128>,
+    reveal_count: vec4<u32>,
 }
 @group(0) @binding(0) var<uniform> frame: Frame;
 // Per node: origin xyz (blocks), level; shown ms, dying ms, flags (bit 0 live, bit 1 alone),
@@ -32,7 +42,7 @@ struct Frame {
 @group(0) @binding(5) var<storage, read_write> counts: array<atomic<u32>, 2>;
 
 fn elapsed(now: u32, since: u32) -> f32 {
-    return f32(select(0u, now - since, now > since)) / FADE_MS;
+    return f32(select(0u, now - since, now > since)) / f32(frame.fade_ms);
 }
 fn fade_in(shown: u32, level: u32, now: u32) -> u32 {
     let step = u32(elapsed(now, shown) * 64.0) + 1u;
@@ -92,13 +102,51 @@ fn cull_main(@builtin(global_invocation_id) id: vec3<u32>) {
     instances[node * 2u + 1u] = vec4<f32>(f32(1u << level), f32(water), 0.0, 0.0);
     // The camera sits at the origin: a direction shows only when it can face it.
     // Down, Up, North, South, West, East.
-    var front = array<bool, 6>(
-        0.0 < hi.y, 0.0 > lo.y, 0.0 < hi.z, 0.0 > lo.z, 0.0 < hi.x, 0.0 > lo.x);
+    var front = 0u;
+    front |= select(0u, 1u, 0.0 < hi.y);
+    front |= select(0u, 2u, 0.0 > lo.y);
+    front |= select(0u, 4u, 0.0 < hi.z);
+    front |= select(0u, 8u, 0.0 > lo.z);
+    front |= select(0u, 16u, 0.0 < hi.x);
+    front |= select(0u, 32u, 0.0 > lo.x);
+    emit(base, node, front, 3u);
+    // A node standing whole is drawn again, a shell, where near cubes come in or leave in
+    // front of it: one for each kind, at its own depth (terrain.wgsl's `fade_depth`).
+    if code == 0u && frame.reveal_count.x > 0u {
+        let margin = vec3<f32>(f32(min(1u << level, 4u)));
+        var kinds = 0u;
+        for (var i = 0u; i < min(frame.reveal_count.x, 64u); i++) {
+            let a = frame.reveal[i * 2u];
+            let b = frame.reveal[i * 2u + 1u];
+            if all(lo <= b.xyz + margin) && all(hi >= a.xyz - margin) {
+                kinds |= select(2u, 1u, b.w > 0.5);
+            }
+        }
+        for (var kind = 0u; kind < 2u; kind++) {
+            if (kinds & (1u << kind)) == 0u {
+                continue;
+            }
+            let out = kind == 0u;
+            let shell_code = REVEAL + 1u + level * 129u + select(0u, 64u, out);
+            let slot = MAX_NODES * (1u + kind) + node;
+            instances[slot * 2u] = vec4<f32>(lo, -(f32(shell_code) + TILE_STEP));
+            instances[slot * 2u + 1u] = vec4<f32>(f32(1u << level), f32(water), 0.0, 0.0);
+            emit(base, slot, front, 1u);
+        }
+    }
+}
+
+// Appends the node's draws for the directions in `front`: its solid pass, and its water
+// when `passes` has bit 1 (a shell has none: the mesh drawn whole has the same).
+fn emit(base: u32, slot: u32, front: u32, passes: u32) {
     for (var dir = 0u; dir < 6u; dir++) {
-        if !front[dir] {
+        if (front & (1u << dir)) == 0u {
             continue;
         }
         for (var pass_ = 0u; pass_ < 2u; pass_++) {
+            if (passes & (1u << pass_)) == 0u {
+                continue;
+            }
             let first = nodes[base + 8u + (dir * 2u + pass_) * 2u];
             let count = nodes[base + 9u + (dir * 2u + pass_) * 2u];
             if count == 0u {
@@ -107,15 +155,21 @@ fn cull_main(@builtin(global_invocation_id) id: vec3<u32>) {
             let draw = atomicAdd(&counts[pass_], 1u);
             let at = draw * 4u;
             if pass_ == 0u {
+                if draw >= frame.nodes * 12u {
+                    continue;
+                }
                 solid_args[at] = count * 6u;
                 solid_args[at + 1u] = 1u;
                 solid_args[at + 2u] = first * 6u;
-                solid_args[at + 3u] = node;
+                solid_args[at + 3u] = slot;
             } else {
+                if draw >= frame.nodes * 6u {
+                    continue;
+                }
                 translucent_args[at] = count * 6u;
                 translucent_args[at + 1u] = 1u;
                 translucent_args[at + 2u] = first * 6u;
-                translucent_args[at + 3u] = node;
+                translucent_args[at + 3u] = slot;
             }
         }
     }

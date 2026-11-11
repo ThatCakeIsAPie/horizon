@@ -213,6 +213,7 @@ mod displace;
 pub mod lightning;
 mod lod;
 mod native_material;
+mod reveal;
 mod native_pack;
 mod native_post;
 pub mod native_render;
@@ -476,6 +477,9 @@ struct Globals {
     /// (`Hdr::draw_params`).
     hdr_settings: [f32; 4],
     hdr_shares: [f32; 4],
+    /// The windows far cube shells dither in, per window two vec4 (`reveal::Table`).
+    reveal: [[f32; 4]; 2 * reveal::MAX_WINDOWS],
+    reveal_count: [u32; 4],
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1408,8 +1412,16 @@ pub struct Renderer {
     hold: hold::Hold<HeldMesh>,
     /// Finished tile meshes `upload_lods` has yet to upload.
     lod_pending: Option<lod::Pending>,
+    /// When the nodes of `lod_cubes` fade in and out (`lod::CubeJobs`).
+    cube_jobs: lod::CubeJobs,
     /// Fade counters (`HORIZON_FADE_STATS`).
     fade_stats: lod::FadeStats,
+    /// The windows in which far cube nodes dither in front of near cubes that come in or
+    /// leave (`open_cube_window`).
+    reveal: reveal::Reveal,
+    /// Removed cubes' columns held whole until far nodes cover them (`hold_cube_columns`),
+    /// with when they were removed.
+    cube_held: FxHashMap<(i32, i32), std::time::Instant>,
     detail_columns: FxHashMap<(i32, i32), SectionMask>,
     /// Bumped whenever a column becomes or stops being complete.
     detail_revision: u64,
@@ -5293,7 +5305,10 @@ impl Renderer {
             lod_leaving: Vec::new(),
             hold: Default::default(),
             lod_pending: None,
+            cube_jobs: Default::default(),
             fade_stats: lod::FadeStats::from_env(),
+            reveal: Default::default(),
+            cube_held: FxHashMap::default(),
             detail_columns: Default::default(),
             detail_revision: 0,
             arena,
@@ -6019,6 +6034,13 @@ impl Renderer {
                 self.open_window((key.0, key.2), now, true);
                 Some(now)
             }
+            // New over far cube nodes: whole too, with a shell to dither in front of it
+            // where a node stands (`Renderer::open_cube_window`), else it fades in as
+            // vanilla's chunks do.
+            None if self.cubic_far() => {
+                let now = std::time::Instant::now();
+                self.open_cube_window(key, now, true).map(|_| now)
+            }
             None => None,
         };
         if fading.is_none() && !self.section_uploaded.contains_key(&key) {
@@ -6068,6 +6090,13 @@ impl Renderer {
         self.detail_columns
             .get(&(key.0, key.2))
             .is_some_and(|mask| mask.contains(key.1 as usize))
+    }
+    /// Whether the cube at absolute section position `pos` is on screen, or this renderer does
+    /// not hold its place (`shown`): far cube nodes stay over a cube until it is
+    /// (`Renderer::open_cube_window`).
+    pub fn cube_shown(&self, [x, y, z]: [i32; 3]) -> bool {
+        let y = y - (self.layout.min_y() >> 4);
+        usize::try_from(y).map_or(true, |y| y >= self.layout.sections() || self.shown((x, y as i32, z)))
     }
     /// The bytes a section's quads take in the arenas.
     fn mesh_bytes(gpu: Option<&SectionGpu>) -> u64 {
@@ -7035,7 +7064,11 @@ impl Renderer {
                 self.detail_revision += 1;
             }
             self.occlusion.remove_column(x, z);
-            let retiring = !self.lod_cutout.is_empty() && self.lod_cutout.contains(&(x, z));
+            let cutout = !self.lod_cutout.is_empty() && self.lod_cutout.contains(&(x, z));
+            // Far cube nodes draw it: its cubes are held, whole, until nodes stand whole
+            // under them and dither in (`Renderer::release_held_cubes`).
+            let for_nodes = !cutout && self.lods.is_empty() && self.cubic_far();
+            let retiring = cutout || for_nodes;
             let mut window = None;
             for sy in 0..self.layout.sections() as i32 {
                 let key = (x, sy, z);
@@ -7046,9 +7079,12 @@ impl Renderer {
                     self.light_revision += 1;
                 }
                 self.section_uploaded.remove(&key);
-                if retiring {
+                if retiring && (!for_nodes || self.sections.contains(key)) {
                     // Distant tiles still leave its column out: drawn until they don't.
                     self.lod_retiring.insert(key);
+                    if for_nodes {
+                        self.cube_held.entry((x, z)).or_insert(now);
+                    }
                     if let Some(gpu) = &mut self.gpu_culling {
                         hold_fading(&mut self.sections, &mut gpu.records, key);
                     }
@@ -8545,6 +8581,9 @@ impl Renderer {
                 },
             )
         };
+        let reveal_table = self
+            .reveal
+            .table(frame.camera, std::time::Instant::now(), lod::fade_time());
         let globals = Globals {
             view_proj: jittered.to_cols_array_2d(),
             fog_color,
@@ -8642,6 +8681,8 @@ impl Renderer {
             ],
             hdr_settings,
             hdr_shares,
+            reveal: reveal_table.boxes,
+            reveal_count: reveal_table.count,
         };
         self.uploads
             .buffer(&mut encoder, &self.globals, 0, bytemuck::bytes_of(&globals));
@@ -8861,7 +8902,7 @@ impl Renderer {
         if !frame.title
             && let Some(far) = &mut self.cube_far
         {
-            far.prepare(&mut encoder, camera, view.planes);
+            far.prepare(&mut encoder, camera, view.planes, &reveal_table);
         }
         if !frame.title
             && let Some(tiles) = &mut self.surface_tiles
@@ -8908,10 +8949,17 @@ impl Renderer {
             visible.clear();
         } else {
             for (&key, tile) in &self.lods {
-                tile.visible(lod::FarKey::Tile(key), camera, &view, now, &mut visible_lods);
+                tile.visible(lod::FarKey::Tile(key), camera, &view, now, None, &mut visible_lods);
             }
             for (&key, tile) in &self.lod_cubes {
-                tile.visible(lod::FarKey::Cube(key), camera, &view, now, &mut visible_lods);
+                tile.visible(
+                    lod::FarKey::Cube(key),
+                    camera,
+                    &view,
+                    now,
+                    Some(&self.reveal),
+                    &mut visible_lods,
+                );
             }
             visible_lods.sort_unstable_by_key(|v| (v.distance, v.key));
             if self.fade_stats.on() {
@@ -8921,7 +8969,7 @@ impl Renderer {
                     .cube_far
                     .as_mut()
                     .map(|far| (far.fading_nodes(), far.take_fade_events()));
-                self.fade_stats.frame(&visible_lods, gpu, open);
+                self.fade_stats.frame(&visible_lods, gpu, open, self.reveal.len() as u32);
             }
         }
         let mut shadow_visible = std::mem::take(&mut self.shadow_visible);
