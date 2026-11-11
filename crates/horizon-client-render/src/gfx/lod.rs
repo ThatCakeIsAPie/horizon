@@ -638,6 +638,7 @@ impl Tile {
         // the two lie at different depths (terrain.wgsl's `fade_depth`).
         if let Some(reveal) = reveal
             && fade == 0
+            && level <= reveal::MAX_SHELL_LEVEL
             && !reveal.is_empty()
         {
             let lo = DVec3::from(key.origin().map(f64::from));
@@ -1299,6 +1300,11 @@ impl Renderer {
     /// Whether the far cube node over section `key`'s place stands whole at `now`: `Some`
     /// with that, or `None` where no node is drawn there.
     fn cube_cover(&self, key: super::SectionKey, now: Instant) -> Option<bool> {
+        self.cube_cover_level(key, now).0
+    }
+
+    /// `cube_cover`, and the level of the node standing whole there, if one does.
+    fn cube_cover_level(&self, key: super::SectionKey, now: Instant) -> (Option<bool>, Option<u8>) {
         let pos = horizon_core::position::SectionPos {
             x: key.0,
             y: (self.layout.min_y() >> 4) + key.1,
@@ -1315,12 +1321,12 @@ impl Renderer {
                 .or_else(|| self.cube_far.as_ref()?.cover(node));
             match whole {
                 // (a node standing whole over it, whatever finer ones came in meanwhile)
-                Some(true) => return Some(true),
+                Some(true) => return (Some(true), Some(level)),
                 Some(false) => cover = Some(false),
                 None => {}
             }
         }
-        cover
+        (cover, None)
     }
 
     /// A cube at section `key` comes in (`out`) or leaves, over a far cube node that
@@ -1334,8 +1340,11 @@ impl Renderer {
         now: Instant,
         out: bool,
     ) -> Option<Instant> {
-        let cover = self.cube_cover(key, now);
-        let shell = cover == Some(true) && !reveal_off();
+        let (cover, level) = self.cube_cover_level(key, now);
+        // (a node too coarse to look like the terrain has no shell: the cube is whole at once)
+        let shell = cover == Some(true)
+            && level.is_some_and(|level| level <= reveal::MAX_SHELL_LEVEL)
+            && !reveal_off();
         self.fade_stats.cubes[usize::from(!out) * 3 + cover.map_or(1, |whole| usize::from(!whole) * 2)] += 1;
         if !shell {
             return None;
@@ -1811,7 +1820,7 @@ mod tests {
         let all = Frustum {
             planes: [glam::Vec4::W; 6],
         };
-        let key = FarKey::Cube(CubeKey::new(3, 0, 0, 0));
+        let key = FarKey::Cube(CubeKey::new(2, 0, 0, 0));
         let parts = |tile: &Tile, reveal: &Reveal| {
             let mut out = Vec::new();
             tile.visible(key, DVec3::ZERO, &all, t0, Some(reveal), &mut out);
@@ -1825,13 +1834,19 @@ mod tests {
         reveal.open(DVec3::splat(4.0), DVec3::splat(20.0), t0, true);
         let drawn = parts(&node, &reveal);
         assert_eq!(drawn.len(), 2);
-        assert_eq!(drawn[1].fade, reveal::shell_code(3, true));
+        assert_eq!(drawn[1].fade, reveal::shell_code(2, true));
         assert!(!drawn[1].water && drawn[1].shares_mesh && !drawn[1].testable);
         assert!(drawn[0].fade == 0 && drawn[0].water);
         // The kinds are separate shells.
         reveal.open(DVec3::splat(4.0), DVec3::splat(20.0), t0, false);
         let kinds: Vec<u32> = parts(&node, &reveal).iter().map(|v| v.fade).collect();
-        assert_eq!(kinds[1..], [reveal::shell_code(3, true), reveal::shell_code(3, false)]);
+        assert_eq!(kinds[1..], [reveal::shell_code(2, true), reveal::shell_code(2, false)]);
+        // Nodes coarser than `MAX_SHELL_LEVEL` get no shell: it would be a slab in front of the
+        // terrain it hands over to.
+        let coarse = FarKey::Cube(CubeKey::new(reveal::MAX_SHELL_LEVEL + 1, 0, 0, 0));
+        let mut out = Vec::new();
+        node.visible(coarse, DVec3::ZERO, &all, t0, Some(&reveal), &mut out);
+        assert_eq!(out.len(), 1, "a coarse node draws alone");
         // Far from the node: none. While the node fades in, or goes alone: none.
         let mut far = Reveal::default();
         far.open(DVec3::splat(500.0), DVec3::splat(516.0), t0, true);
@@ -1845,8 +1860,8 @@ mod tests {
         assert_eq!(parts(&leaving, &reveal).len(), 1);
         assert!(!leaving.whole(t0) && node.whole(t0));
         // What terrain.wgsl reads back from the code.
-        let (_, level, out, _) = decode_front(reveal::shell_code(3, true));
-        assert!(reveal::shell_code(3, true) & REVEAL_BIT != 0 && level == 3 && out);
+        let (_, level, out, _) = decode_front(reveal::shell_code(2, true));
+        assert!(reveal::shell_code(2, true) & REVEAL_BIT != 0 && level == 2 && out);
         assert_eq!(reveal::shell_code(22, false) & !(REVEAL_BIT - 1), REVEAL_BIT);
     }
 

@@ -14,6 +14,8 @@ const TILE_STEP: f32 = 0.03125;
 const MAX_NODES: u32 = 262144u;
 // Added to a shell's fade code (terrain.wgsl's `REVEAL`).
 const REVEAL: u32 = 8192u;
+// The coarsest node level that gets a shell (gfx/reveal.rs's `MAX_SHELL_LEVEL`, keep equal).
+const MAX_SHELL_LEVEL: u32 = 2u;
 
 struct Frame {
     planes: array<vec4<f32>, 6>,
@@ -112,7 +114,7 @@ fn cull_main(@builtin(global_invocation_id) id: vec3<u32>) {
     emit(base, node, front, 3u);
     // A node standing whole is drawn again, a shell, where near cubes come in or leave in
     // front of it: one for each kind, at its own depth (terrain.wgsl's `fade_depth`).
-    if code == 0u && frame.reveal_count.x > 0u {
+    if code == 0u && level <= MAX_SHELL_LEVEL && frame.reveal_count.x > 0u {
         let margin = vec3<f32>(f32(min(1u << level, 4u)));
         var kinds = 0u;
         for (var i = 0u; i < min(frame.reveal_count.x, 64u); i++) {
