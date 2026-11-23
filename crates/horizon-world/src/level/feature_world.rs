@@ -22,7 +22,7 @@ pub(crate) struct LevelFeatureWorld<'s, 'a, L: LevelAccess + ?Sized> {
     pub features: &'s LiveFeatures,
     /// The entities a structure template placed (`add_entity`), for the caller
     /// to spawn.
-    pub entities: Vec<crate::nbt::Compound>,
+    pub entities: Vec<horizon_core::nbt::Compound>,
     /// Population of a cube (`cubic::custom::vegetation`): whether the biome
     /// at a position has the root feature being placed (the `biome`
     /// placement modifier), and the surface blocks' Y range a heightmap may
@@ -46,7 +46,7 @@ fn pos([x, y, z]: [i32; 3]) -> BlockPos {
 
 impl<L: LevelAccess + ?Sized> LevelFeatureWorld<'_, '_, L> {
     fn sea(&self) -> i32 {
-        super::vanilla_sea_level(self.sim.level.level_key())
+        self.sim.level.sea_level()
     }
     fn in_tag(&self, state: BlockStateId, tag: &str) -> bool {
         let name = tag.trim_start_matches('#');
@@ -81,12 +81,12 @@ impl<L: LevelAccess + ?Sized> PlacementContext for LevelFeatureWorld<'_, '_, L> 
     fn set_block_entity(
         &mut self,
         position: [i32; 3],
-        nbt: crate::nbt::Compound,
+        nbt: horizon_core::nbt::Compound,
     ) -> Result<(), PlacementQueryError> {
         self.sim.level.load_block_entity(pos(position), nbt);
         Ok(())
     }
-    fn add_entity(&mut self, nbt: crate::nbt::Compound) -> Result<(), PlacementQueryError> {
+    fn add_entity(&mut self, nbt: horizon_core::nbt::Compound) -> Result<(), PlacementQueryError> {
         self.entities.push(nbt);
         Ok(())
     }
@@ -452,6 +452,7 @@ mod dungeon_spawner_default_tests {
         random: LegacyRandom,
         loads: usize,
     }
+    impl crate::level::BlockEntityNeighbors for Unbound {}
     impl LevelAccess for Unbound {
         fn block_state(&self, _: BlockPos) -> BlockStateId {
             BlockStateId(0)
@@ -468,7 +469,7 @@ mod dungeon_spawner_default_tests {
         fn game_time(&self) -> i64 {
             0
         }
-        fn load_block_entity(&mut self, _: BlockPos, _: crate::nbt::Compound) {
+        fn load_block_entity(&mut self, _: BlockPos, _: horizon_core::nbt::Compound) {
             self.loads += 1;
         }
     }

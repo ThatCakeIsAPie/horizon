@@ -3,9 +3,13 @@
 Small items Horizon players wear: a hat, something on the back, a shirt, a pet on the shoulder, a
 style for their name tag. They are drawn by Horizon clients only and change nothing in the game.
 **On by default** (Ludovic, 2026-11-04: on when the shop opens), your own shown. Other players'
-show by default only if your account owns a cosmetic: a player who owns none sees a vanilla game,
-and the game asks the service nothing about other players (CONTRIBUTING.md: Horizon-only features
-that change the look are off by default). The settings below change both.
+show by default only if your account owns a cosmetic: a player who owns none sees no cosmetics
+(CONTRIBUTING.md: Horizon-only features that change the look are off by default). The settings
+below change both. The game sends the UUIDs of the players it draws or lists to the cosmetics
+service unless both *Horizon logos* and *Other players' cosmetics* are off (*Hidden*): the logos
+setting looks them up to learn who plays Horizon ([Horizon players' mark](#horizon-players-mark)),
+and *Shown* or *Name tags* looks them up for what they wear. *Horizon logos* is on by default, so by
+default the game asks, whether or not your account owns a cosmetic.
 
 ## Rules
 
@@ -304,6 +308,11 @@ same cached `/v1/worn` answers as what they wear (no request of its own, nothing
     know, so in single player (open to LAN too) the game draws and asks nothing for the player's
     own model. On, it asks by the signed-in account's UUID: their cosmetics, their name tag style
     (with *Own name tag*) and Horizon's mark show in their own worlds. Offline accounts: nothing.
+  - **Offline-mode servers** (#12820): such a server names the player by `nameUUIDFromBytes` of
+    their name (a version 3 UUID), which the service doesn't know, so the game asks for the
+    player's own model by the signed-in account's UUID, as on an online server; *My cosmetics*
+    decides, with no setting of its own. Only the own model: on an offline server anyone can take
+    any name, so other players are still asked by the UUID the server gives them.
 - **Name tag styles** (`game/names.rs`): the badge, 8 text pixels square, after the name and a
   one-pixel line in the style's colour under the name's background, in the name tag's own pass
   (the badge is in the atlas like the other items' textures). Horizon's mark goes before the name.
