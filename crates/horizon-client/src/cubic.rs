@@ -2311,7 +2311,7 @@ mod tests {
         fn new(name: &str) -> Option<Self> {
             let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES")?);
             let assets = crate::assets::Assets::load(&root).expect("assets");
-            let biomes = Arc::new(Biomes::load(&root).expect("biomes"));
+            let biomes = Arc::new(Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(root.clone())).expect("biomes"));
             let tables = Arc::new(SaveTables::new(&assets));
             let dir = std::env::temp_dir().join(format!(
                 "horizon-cubic-{name}-{}-{:?}",
@@ -2906,8 +2906,8 @@ mod tests {
         one.set(5, 71, 5, f.state("minecraft:bell"));
         let root = ctx.encode(&one, 0, false, &[]);
         let loaded = ctx.decode(&root, 4).expect("decodes");
-        let poi = crate::save::encode_poi(&loaded, &f.tables).expect("the bell is a POI");
-        let again = crate::save::encode_poi(&one, &f.tables).unwrap();
+        let poi = crate::save::encode_poi(&loaded, &f.tables, None).expect("the bell is a POI");
+        let again = crate::save::encode_poi(&one, &f.tables, None).unwrap();
         assert_eq!(poi, again);
     }
 

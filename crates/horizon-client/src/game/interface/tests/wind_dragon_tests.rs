@@ -10,7 +10,7 @@ fn end_game<'a>(resources: &'a mut Option<std::sync::Arc<crate::game::Resources>
     game.set_allow_commands(true);
     assert_eq!(
         game.enter_command_level(crate::game::Dim::End),
-        Some(crate::game::Dim::Overworld)
+        Some(crate::game::Dim::Overworld.into())
     );
     assert!(game.dimension_type().has_ender_dragon_fight, "the End");
     for x in -1..2 {

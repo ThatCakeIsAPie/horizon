@@ -43,7 +43,7 @@ fn end_game() -> Game<'static> {
     .unwrap();
     game.build_registries();
     game.set_allow_commands(true);
-    assert_eq!(game.enter_command_level(Dim::End), Some(Dim::Overworld));
+    assert_eq!(game.enter_command_level(Dim::End), Some(Dim::Overworld.into()));
     assert!(game.dimension_type().has_ender_dragon_fight, "the End");
     game
 }

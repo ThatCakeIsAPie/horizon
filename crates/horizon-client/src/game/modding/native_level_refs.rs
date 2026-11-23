@@ -1940,7 +1940,7 @@ mod tests {
             let level = game.level(game.dim.id()).unwrap();
             let chunk = game.level_chunk_ref(level, [5, 6]).unwrap();
             assert!(game.chunk_set_forced(chunk, true));
-            assert!(game.levels_to_tick().contains(&game.dim));
+            assert!(game.levels_to_tick().contains(&(game.dim, 0)));
             game.save_chunk_tickets().unwrap();
             assert!(game.save.load_forced_chunks().contains(&(5, 6)));
             assert!(game.chunk_set_forced(chunk, false));
@@ -1985,9 +1985,9 @@ mod tests {
             assert_eq!(game.dim, back, "forcing must not switch the acting level");
             assert_eq!(game.level_forced_chunks(parked), Some(vec![[1, 1]]));
             assert_eq!(game.level_forced_chunks(level), Some(vec![]));
-            assert!(game.levels_to_tick().contains(&other));
+            assert!(game.levels_to_tick().contains(&(other, 0)));
             assert!(game.chunk_set_forced(chunk, false));
-            assert!(!game.levels_to_tick().contains(&other));
+            assert!(!game.levels_to_tick().contains(&(other, 0)));
         });
     }
 
@@ -2525,11 +2525,11 @@ mod tests {
             let chunk = ChunkRef::new(parked, [2, 2]);
             let _guard = in_mod("machines");
             let owner = mod_api::TicketOwner::Block([32, 64, 32]);
-            assert!(!game.levels_to_tick().contains(&other));
+            assert!(!game.levels_to_tick().contains(&(other, 0)));
             assert!(game.chunk_set_mod_forced(chunk, quarry(), owner, true, false));
-            assert!(game.levels_to_tick().contains(&other));
+            assert!(game.levels_to_tick().contains(&(other, 0)));
             assert!(game.chunk_set_mod_forced(chunk, quarry(), owner, false, false));
-            assert!(!game.levels_to_tick().contains(&other));
+            assert!(!game.levels_to_tick().contains(&(other, 0)));
         });
     }
 
@@ -2606,7 +2606,7 @@ mod tests {
             // Both kinds load and tick: they are forced chunks.
             assert!(game.streaming.forced.contains(&(11, 12)));
             assert!(game.streaming.forced.contains(&(13, 12)));
-            assert!(game.levels_to_tick().contains(&game.dim));
+            assert!(game.levels_to_tick().contains(&(game.dim, 0)));
             assert_eq!(
                 game.level_mod_forced_chunks(level, quarry()),
                 Some(vec![(owner, [11, 12], false), (owner, [13, 12], true)])
@@ -2780,7 +2780,7 @@ mod tests {
                 let parked = game.levels.parked_streaming_of(other.id()).unwrap();
                 assert!(!parked.forced.contains(&(7, 7)));
                 assert!(parked.forced.contains(&(8, 8)));
-                assert!(game.levels_to_tick().contains(&other));
+                assert!(game.levels_to_tick().contains(&(other, 0)));
                 let _ = std::fs::remove_dir_all(&world);
             });
         });

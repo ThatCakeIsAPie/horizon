@@ -67,7 +67,7 @@ fn infiniburn_refresh_updates_active_and_parked_worlds() {
                     [member.to_owned()].into_iter().collect(),
                 );
             game.refresh_infiniburn();
-            let parked_world = &game.levels.parked.get(&Dim::Nether).unwrap().world;
+            let parked_world = &game.levels.parked.get(&(Dim::Nether, 0)).unwrap().world;
             for world in [&game.world, parked_world] {
                 let set = world.infiniburn.as_deref().expect("resolved level tag");
                 assert_eq!(
