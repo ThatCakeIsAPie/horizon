@@ -847,7 +847,7 @@ impl Game<'_> {
         }
         let mut parked = self.open_level(dim)?;
         parked.world.game_time = self.world.game_time;
-        self.levels.parked.insert(dim, parked);
+        self.levels.parked.insert((dim, parked.shard), parked);
         self.levels.runtime.mark_open(id);
         self.native_level_opened(dim);
         Ok(())
@@ -864,7 +864,7 @@ impl Game<'_> {
             self.enter_level(Dim::Overworld)?;
         }
         // A level the idle close already saved and dropped is only forgotten.
-        if self.levels.parked.contains_key(&dim)
+        if self.levels.primary_key(dim).is_some()
             && let Err(why) = self.close_parked_level(dim)
         {
             // The level stays as it was, and in place if it was.

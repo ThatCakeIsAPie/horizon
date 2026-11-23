@@ -220,11 +220,9 @@ impl ViewedWorld {
     /// world keeps is bounded by its columns' block-entity blocks.
     pub(super) fn block_entity_data(&mut self, p: play::BlockEntityData, entity_block: bool) {
         let [x, y, z] = p.pos;
-        let Ok(y16) = i16::try_from(y) else {
-            return;
-        };
+        // Cubic: a block entity's Y is wide (no height limit).
         let packed_xz = ((x & 15) << 4 | (z & 15)) as i8;
-        let at = |info: &BlockEntityInfo| info.packed_xz == packed_xz && info.y == y16;
+        let at = |info: &BlockEntityInfo| info.packed_xz == packed_xz && info.y == y;
         let column = (x >> 4, z >> 4);
         if !self.world.chunks.contains_key(&column) {
             return;
@@ -232,7 +230,7 @@ impl ViewedWorld {
         let infos = self.block_entities.entry(column).or_default();
         let info = BlockEntityInfo {
             packed_xz,
-            y: y16,
+            y,
             kind: p.kind,
             tag: p.tag,
         };

@@ -98,7 +98,8 @@ impl Game<'_> {
             self.enter_level(hold)?;
         }
         for dim in VANILLA {
-            if self.levels.parked.contains_key(&dim) {
+            // Every shard of a cubic Overworld goes, primary first.
+            while self.levels.primary_key(dim).is_some() {
                 self.discard_parked_level(dim)?;
             }
         }
@@ -160,7 +161,9 @@ impl Game<'_> {
             self.entity_attachments.remove(id);
         }
         self.enter_level(back)?;
-        self.levels.parked.remove(&dim);
+        if let Some(key) = self.levels.primary_key(dim) {
+            self.levels.parked.remove(&key);
+        }
         self.native_level_closed(dim);
         Ok(())
     }

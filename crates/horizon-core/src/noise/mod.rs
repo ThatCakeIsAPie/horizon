@@ -56,6 +56,11 @@ impl GradientTable {
     pub fn permutations(&self) -> &[u8; 256] {
         &self.permutations
     }
+
+    /// One permutation lookup, for Cubic's column sampler (`get3_column`).
+    fn permute(&self, index: i32) -> i32 {
+        i32::from(self.permutations[(index & 255) as usize])
+    }
 }
 
 // Perlin's 16-direction table includes four repeated directions. Simplex uses

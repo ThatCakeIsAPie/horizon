@@ -1535,10 +1535,10 @@ pub fn relight_entering(
         extend_sky_source(&mut region, tables, p, &mut sky_queue, changed);
     }
     crate::spans::time("lt_slide_sky", || {
-        increase_pass(&mut region, tables, true, sky_queue, changed)
+        increase_pass(&mut region, tables, true, &mut sky_queue, changed)
     });
     crate::spans::time("lt_slide_block", || {
-        increase_pass(&mut region, tables, false, block_seeds.into(), changed)
+        increase_pass(&mut region, tables, false, &mut block_seeds.into(), changed)
     });
     region.finish();
 }
@@ -1944,7 +1944,7 @@ fn increase_pass(
     world: &mut Region,
     tables: &LightTables,
     sky: bool,
-    mut increase: VecDeque<Pos>,
+    increase: &mut VecDeque<Pos>,
     changed: &mut LightChanges,
 ) {
     while let Some(p) = increase.pop_front() {

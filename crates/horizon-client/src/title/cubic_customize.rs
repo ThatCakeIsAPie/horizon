@@ -2079,6 +2079,7 @@ pub(super) fn buttons(w: f32, h: f32, state: &State) -> Vec<Button> {
         icon: None,
         trailing: None,
         action: None,
+        agent_id: None,
     };
     let row = |specs: Vec<(&str, bool, u8)>, width: f32| {
         let total = specs.len() as f32 * (width + 4.0) - 4.0;

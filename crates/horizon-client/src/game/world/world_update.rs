@@ -471,8 +471,8 @@ impl Game<'_> {
                 });
             }
             if let (Some(cube_lod), Some(player)) = (&mut self.cube_lod, &self.player) {
-                let lod_distance =
-                    horizon_client::graphics::lod_distance_capped(far_distance, &renderer.info);
+                // Upstream dropped the integrated-GPU cap (#19678): the distance as set.
+                let lod_distance = far_distance.min(horizon_client::lod::MAX_CHUNKS);
                 let camera = [player.position.x, player.position.y, player.position.z];
                 let world = &self.world;
                 let shape = world.shape;

@@ -218,7 +218,12 @@ impl Game<'_> {
         if registry == "minecraft:dimension" {
             return identifiers(
                 std::iter::once(self.dim.id())
-                    .chain(self.levels.parked.keys().map(|dimension| dimension.id())),
+                    .chain(
+                        (self.levels.parked.keys())
+                            // One name per dimension: a cubic Overworld's shards share it.
+                            .filter(|k| k.0 != self.dim && self.levels.primary_key(k.0) == Some(**k))
+                            .map(|k| k.0.id()),
+                    ),
             );
         }
         if registry == "minecraft:trial_spawner" {

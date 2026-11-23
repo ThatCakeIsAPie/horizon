@@ -176,6 +176,8 @@ macro_rules! server_ctx {
         }
     }};
 }
+/// For Cubic's shard moves (`game/world/cubic.rs`).
+pub(in crate::game) use server_ctx;
 
 /// The vehicle `id` leaves the level it is in, at the point its rider
 /// arrives. It keeps its entity id, so the ride is never broken.
@@ -1499,14 +1501,14 @@ impl Game<'_> {
             return;
         }
         for t in std::mem::take(&mut self.level_teleports) {
+            let source = self.dim;
+            let back = self.here();
             let Some(host) = self.lan.as_mut() else {
                 return;
             };
             let Some(i) = host.hub.guests.iter().position(|g| g.conn == t.conn) else {
                 continue;
             };
-            let source = self.dim;
-            let back = self.here();
             if t.dim != source {
                 drop_hook(host, t.conn);
             }

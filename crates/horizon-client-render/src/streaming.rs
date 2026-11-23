@@ -1624,7 +1624,11 @@ impl Streaming {
             self.light_snapshots.remove(key);
         }
         self.generation_scan.invalidate();
-        self.forget_columns(world, columns)
+        let chunks = (columns.iter())
+            .filter_map(|column| world.chunks.remove(column))
+            .collect();
+        self.forget_columns(world, columns);
+        chunks
     }
     /// Queue a job for the column `at`, nearest first: its distance (`distance`)
     /// times four plus `bias`, which orders a column's jobs. A job without a

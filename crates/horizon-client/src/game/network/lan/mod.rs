@@ -3056,10 +3056,10 @@ impl Game<'_> {
             }
         }
         // A server places each player in their own level (`PlayerList.placeNewPlayer`).
+        let back = self.here();
         let Some(host) = self.lan.as_mut() else {
             return;
         };
-        let back = self.here();
         let Some((level, mut elsewhere)) = host.hub.update_guest(conn, |g| {
             let level = super::Dim::from_id(&g.dimension);
             let elsewhere = level != back.dim;

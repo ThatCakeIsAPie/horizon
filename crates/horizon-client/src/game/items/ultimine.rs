@@ -625,7 +625,14 @@ impl Game<'_> {
             if !self.ultimine_may_continue(&tool, 1, &config) {
                 break;
             }
-            if self.use_block_transformer(&stack, pos, face)? {
+            // The clicked face's centre on each block, as a click there would hit it.
+            let hit = super::Hit {
+                pos,
+                face,
+                point: std::array::from_fn(|i| f64::from(pos[i]) + 0.5 + f64::from(face[i]) * 0.5),
+                inside: false,
+            };
+            if self.use_block_transformer(&stack, &hit)? {
                 self.ultimine_exhaust(config.exhaustion());
             }
         }

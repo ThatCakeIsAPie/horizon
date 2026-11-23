@@ -98,11 +98,11 @@ impl Game<'_> {
             Some(d) => (d.to.dim, [d.to.at.x, d.to.at.y, d.to.at.z]),
             None => (level, spawn),
         };
+        let back = self.here();
         let Some(host) = self.lan.as_mut() else {
             return;
         };
         let rotation = decision.map(|d| [d.to.yaw, d.to.pitch]);
-        let back = self.here();
         let left = crate::game::Dim::from_id(&host.hub.guests[i].dimension);
         let away = server && host.hub.guests[i].dimension != level.id();
         if server {

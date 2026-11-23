@@ -37,7 +37,7 @@ use horizon_world::cubic::custom::{
     BiomeColumns, ClimateBiomes, CustomCubicGenerator, CustomGeneratorSettings, FixedBiome,
     FlatGeneratorSettings,
 };
-use horizon_world::nbt::{NamedTag, Tag};
+use horizon_core::nbt::{NamedTag, Tag};
 use horizon_world::registry::BlockRegistry;
 use horizon_world::worldgen::generator::GeneratorData;
 use std::collections::{HashMap, VecDeque};
@@ -267,8 +267,8 @@ pub struct PopRegion {
     columns: Arc<dyn BiomeColumns>,
     vegetation: Option<Arc<Vegetation>>,
     structures: Option<Arc<CubicStructures>>,
-    block_entities: Vec<([i32; 3], horizon_world::nbt::Compound)>,
-    entities: Vec<horizon_world::nbt::Compound>,
+    block_entities: Vec<([i32; 3], horizon_core::nbt::Compound)>,
+    entities: Vec<horizon_core::nbt::Compound>,
 }
 
 impl PopRegion {
@@ -304,8 +304,8 @@ impl PopRegion {
     pub fn take_placed(
         &mut self,
     ) -> (
-        Vec<([i32; 3], horizon_world::nbt::Compound)>,
-        Vec<horizon_world::nbt::Compound>,
+        Vec<([i32; 3], horizon_core::nbt::Compound)>,
+        Vec<horizon_core::nbt::Compound>,
     ) {
         (
             std::mem::take(&mut self.block_entities),
@@ -482,13 +482,13 @@ impl CubeWorld for PopRegion {
             structures.place(cube, self);
         }
     }
-    fn set_block_entity(&mut self, p: [i32; 3], nbt: horizon_world::nbt::Compound) {
+    fn set_block_entity(&mut self, p: [i32; 3], nbt: horizon_core::nbt::Compound) {
         if self.locate(p).is_some() {
             self.block_entities.retain(|(q, _)| *q != p);
             self.block_entities.push((p, nbt));
         }
     }
-    fn add_entity(&mut self, nbt: horizon_world::nbt::Compound) {
+    fn add_entity(&mut self, nbt: horizon_core::nbt::Compound) {
         self.entities.push(nbt);
     }
 }

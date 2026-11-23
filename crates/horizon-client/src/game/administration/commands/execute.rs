@@ -236,7 +236,7 @@ impl Game<'_> {
     ) -> T {
         let previous = self.command_source.replace(source);
         // Opening a level can call mods after the swap, before it returns.
-        let mut back = Some(self.dim);
+        let mut back = Some(self.here());
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             back = self.enter_command_level(source.dimension);
             f(self)

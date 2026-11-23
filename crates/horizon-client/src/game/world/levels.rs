@@ -186,7 +186,7 @@ impl LevelId {
 /// A level that is not in place: every per-level field of `Game`.
 pub(super) struct Parked {
     /// The vertical shard of its dimension this level is.
-    shard: u16,
+    pub(super) shard: u16,
     /// The shard's window cell (`None` for the primary's, which the cubic
     /// level keeps).
     shard_window: Option<horizon_client::cubic::ShardWindow>,
@@ -468,7 +468,7 @@ impl Game<'_> {
         let journal = table.producer();
         self.bind_resident_owners(&journal, self.dim.key(), self.is_logical_server());
         self.bind_specialized_resident_owners(&journal);
-        for (dim, parked) in &mut self.levels.parked {
+        for ((dim, _), parked) in &mut self.levels.parked {
             parked.bind_resident_owners(&journal, dim.key(), true);
         }
     }

@@ -212,6 +212,8 @@ impl Region<'_> {
     }
 }
 
+impl crate::level::BlockEntityNeighbors for Region<'_> {}
+
 impl LevelAccess for Region<'_> {
     fn block_state(&self, pos: BlockPos) -> BlockStateId {
         if self.inside(pos) {

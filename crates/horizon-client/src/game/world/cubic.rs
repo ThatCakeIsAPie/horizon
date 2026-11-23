@@ -136,7 +136,7 @@ impl Game<'_> {
             Some(shard) if !self.shard_exists(back.dim, shard) => LevelId::shard(back.dim, 0),
             _ => back,
         };
-        self.enter_level(None, back)
+        self.enter_level(back)
     }
 
     /// Carries out the groups: in order, the merges (the shard that closes is
@@ -254,7 +254,7 @@ impl Game<'_> {
         others: &[Range],
         force: bool,
     ) -> horizon_client::Result<Range> {
-        self.enter_level(None, LevelId::shard(Dim::Overworld, shard))?;
+        self.enter_level(LevelId::shard(Dim::Overworld, shard))?;
         let due = force || cubic::needs_new_window(self.world.shape, wanted);
         self.cubic_slide.since_retarget += 1;
         if !due {
@@ -483,12 +483,12 @@ impl Game<'_> {
         } else {
             self.here()
         };
-        self.enter_level(None, LevelId::shard(Dim::Overworld, id))?;
+        self.enter_level(LevelId::shard(Dim::Overworld, id))?;
         let chunks: Vec<_> = self.world.chunks.values().cloned().collect();
-        self.native_chunks_changed(&chunks);
+        self.native_chunks_unloaded(&chunks);
         self.save_level(true)?;
-        for uuid in self.persist.uuids.values() {
-            self.entity_attachments.remove(uuid);
+        for id in self.persist.uuids.keys() {
+            self.entity_attachments.remove(id);
         }
         if let Some(level) = self.save.cubic.get().cloned() {
             let (first, last) = cubic::window_cube_range(self.world.shape);
@@ -499,7 +499,7 @@ impl Game<'_> {
             }
             level.drop_ring_target(id);
         }
-        self.enter_level(None, back)?;
+        self.enter_level(back)?;
         self.levels.remove_shard(Dim::Overworld, id);
         if let Some(h) = self.lan.as_mut() {
             h.hub.forget_level(Dim::Overworld.id(), id);
@@ -513,27 +513,28 @@ impl Game<'_> {
     /// columns and cubes), at the same place. A vehicle it rides stays behind
     /// in its shard (saved with its cube when that leaves its window).
     fn move_guest_to_shard(&mut self, conn: u32, to: u16) {
-        let Some(mut host) = self.lan.take() else {
+        let back = self.here();
+        let Some(i) = (self.lan.as_ref())
+            .and_then(|host| host.hub.guests.iter().position(|g| g.conn == conn))
+        else {
             return;
         };
-        let back = self.here();
-        if let Some(i) = host.hub.guests.iter().position(|g| g.conn == conn)
-            && self
-                .enter_level(Some(&mut host), LevelId::shard(Dim::Overworld, to))
-                .is_ok()
-        {
-            let g = &mut host.hub.guests[i];
-            g.vehicle = None;
-            let (at, yaw, pitch) = (g.position, g.yaw, g.pitch);
-            let cooldown = host.play.get(&conn).map_or(0, |p| p.portal.cooldown);
-            let ctx = self.server_ctx();
-            host.hub
-                .change_level(i, at, yaw, Some(pitch), false, cooldown, &ctx);
+        if self.enter_level(LevelId::shard(Dim::Overworld, to)).is_ok() {
+            use horizon_client::lan::hub::TickCtx;
+            let ctx = super::server_travel::server_ctx!(self);
+            if let Some(host) = self.lan.as_mut() {
+                let (at, yaw, pitch) = host.hub.guests.update(i, |g| {
+                    g.vehicle = None;
+                    (g.position, g.yaw, g.pitch)
+                });
+                let cooldown = host.play.get(&conn).map_or(0, |p| p.portal.cooldown);
+                host.hub
+                    .change_level(i, at, yaw, Some(pitch), false, cooldown, &ctx);
+            }
         }
-        if let Err(e) = self.enter_level(Some(&mut host), back) {
+        if let Err(e) = self.enter_level(back) {
             log::error!("could not reopen the level in place: {e}");
         }
-        self.lan = Some(host);
     }
 
     /// Saves the cubes of `leaving` (ranges of cube Ys) in `columns`, which
@@ -603,7 +604,8 @@ impl Game<'_> {
         }
         self.world.block_names.extend(cube.block_names);
         if !cube.entities.is_empty() {
-            self.world.loaded_entities.push(((x, z), cube.entities));
+            (self.world.loaded_entities)
+                .push(((x, z), cube.entities.into_iter().map(Into::into).collect()));
         }
         let pos = ChunkPos::new(x, z);
         if !cube.block_ticks.is_empty() {
@@ -623,7 +625,7 @@ impl Game<'_> {
     fn unload_columns_now(&mut self, columns: &HashSet<(i32, i32)>) {
         let keys: FxHashSet<(i32, i32)> = columns.iter().copied().collect();
         let unloaded = self.streaming.unload_columns(&mut self.world, &keys);
-        self.native_chunks_changed(&unloaded);
+        self.native_chunks_unloaded(&unloaded);
         for chunk in &unloaded {
             self.world.modified.remove(&(chunk.x, chunk.z));
         }

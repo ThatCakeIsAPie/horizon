@@ -43,7 +43,7 @@ use horizon_core::position::{ChunkPos, SectionPos};
 use horizon_core::ticks::SavedTick;
 use horizon_world::cubic::store::CubeStore;
 use horizon_world::cubic::{MAX_CUBE_Y, MIN_CUBE_Y};
-use horizon_world::nbt::{NamedTag, Tag};
+use horizon_core::nbt::{NamedTag, Tag};
 use horizon_world::registry::BlockRegistry;
 use horizon_world::worldgen::structure::start::StructureStart;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1794,7 +1794,7 @@ fn block_entity_pos(tag: &Tag) -> Option<(i64, i64, i64)> {
 }
 
 /// A block entity a structure placed at `p`, as a record saves it.
-fn placed_block_entity(p: [i32; 3], nbt: &horizon_world::nbt::Compound) -> Tag {
+fn placed_block_entity(p: [i32; 3], nbt: &horizon_core::nbt::Compound) -> Tag {
     let mut map = nbt.clone();
     map.insert("x".into(), Tag::Int(p[0]));
     map.insert("y".into(), Tag::Int(p[1]));
@@ -1803,7 +1803,7 @@ fn placed_block_entity(p: [i32; 3], nbt: &horizon_world::nbt::Compound) -> Tag {
 }
 
 /// The block an entity's `Pos` is in.
-fn entity_block(entity: &horizon_world::nbt::Compound) -> Option<[i32; 3]> {
+fn entity_block(entity: &horizon_core::nbt::Compound) -> Option<[i32; 3]> {
     let Some(Tag::List(pos)) = entity.get(&"Pos".into()) else {
         return None;
     };

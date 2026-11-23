@@ -193,13 +193,13 @@ impl Behaviours {
         start: &crate::worldgen::structure::start::StructureStart,
         resources: &crate::worldgen::structure::StructureResources,
         blocks: &dyn crate::worldgen::structure::legacy::SolidRender,
-        select: crate::worldgen::structure::BoundingBox,
-        chunk_box: crate::worldgen::structure::BoundingBox,
-        settle_box: crate::worldgen::structure::BoundingBox,
+        select: horizon_core::bounding_box::BoundingBox,
+        chunk_box: horizon_core::bounding_box::BoundingBox,
+        settle_box: horizon_core::bounding_box::BoundingBox,
         settle_random: &mut horizon_core::random::LegacyRandom,
         random: &mut horizon_core::random::LegacyRandom,
         heights: &dyn Fn(crate::heightmap::HeightmapType, i32, i32) -> i32,
-    ) -> (bool, Vec<crate::nbt::Compound>) {
+    ) -> (bool, Vec<horizon_core::nbt::Compound>) {
         let mut sim = self.sim(level, ticks);
         let mut placed = true;
         let entities = {

@@ -614,7 +614,7 @@ impl DensityGraph {
     pub fn node(&self, id: FunctionId) -> Option<&GraphNode> {
         match &self.entries.get(id.0)?.definition {
             Definition::Node(node) => Some(node),
-            Definition::Bound { .. } => None,
+            Definition::Bound { .. } | Definition::Seeded { .. } => None,
         }
     }
     fn noise_entry(&self, id: NoiseId) -> Result<&seeded::NoiseEntry, CompileError> {

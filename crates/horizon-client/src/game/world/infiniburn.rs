@@ -32,10 +32,10 @@ impl Game<'_> {
             .parked
             .keys()
             .copied()
-            .map(|dim| {
+            .map(|key| {
                 (
-                    dim,
-                    self.resolve_level_infiniburn(self.dimension_type_of(dim)),
+                    key,
+                    self.resolve_level_infiniburn(self.dimension_type_of(key.0)),
                 )
             })
             .collect();

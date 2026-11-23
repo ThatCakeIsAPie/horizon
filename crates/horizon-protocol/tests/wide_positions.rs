@@ -2,7 +2,7 @@
 //! checks share one test and run in order.
 use horizon_protocol::buf::{Codec, Pos, Reader, Writer, set_wide_positions, wide_positions};
 use horizon_protocol::chunk::BlockEntityInfo;
-use horizon_world::nbt::Tag;
+use horizon_core::nbt::Tag;
 
 fn pos_bytes(p: [i32; 3]) -> Vec<u8> {
     let mut w = Writer::new();
