@@ -119,6 +119,8 @@ jobs:
         run: |
           set -euo pipefail
           tag="${REF_NAME//\//-}"
+          # cubic-earth-v0.1.0 -> v0.1.0: the zip name already says horizon-cubic-earth.
+          tag="${tag#cubic-earth-}"
           zip="horizon-cubic-earth-${tag}-${{ matrix.name }}.zip"
           folder=dist/horizon-cubic-earth
           rm -rf dist
