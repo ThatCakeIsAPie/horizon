@@ -5,8 +5,8 @@ elevation data for a place on the globe you choose, at a scale you choose (1 blo
 at the summit of Mount Everest at 1 block per metre opens on a surface at about y 8,850 and the far view shows the
 valleys around it.
 
-Earth is Horizon's own design, in MIT-licensed code. It was **inspired by the Terrarium mod by gegy; Earth shares
-no code with it.**
+Earth is Horizon's own design, in code under Horizon's licence (LGPL-3.0-or-later). It was **inspired by the
+Terrarium mod by gegy; Earth shares no code with it.**
 
 ## Create an Earth world
 

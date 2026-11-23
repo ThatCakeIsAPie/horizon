@@ -1,0 +1,201 @@
+name: cubic-earth release
+# Builds the Cubic + Earth game (horizon-official, shipped as `horizon-client`) on GitHub's free hosted runners: Linux
+# x64, Windows x64, macOS arm64, and macOS x64 (cross-built on the arm64 runner; optional, its failure never holds the
+# others back). Each platform becomes one zip, horizon-cubic-earth-<TAG>-<platform>.zip, with a horizon-cubic-earth/
+# folder holding horizon-client(.exe), the licenses and HOW-TO-PLAY.md, which is what the Horizon launcher's
+# "Import a game build" takes.
+# Starts on a pushed tag `cubic-earth-v*` (e.g. `git tag cubic-earth-v0.1.0 && git push origin cubic-earth-v0.1.0`), or by
+# hand (`gh workflow run "cubic-earth release"`): a hand-started run on a branch builds and keeps the zips as workflow
+# artifacts and makes no release.
+# A tag run then attaches the zips and a SHA256SUMS.txt to a DRAFT GitHub release. It never publishes: reading the
+# draft over and publishing it is a manual click on the release page.
+# No secrets, no self-hosted runners, no repository variables; the only credential is the run's own GITHUB_TOKEN.
+on:
+  push:
+    tags: ['cubic-earth-v*']
+  workflow_dispatch:
+permissions:
+  contents: write # the draft release (and nothing else)
+concurrency:
+  group: cubic-earth-release-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: always
+  # As in ci.yml: no telemetry from anything this workflow starts.
+  HORIZON_TELEMETRY_URL: 'off'
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    # The optional Intel Mac entry may fail without failing this job (a failed entry with continue-on-error leaves the
+    # job's result `success`), so `release` below needs only the three required entries to have passed.
+    continue-on-error: ${{ matrix.optional == true }}
+    runs-on: ${{ matrix.os }}
+    # thin LTO and one codegen unit: a cold build is slow. GitHub's cap for a hosted job is 360 minutes.
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The older Ubuntu, so the binary needs an older glibc and runs on more distributions.
+          - name: linux-x64
+            os: ubuntu-22.04
+            exe: ''
+          - name: windows-x64
+            os: windows-latest
+            exe: .exe
+            # The C runtime linked in, so the game runs without the Visual C++ redistributable (as ci.yml and
+            # game-build.yml build it).
+            rustflags: -C target-feature=+crt-static
+          - name: macos-arm64
+            os: macos-14
+            exe: ''
+          # Intel Mac: cross-compiled on the arm64 runner. Not run here (the runner is arm64), so no smoke check.
+          - name: macos-x64
+            os: macos-14
+            exe: ''
+            target: x86_64-apple-darwin
+            optional: true
+    env:
+      # An empty value on Linux and macOS, as game-build.yml: a RUSTFLAGS variable replaces .cargo/config.toml's
+      # build.rustflags (-Zthreads=8), which the release builds don't use.
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      # Where cargo puts the programs: target/release, or target/<target>/release for another target.
+      BIN: ${{ matrix.target && format('target/{0}/release', matrix.target) || 'target/release' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        # The workspace's release build is large; the hosted image's own toolchains are not needed.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /usr/local/share/powershell \
+            "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: rust
+        run: echo "version=$(cat tools/ci/rust-version)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-11
+        with:
+          # The version the repository's CI and releases pin (tools/ci/rust-version).
+          toolchain: ${{ steps.rust.outputs.version }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: cubic-earth-${{ matrix.name }}
+      - name: ALSA and udev headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev
+      - name: Build the official game
+        run: cargo build --release --locked ${{ matrix.target && format('--target {0}', matrix.target) || '' }} -p horizon-official --bin horizon-official
+      - name: The official game is the game players get, under its name
+        # horizon-official is horizon-client's game with Horizon's own parts plugged in; the launcher and players know
+        # it as horizon-client.
+        run: cp -f "$BIN/horizon-official${{ matrix.exe }}" "$BIN/horizon-client${{ matrix.exe }}"
+      - name: The launcher's identity mark is in the program
+        run: |
+          file="$BIN/horizon-client${{ matrix.exe }}"
+          ls -l "$file"
+          count=$(grep -a -c -F 'horizon-game-executable;' "$file" || true)
+          [ "${count:-0}" -gt 0 ] || { echo "::error::$file does not contain the horizon-game-executable; mark"; exit 1; }
+      - name: The program starts
+        # Not the cross-built one: the runner can't run it. `--help` prints and exits (as game-build.yml's check).
+        if: ${{ !matrix.target }}
+        run: |
+          set -euo pipefail
+          "$BIN/horizon-client${{ matrix.exe }}" --help | grep -q -- '--resources'
+          echo "horizon-client starts"
+      - name: Zip it
+        id: zip
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${REF_NAME//\//-}"
+          zip="horizon-cubic-earth-${tag}-${{ matrix.name }}.zip"
+          folder=dist/horizon-cubic-earth
+          rm -rf dist
+          mkdir -p "$folder"
+          cp "$BIN/horizon-client${{ matrix.exe }}" "$folder/"
+          chmod +x "$folder/horizon-client${{ matrix.exe }}"
+          for f in LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md; do
+            if [ -f "$f" ]; then cp "$f" "$folder/"; fi
+          done
+          if [ -d LICENSES ]; then cp -R LICENSES "$folder/"; fi
+          if [ -f docs/play-cubic-earth.md ]; then
+            cp docs/play-cubic-earth.md "$folder/HOW-TO-PLAY.md"
+          else
+            echo "::warning::docs/play-cubic-earth.md is missing: the zip has no HOW-TO-PLAY.md"
+          fi
+          if [ "$RUNNER_OS" = Windows ]; then
+            (cd dist && 7z a -tzip "../$zip" horizon-cubic-earth)
+          else
+            # zip keeps the executable bit.
+            (cd dist && zip -r -X "../$zip" horizon-cubic-earth)
+          fi
+          ls -l "$zip"
+          unzip -l "$zip" 2>/dev/null || 7z l "$zip"
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: horizon-cubic-earth-${{ matrix.name }}
+          path: ${{ steps.zip.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: draft release
+    needs: build
+    # Only for a pushed tag (a hand-started run on a branch stops after the build). `needs: build` alone holds this
+    # job back unless every required entry passed; the Intel Mac entry may have failed (continue-on-error).
+    if: startsWith(github.ref, 'refs/tags/cubic-earth-v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: docs
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: horizon-cubic-earth-*
+          merge-multiple: true
+          path: assets
+      - name: Draft release with the zips
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd assets
+          for platform in linux-x64 windows-x64 macos-arm64; do
+            ls horizon-cubic-earth-*-"$platform".zip > /dev/null || { echo "::error::no $platform zip"; exit 1; }
+          done
+          ls horizon-cubic-earth-*-macos-x64.zip > /dev/null 2>&1 || echo "::warning::no macos-x64 zip (the optional Intel Mac build failed): releasing without it"
+          sha256sum horizon-cubic-earth-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          files=(horizon-cubic-earth-*.zip SHA256SUMS.txt)
+          cd ..
+          notes=docs/cubic-earth-release-notes.md
+          if [ ! -f "$notes" ]; then
+            echo "::warning::$notes is missing: the draft has a one-line note"
+            echo "Horizon Cubic + Earth $TAG" > release-notes.md
+            notes=release-notes.md
+          fi
+          cd assets
+          # Always a draft: nothing here publishes. A rerun for the same tag updates its release and keeps it a draft.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=true
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+              --title "Horizon Cubic + Earth $TAG" --notes-file "../$notes" "${files[@]}"
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,url --jq '"draft=\(.isDraft) \(.url)"'
