@@ -154,7 +154,10 @@ impl LaunchArguments {
                 | "--server-thread"
                 | "--in-frame"
                 | "--no-server-thread"
-                | "--pregen" => {
+                | "--pregen"
+                // Cubic Chunks: a new world is cubic; a conversion keeps its bedrock floor.
+                | "--cubic"
+                | "--keep-bedrock" => {
                     rest.push(Argument::Switch(arg));
                 }
                 _ => {
@@ -175,6 +178,24 @@ impl LaunchArguments {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cubic_switches_take_no_value() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut command = std::process::Command::new("game");
+        command
+            .current_dir(&cwd)
+            .args(["--cubic", "--keep-bedrock", "--world", "w"]);
+        let launch = LaunchArguments::for_command(&command).unwrap();
+        assert_eq!(
+            launch.rest,
+            [
+                Argument::Switch("--cubic".into()),
+                Argument::Switch("--keep-bedrock".into()),
+                Argument::Value("--world".into(), "w".into())
+            ]
+        );
+    }
 
     #[test]
     fn final_command_owns_paths_values_and_environment() {
