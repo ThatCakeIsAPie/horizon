@@ -7,7 +7,7 @@ use crate::cubic_gen::CubicGeneration;
 use crate::save::{ChunkExtras, encode_with};
 use horizon_core::ticks::{SavedTick, TickPriority, TickTypeId};
 use horizon_world::compression::Compression;
-use horizon_world::nbt::{Limits, NamedTag};
+use horizon_core::nbt::{Limits, NamedTag};
 use horizon_world::region::{ChunkRecord, RegionFile};
 use std::collections::BTreeMap;
 

@@ -79,9 +79,9 @@ use crate::worldgen::biome::BiomeId;
 use crate::worldgen::biome_temperature::BiomeTemperature;
 use crate::worldgen::generator::GeneratorData;
 use crate::worldgen::live::LiveFeatures;
-use crate::worldgen::structure::BoundingBox;
+use horizon_core::bounding_box::BoundingBox;
 use crate::worldgen::structure::jigsaw::JigsawContext;
-use crate::worldgen::structure::start::{NoiseBlock, NoiseColumn, StartContext, StructureStart};
+use crate::worldgen::structure::start::{NoiseBlock, NoiseColumn, NoiseColumnTarget, StartContext, StructureStart};
 use crate::worldgen::tree_blocks::TreeBlocks;
 use crate::worldgen::{SetTuning, StructurePlanner};
 
@@ -576,11 +576,24 @@ impl StartContext for Context<'_> {
             })
             .collect()
     }
-    fn base_columns(&mut self, x: i32, z: i32, kinds: &[HeightmapType]) -> Vec<Vec<bool>> {
-        kinds.iter().map(|&k| self.base_column(x, z, k)).collect()
+    fn base_columns_by(
+        &mut self,
+        x: i32,
+        z: i32,
+        count: usize,
+        kind: &dyn Fn(usize) -> HeightmapType,
+    ) -> Vec<Vec<bool>> {
+        (0..count).map(|i| self.base_column(x, z, kind(i))).collect()
     }
     fn noise_column(&mut self, x: i32, z: i32) -> NoiseColumn {
         self.s.noise_blocks(x, z)
+    }
+    fn noise_column_into(&mut self, x: i32, z: i32, column: &mut dyn NoiseColumnTarget) {
+        let blocks = self.s.noise_blocks(x, z);
+        column.resize(blocks.min, blocks.blocks.len());
+        for (i, block) in blocks.blocks.into_iter().enumerate() {
+            column.set(i, block);
+        }
     }
     fn cold_enough_to_snow(&mut self, biome: BiomeId, pos: [i32; 3]) -> bool {
         if self.temperatures.is_empty() {
@@ -630,6 +643,8 @@ impl Region<'_, '_> {
     }
 }
 
+impl crate::level::BlockEntityNeighbors for Region<'_, '_> {}
+
 impl LevelAccess for Region<'_, '_> {
     fn block_state(&self, pos: BlockPos) -> BlockStateId {
         if self.inside(pos) {
@@ -668,14 +683,14 @@ impl LevelAccess for Region<'_, '_> {
     fn world_seed(&self) -> i64 {
         self.s.seed
     }
-    fn load_block_entity(&mut self, pos: BlockPos, nbt: crate::nbt::Compound) {
+    fn load_block_entity(&mut self, pos: BlockPos, nbt: horizon_core::nbt::Compound) {
         if self.inside(pos) {
             self.world.set_block_entity([pos.x, pos.y, pos.z], nbt);
         }
     }
     /// The pieces' spawners (`LevelFeatureWorld::configure_spawner` checked the
     /// block is one): generation just placed it, so it has no entity yet.
-    fn create_feature_spawner(&mut self, pos: BlockPos, nbt: crate::nbt::Compound) {
+    fn create_feature_spawner(&mut self, pos: BlockPos, nbt: horizon_core::nbt::Compound) {
         self.load_block_entity(pos, nbt);
     }
 }

@@ -40,7 +40,7 @@ use crate::cubic::{
 use crate::save::{SaveDir, SaveTables, decode_with, dimension_dir, number, read_dat, text};
 use horizon_core::position::SectionPos;
 use horizon_world::cubic::store::CubeStore;
-use horizon_world::nbt::Tag;
+use horizon_core::nbt::Tag;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -497,7 +497,9 @@ fn convert_columns(
     report.regions = regions.len() as u64;
     let assets = crate::assets::Assets::load(&options.resources)
         .map_err(|e| format!("resources {}: {e}", options.resources.display()))?;
-    let biomes = Biomes::load(&options.resources)
+    let biomes = Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(
+        options.resources.clone(),
+    ))
         .map_err(|e| format!("biomes in {}: {e}", options.resources.display()))?;
     let tables = SaveTables::new(&assets);
     let save = SaveDir::new(source.clone(), LevelShape::OVERWORLD);

@@ -76,7 +76,7 @@ pub struct CubeBlockEntity {
     pub y: i32,
     pub kind: i32,
     /// The update tag, `Tag::End` for none.
-    pub tag: horizon_world::nbt::Tag,
+    pub tag: horizon_core::nbt::Tag,
 }
 
 /// One cube of a [`Cubes`] payload.
@@ -259,7 +259,7 @@ mod tests {
                         packed_xz: 0x2A,
                         y: -1_000_000,
                         kind: 5,
-                        tag: horizon_world::nbt::Tag::End,
+                        tag: horizon_core::nbt::Tag::End,
                     }],
                 },
             ],

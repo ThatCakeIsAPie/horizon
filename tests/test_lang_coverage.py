@@ -37,7 +37,7 @@ class GameCoverageTests(unittest.TestCase):
         self.assertEqual(row["missing"], ["b"])
         self.assertEqual(row["extra"], ["d"])
         self.assertEqual(row["empty"], ["c"])
-        self.assertAlmostEqual(row["coverage"], 2 / 3)
+        self.assertAlmostEqual(row["coverage"], 1 / 3)  # `c` is blank, so it does not cover its key
         self.assertEqual(row["problem"], "")
 
     def test_a_value_equal_to_english_is_listed_but_never_for_the_reference(self):
@@ -49,17 +49,100 @@ class GameCoverageTests(unittest.TestCase):
         self.assertEqual(by_code(rows, "xx")["same"], ["a"])
         self.assertEqual(by_code(rows, "en_us")["same"], [])
 
-    def test_a_changed_placeholder_is_reported_and_plain_percent_text_is_not(self):
-        self.assertEqual(lang_coverage.placeholders("%s chunks of %1$s, 100% sure, %.2f, %%"),
-                         ["%%", "%.2f", "%1$s", "%s"])
-        self.assertEqual(lang_coverage.placeholders("100% is plain text"), [])
+    def test_templates_parse_and_format_as_the_game_reads_them(self):
+        # The same cases the game's own parser and formatter are tested on (text.rs), so the two
+        # cannot drift.
+        fixture = Path(__file__).parent / "fixtures/translation_templates.json"
+        for case in json.loads(fixture.read_text(encoding="utf-8"))["cases"]:
+            with self.subTest(template=case["template"][:40]):
+                pieces = lang_coverage.translation_pieces(case["template"])
+                self.assertEqual(None if pieces is None else
+                                 [piece for piece in pieces if isinstance(piece, int)],
+                                 case["fields"])
+                self.assertEqual(lang_coverage.format_translation(case["template"], case["args"]),
+                                 case["out"])
+
+    def test_the_fields_a_template_fills_in_and_one_the_game_cannot_format(self):
+        self.assertEqual(lang_coverage.template("%s of %1$s, 100% sure, %.2f, %%"),
+                         ([0, 0], " of , 100% sure, %.2f, %"))
+        self.assertEqual(lang_coverage.template("%2$s before %1$s")[0], [0, 1])
+        self.assertEqual(lang_coverage.template("%33$s")[0], [32])
+        self.assertEqual(lang_coverage.template("100% is plain text")[0], [])
+        for text in ("%s %q", "in %", "%0$s"):
+            self.assertIsNone(lang_coverage.template(text), text)
+
+    def test_a_changed_or_unformattable_placeholder_is_reported_and_a_reordered_one_is_not(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
-            write(folder, "en_us.json", '{\n  "z": "%s and %d"\n}\n')
-            write(folder, "xx.json", '{\n  "z": "%s"\n}\n')
+            write(folder, "en_us.json", '{\n  "z": "%s and %s"\n}\n')
+            write(folder, "xx.json", '{\n  "z": "%2$s, %1$s"\n}\n')
+            write(folder, "yy.json", '{\n  "z": "%s and %q"\n}\n')
+            write(folder, "zz.json", '{\n  "z": "%s"\n}\n')
             _, rows = lang_coverage.game_rows(folder, set())
-        changed = by_code(rows, "xx")["placeholders"]
-        self.assertEqual([entry["key"] for entry in changed], ["z"])
+        self.assertEqual(by_code(rows, "xx")["placeholders"], [])
+        for code in ("yy", "zz"):
+            self.assertEqual([entry["key"] for entry in by_code(rows, code)["placeholders"]],
+                             ["z"], code)
+
+    def test_an_argument_past_any_count_or_text_that_looks_like_one_is_no_argument(self):
+        plain = set()
+        self.assertFalse(lang_coverage.formats_like("k", "Durability", "Durability %33$s", plain))
+        self.assertFalse(lang_coverage.formats_like("k", "%s", "\ue0000\ue001", plain))
+        self.assertTrue(lang_coverage.formats_like("k", "%s" * 33, "%33$s" + "%s" * 32, plain))
+
+    def test_a_percent_sign_english_writes_as_two_is_kept(self):
+        plain = set()
+        self.assertTrue(lang_coverage.formats_like("k", "50%% off %s", "50 % de %s", plain))
+        self.assertTrue(lang_coverage.formats_like("k", "50%% off %s", "%s: 50%%", plain))
+        self.assertFalse(lang_coverage.formats_like("k", "50%% off %s", "50 off %s", plain))
+
+    def test_a_key_read_as_plain_text_only_has_to_fill_in_nothing(self):
+        plain = {"k"}
+        self.assertTrue(lang_coverage.formats_like("k", "Durability in %", "En %", plain))
+        self.assertTrue(lang_coverage.formats_like("k", "Durability in %", "En 100%%", plain))
+        self.assertFalse(lang_coverage.formats_like("k", "Durability in %", "En %s", plain))
+        self.assertFalse(lang_coverage.formats_like("k", "Durability in %", "En %33$s", plain))
+        self.assertFalse(lang_coverage.formats_like("other", "Durability in %", "En %", plain))
+
+    def test_the_plain_text_list_holds_exactly_the_keys_reviewed_here(self):
+        # Growing the list takes changing this test (and lang.rs's twin); lang.rs also fails once
+        # a listed key's English formats, so the list shrinks when the English is fixed.
+        self.assertEqual(lang_coverage.unformattable(), {"horizon.pvp.hud_armour_percent"})
+
+    def test_a_control_character_is_stray_unless_it_is_a_tab_or_bidi_control_english_has(self):
+        self.assertEqual(lang_coverage.stray_controls("a", "b\nc"), [])
+        self.assertEqual(lang_coverage.stray_controls("a", "b\tc\x7f\x85"), ["\t", "\x7f", "\x85"])
+        self.assertEqual(lang_coverage.stray_controls("a", "b\u202ec\u2066"), ["\u202e", "\u2066"])
+        self.assertEqual(lang_coverage.stray_controls("a\u2067b\u2069\t", "c\u2067d\u2069\t"), [])
+        self.assertEqual(lang_coverage.stray_controls("a\x1b", "b\x1b"), ["\x1b"])
+
+    def test_translated_text_keeps_what_its_english_allows(self):
+        # The same cases lang.rs's bundled-file test reads, so the importer and the test agree.
+        fixture = Path(__file__).parent / "fixtures/translation_text_rules.json"
+        for case in json.loads(fixture.read_text(encoding="utf-8"))["cases"]:
+            with self.subTest(case["case"]):
+                self.assertEqual(lang_coverage.text_problem(case["english"], case["text"]),
+                                 case["rule"])
+
+    def test_the_unicode_tables_are_sorted_disjoint_ranges_of_unicode_17(self):
+        # tools/gen_lang_unicode_tables.py writes the file from UCD files that are not committed,
+        # so the test checks only what any correct output holds.
+        body = json.loads(lang_coverage.UNICODE_TABLES_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(body["unicode"], "17.0.0")
+        self.assertEqual(set(body["sources"]),
+                         {"UnicodeData.txt", "Scripts.txt", "GraphemeBreakProperty.txt"})
+        every = []
+        for name in lang_coverage.UNICODE_TABLES:
+            ranges = body[name]
+            with self.subTest(name):
+                self.assertTrue(ranges)
+                self.assertTrue(all(0 <= low <= high <= 0x10FFFF for low, high in ranges))
+                # Sorted and apart: touching ranges would have been written as one.
+                self.assertTrue(all(a[1] + 1 < b[0] for a, b in zip(ranges, ranges[1:])))
+            every += ranges
+        every.sort()
+        # No character is in two tables.
+        self.assertTrue(all(a[1] < b[0] for a, b in zip(every, every[1:])))
 
     def test_a_repeated_key_or_a_missing_indent_is_a_problem(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -150,6 +233,32 @@ class CommandLineTests(unittest.TestCase):
         self.assertIn("GAME es_es ", out)
         self.assertIn("LAUNCHER es ", out)
 
+    def test_show_keys_is_not_dropped_when_a_mode_also_prints_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            write(folder, "en_us.json", '{\n  "a": "Apple",\n  "b": "Banana"\n}\n')
+            write(folder, "xx.json", '{\n  "a": "Manzana",\n  "c": "Datil"\n}\n')
+            common = ("--game-dir", tmp, "--game-only")
+            code, summary, _ = run(*common, "--summary")
+            code, with_keys, _ = run(*common, "--summary", "--show-keys")
+            code, unreviewed, _ = run(*common, "--unreviewed")
+            code, unreviewed_keys, _ = run(*common, "--unreviewed", "--show-keys")
+            code, payload, _ = run(*common, "--json", "--show-keys")
+        self.assertEqual(code, 0)
+        # the summary keeps its line per file, and the keys behind the counts follow it
+        self.assertIn("GAME xx 2/2 keys, missing 1, extra 1", summary)
+        self.assertIn("GAME xx 2/2 keys, missing 1, extra 1", with_keys)
+        self.assertNotIn("xx: missing (1)", summary)
+        self.assertIn("xx: missing (1)", with_keys)
+        self.assertIn("  b", with_keys)
+        self.assertIn("xx: not in the reference (1)", with_keys)
+        self.assertIn("  c", with_keys)
+        self.assertNotEqual(summary, with_keys)
+        # the unreviewed listing says the same, and the json stays a json
+        self.assertNotEqual(unreviewed, unreviewed_keys)
+        self.assertIn("xx: missing (1)", unreviewed_keys)
+        self.assertEqual(by_code(json.loads(payload)["game"]["files"], "xx")["missing"], ["b"])
+
 
 class ReviewTests(unittest.TestCase):
     """The record of what a person checked: anything else, or anything changed since, is unreviewed."""
@@ -215,8 +324,49 @@ class ReviewTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertTrue((Path(tmp) / "review" / "launcher" / "xx.json").exists())
 
+    def test_a_crates_own_folder_is_reported_and_its_reviews_kept_apart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game, crates, review = Path(tmp) / "game", Path(tmp) / "crates", Path(tmp) / "review"
+            friends = crates / "horizon-friends" / "assets" / "lang"
+            game.mkdir()
+            friends.mkdir(parents=True)
+            (crates / "horizon-plain" / "src").mkdir(parents=True)  # no lang folder: not reported
+            write(game, "en_us.json", '{\n  "a": "Apple"\n}\n')
+            write(game, "xx_yy.json", '{\n  "a": "Manzana"\n}\n')
+            write(friends, "en_us.json", '{\n  "f.one": "One",\n  "f.two": "Two"\n}\n')
+            write(friends, "xx_yy.json", '{\n  "f.one": "Uno"\n}\n')
+            common = ("--game-dir", str(game), "--crates-dir", str(crates), "--review-dir", str(review),
+                      "--game-only")
+            code, out, _ = run(*common, "--summary")
+            self.assertEqual(code, 0)
+            self.assertIn("GAME xx_yy 1/1 keys, missing 0", out)
+            self.assertIn("GAME horizon-friends xx_yy 1/2 keys, missing 1", out)
+            self.assertNotIn("horizon-plain", out)
+            code, _, err = run(*common, "--fail-under", "90")
+            self.assertEqual(code, 1)
+            self.assertIn("xx_yy: 50.0%", err)
+            # One command marks the keys of both folders; each lands in its folder's record.
+            code, out, _ = run(*common, "--lang", "xx_yy", "--mark-reviewed", "a", "f.one")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(json.loads((review / "game" / "xx_yy.json").read_text(encoding="utf-8")),
+                             {"a": "Manzana"})
+            self.assertEqual(json.loads((review / "horizon-friends" / "xx_yy.json").read_text(encoding="utf-8")),
+                             {"f.one": "Uno"})
+            # Marking the game's folder again keeps the crate's record.
+            code, _, _ = run(*common, "--lang", "xx_yy", "--mark-reviewed", "a")
+            self.assertEqual(code, 0)
+            self.assertTrue((review / "horizon-friends" / "xx_yy.json").exists())
+            code, _, err = run(*common, "--lang", "xx_yy", "--mark-reviewed", "nosuch")
+            self.assertEqual(code, 1)
+            self.assertIn("no key 'nosuch'", err)
+            # A scratch --game-dir alone leaves the repository's crates out.
+            code, out, _ = run("--game-dir", str(game), "--review-dir", str(review), "--game-only", "--summary")
+            self.assertNotIn("horizon-friends", out)
+
     def test_every_repository_record_belongs_to_a_lang_file_and_reads(self):
-        for kind, folder in (("game", lang_coverage.GAME), ("launcher", lang_coverage.LAUNCHER)):
+        folders = [("game", lang_coverage.GAME), ("launcher", lang_coverage.LAUNCHER),
+                   *lang_coverage.crate_dirs(lang_coverage.CRATES)]
+        for kind, folder in folders:
             for record in sorted((lang_coverage.REVIEW / kind).glob("*.json")):
                 with self.subTest(record=record.name, kind=kind):
                     self.assertTrue((folder / record.name).exists(), f"{record} names no lang file")

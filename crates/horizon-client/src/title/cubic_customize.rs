@@ -2120,6 +2120,7 @@ pub(super) fn buttons(w: f32, h: f32, state: &State) -> Vec<Button> {
         icon: None,
         trailing: None,
         action: None,
+        agent_id: None,
     };
     let row = |specs: Vec<(&str, bool, u8)>, width: f32| {
         let total = specs.len() as f32 * (width + 4.0) - 4.0;
@@ -2438,9 +2439,11 @@ pub(super) fn draw(
     batch: &mut HudBatch,
     cursor: (f32, f32),
     state: &State,
+    phases: &mut dyn FnMut(crate::screen_draw::RenderPhase, &mut HudBatch),
 ) {
     let (w, h) = (batch.width.ceil(), batch.height.ceil());
     ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+    phases(crate::screen_draw::RenderPhase::Background, batch);
     match &state.overlay {
         Overlay::Presets(presets) => {
             return draw_presets(title, atlas, batch, state, presets, (w, h));

@@ -135,7 +135,7 @@
             meta = with pkgs.lib; {
               description = "Launcher for Horizon, Minecraft: Java Edition rewritten in Rust";
               homepage = "https://playhorizon.dev";
-              license = licenses.mit;
+              license = licenses.lgpl3Plus;
               platforms = [ "x86_64-linux" "aarch64-linux" ];
               mainProgram = pname;
             };
@@ -150,8 +150,17 @@
         horizon-launcher = self.packages.${final.stdenv.hostPlatform.system}.horizon-launcher;
       } // gamePackages final;
 
+      # services.horizon-server (docs/nix.md).
+      nixosModules = {
+        horizon-server = import ./nix/module.nix { inherit self; };
+        default = self.nixosModules.horizon-server;
+      };
+
       checks = forAllSystems (pkgs: {
         inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) horizon-server horizon-prepare;
+      } // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        # The module in a VM, without any of Mojang's files.
+        nixos-module = pkgs.testers.runNixOSTest (import ./nix/tests/server.nix { inherit self; });
       });
 
       devShells = forLinuxSystems (pkgs: {

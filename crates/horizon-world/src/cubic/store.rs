@@ -30,7 +30,7 @@
 
 use super::has_cube;
 use crate::compression::Compression;
-use crate::nbt::{Limits, NamedTag, Tag};
+use horizon_core::nbt::{Limits, NamedTag, Tag};
 use crate::region::{ChunkRecord, RegionFile};
 use horizon_core::position::{ChunkPos, SectionPos};
 use std::collections::HashMap;
@@ -482,7 +482,7 @@ impl CubeStore {
             };
             bytes.clone()
         };
-        let (mut root, _) = crate::nbt::read_named(&bytes, Limits::saved()).map_err(invalid)?;
+        let (mut root, _) = horizon_core::nbt::read_named(&bytes, Limits::saved()).map_err(invalid)?;
         if let Tag::Compound(map) = &mut root.tag {
             map.insert("xPos".into(), Tag::Int(cube.x));
             map.insert("zPos".into(), Tag::Int(cube.z));
@@ -723,7 +723,7 @@ fn template_of(cube: SectionPos, root: &NamedTag) -> io::Result<Vec<u8>> {
         name: root.name.clone(),
         tag: Tag::Compound(map),
     };
-    crate::nbt::write_named(&template, Limits::saved()).map_err(invalid)
+    horizon_core::nbt::write_named(&template, Limits::saved()).map_err(invalid)
 }
 
 fn checksum(bytes: &[u8]) -> u64 {

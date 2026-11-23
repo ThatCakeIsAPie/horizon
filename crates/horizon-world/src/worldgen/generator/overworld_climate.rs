@@ -48,7 +48,7 @@ impl GeneratorData {
         let source = self
             .source_catalog
             .decode(&generator["biome_source"].to_string())?
-            .resolve(&self.presets)
+            .resolve(&self.presets, seed)
             .map_err(|e| resource(format!("biome source: {e}")))?;
         let ResolvedBiomeSource::MultiNoise(source) = source else {
             return Err(resource("the overworld's biome source is not multi-noise"));

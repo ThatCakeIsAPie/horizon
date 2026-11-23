@@ -55,10 +55,10 @@ pub trait CubeWorld {
     fn place_structures(&mut self, _cube: SectionPos) {}
     /// A block entity a structure placed (a chest with its loot table, a
     /// spawner), as NBT without its position.
-    fn set_block_entity(&mut self, _p: [i32; 3], _nbt: crate::nbt::Compound) {}
+    fn set_block_entity(&mut self, _p: [i32; 3], _nbt: horizon_core::nbt::Compound) {}
     /// An entity a structure carried (a villager, a guardian), as NBT with
     /// its `Pos`.
-    fn add_entity(&mut self, _nbt: crate::nbt::Compound) {}
+    fn add_entity(&mut self, _nbt: horizon_core::nbt::Compound) {}
 }
 
 /// A compiled `GenerationCondition`.

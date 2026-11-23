@@ -378,16 +378,17 @@ fn activity(status: Status, since: Option<u64>) -> Option<Value> {
                 assets["small_text"] = text.into();
             }
             let place = match dimension {
-                Dimension::Overworld => "In the Overworld",
-                Dimension::Nether => "In the Nether",
-                Dimension::End => "In the End",
+                Dimension::Overworld => Some("In the Overworld"),
+                Dimension::Nether => Some("In the Nether"),
+                Dimension::End => Some("In the End"),
+                Dimension::Other => None,
             };
             let (details, party) = match play {
                 Play::Singleplayer => ("Singleplayer", None),
                 Play::Multiplayer => ("Multiplayer", None),
                 Play::Hosting { players, max } => ("Hosting a world", Some((players, max))),
             };
-            (details, Some(place), party)
+            (details, place, party)
         }
     };
     let mut a = json!({"details": details, "assets": assets});
@@ -658,6 +659,11 @@ mod tests {
         assert!(single.get("party").is_none());
         assert!(single["assets"].get("small_image").is_none());
 
+        let custom = activity(world(Play::Singleplayer, Dimension::Other), Some(1000)).unwrap();
+        assert_eq!(custom["details"], "Singleplayer");
+        assert!(custom.get("state").is_none());
+        assert_eq!(custom["timestamps"]["start"], 1000);
+
         let multi = activity(world(Play::Multiplayer, Dimension::End), Some(5)).unwrap();
         assert_eq!(multi["details"], "Multiplayer");
         assert_eq!(multi["state"], "In the End");
@@ -709,8 +715,6 @@ mod tests {
         assert_eq!(limit.wait(t + WINDOW), Duration::from_secs(1));
     }
 
-    /// A fake Discord: answers the handshake with READY, each command with its nonce, after a ping.
-    #[cfg(unix)]
     /// The switch as the player's settings and the Extras page see it. The only test that
     /// touches the presence's statics.
     #[test]
@@ -742,6 +746,8 @@ mod tests {
         SECTION.act(0, Act::Press);
     }
 
+    /// A fake Discord: answers the handshake with READY, each command with its nonce, after a ping.
+    #[cfg(unix)]
     #[test]
     fn talks_to_discord_over_its_socket() {
         let dir = std::env::temp_dir().join(format!("horizon-discord-{}", std::process::id()));

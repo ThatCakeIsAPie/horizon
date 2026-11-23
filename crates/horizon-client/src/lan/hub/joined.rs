@@ -1,0 +1,52 @@
+//! Entities that join a level between tracking passes (`ChunkMap.addEntity`): paired as they
+//! joined, before their first tick.
+use super::{Hub, entity_type};
+use crate::lan::entity::EntityState;
+
+impl Hub {
+    /// Fresh entities that joined during the current tick before the tracking pass:
+    /// paired from their state as they joined (ChunkMap.addEntity), before their first tick.
+    pub fn note_fresh_joined(&mut self, entities: &[EntityState]) {
+        let joined: Vec<_> = entities
+            .iter()
+            .filter(|e| !self.tracks(e.id))
+            .cloned()
+            .collect();
+        if joined.is_empty() {
+            return;
+        }
+        let key = self.level_key();
+        self.fresh_joined.entry(key).or_default().extend(joined);
+    }
+
+    /// `ChunkMap.addEntity` for late arrivals, before their sounds are sent.
+    /// Pairing does not run another tracking pass or advance entity clocks.
+    pub fn note_joined(&mut self, entities: &[EntityState]) {
+        if entities.is_empty() {
+            return;
+        }
+        let key = self.level_key();
+        let (dimension, shard) = (self.config.dimension.clone(), self.shard);
+        let mut outs: Vec<Vec<crate::lan::Body>> = self
+            .guests
+            .iter()
+            .filter(|g| self.here(g))
+            .map(|_| Vec::new())
+            .collect();
+        let mut viewers = self.guests.tracking_viewers(
+            |g| g.placed && g.dimension == dimension && g.shard == shard,
+            outs.iter_mut().map(|out| (out, None)),
+            false,
+        );
+        let level = self.entities.entry(key).or_default();
+        level.range_percent = Some(self.entity_range_percent);
+        let (types, sync) = (&mut self.entity_types, &self.sync);
+        level.pair_after_tick(entities, &self.riding, &mut viewers, |kind| {
+            entity_type(types, sync, kind)
+        });
+        drop(viewers);
+        for (g, out) in self.guests.iter().filter(|g| self.here(g)).zip(&mut outs) {
+            g.sender.send_many(out.drain(..));
+        }
+    }
+}

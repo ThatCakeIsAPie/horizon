@@ -74,11 +74,70 @@ pub trait ResourceSource {
         vec!["minecraft".into()]
     }
 }
+/// The bundled file a language reads, and whether it drops `ß`: a regional variant reads its
+/// language's file (Swiss German writes "ss" for "ß", as vanilla's de_ch does).
+fn bundled_code(code: &str) -> (&str, bool) {
+    match code {
+        "ko" => ("ko_kr", false),
+        "hr" => ("hr_hr", false),
+        "de_at" => ("de_de", false),
+        "de_ch" => ("de_de", true),
+        "fr_ca" | "fr_ch" => ("fr_fr", false),
+        "es_ar" | "es_cl" | "es_ec" | "es_mx" | "es_uy" | "es_ve" => ("es_es", false),
+        code => (code, false),
+    }
+}
+
+/// Lang files crates above the engine ship (`horizon_hooks::lang`), each a list of
+/// (code, JSON) pairs. The game's entry installs them once, before any language loads.
+static CRATE_FILES: std::sync::OnceLock<&'static [&'static [(&'static str, &'static str)]]> =
+    std::sync::OnceLock::new();
+
+/// Installs the crates' lang files (`horizon_hooks::lang::engine::all()`). Only the first call
+/// counts.
+pub fn install_crate_files(files: &'static [&'static [(&'static str, &'static str)]]) {
+    let _ = CRATE_FILES.set(files);
+}
+
+/// The crates' entries for language `code` (through [`bundled_code`]'s variants) that the
+/// engine's own `horizon` file for it doesn't have: on a key both have, the engine wins.
+fn read_crate_files(files: &[&[(&str, &str)]], code: &str, map: &mut HashMap<String, String>) {
+    if files.is_empty() {
+        return;
+    }
+    let (file, swiss) = bundled_code(code);
+    let mut own = HashMap::new();
+    if let Some(bytes) = Bundled.read(&format!("assets/horizon/lang/{code}.json")) {
+        read_lang_file(&bytes, &mut own);
+    }
+    for (c, json) in files.iter().flat_map(|f| f.iter()) {
+        if *c != file {
+            continue;
+        }
+        let mut theirs = HashMap::new();
+        if swiss {
+            read_lang_file(json.replace('ß', "ss").as_bytes(), &mut theirs);
+        } else {
+            read_lang_file(json.as_bytes(), &mut theirs);
+        }
+        for (key, value) in theirs {
+            if !own.contains_key(&key) {
+                map.insert(key, value);
+            }
+        }
+    }
+}
+
 /// Horizon's own strings, compiled in so they need no prepared resources.
 struct Bundled;
 impl ResourceSource for Bundled {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
-        let body = match path {
+        let code = path
+            .strip_prefix("assets/horizon/lang/")?
+            .strip_suffix(".json")?;
+        let (file, swiss) = bundled_code(code);
+        let path = format!("assets/horizon/lang/{file}.json");
+        let body = match path.as_str() {
             "assets/horizon/lang/en_us.json" => {
                 include_str!("../../horizon-client/assets/horizon/lang/en_us.json")
             }
@@ -103,10 +162,10 @@ impl ResourceSource for Bundled {
             "assets/horizon/lang/tr_tr.json" => {
                 include_str!("../../horizon-client/assets/horizon/lang/tr_tr.json")
             }
-            "assets/horizon/lang/ko_kr.json" | "assets/horizon/lang/ko.json" => {
+            "assets/horizon/lang/ko_kr.json" => {
                 include_str!("../../horizon-client/assets/horizon/lang/ko_kr.json")
             }
-            "assets/horizon/lang/hr_hr.json" | "assets/horizon/lang/hr.json" => {
+            "assets/horizon/lang/hr_hr.json" => {
                 include_str!("../../horizon-client/assets/horizon/lang/hr_hr.json")
             }
             "assets/horizon/lang/pt_pt.json" => {
@@ -331,34 +390,35 @@ impl ResourceSource for Bundled {
             "assets/horizon/lang/vec_it.json" => {
                 include_str!("../../horizon-client/assets/horizon/lang/vec_it.json")
             }
-            "assets/horizon/lang/de_de.json" | "assets/horizon/lang/de_at.json" => {
+            "assets/horizon/lang/de_de.json" => {
                 include_str!("../../horizon-client/assets/horizon/lang/de_de.json")
             }
-            // Swiss German writes "ss" for "ß", as vanilla's de_ch does.
-            "assets/horizon/lang/de_ch.json" => {
-                let de = include_str!("../../horizon-client/assets/horizon/lang/de_de.json");
-                return Some(de.replace('ß', "ss").into_bytes());
-            }
-            "assets/horizon/lang/fr_fr.json"
-            | "assets/horizon/lang/fr_ca.json"
-            | "assets/horizon/lang/fr_ch.json" => {
+            "assets/horizon/lang/fr_fr.json" => {
                 include_str!("../../horizon-client/assets/horizon/lang/fr_fr.json")
             }
-            "assets/horizon/lang/es_es.json"
-            | "assets/horizon/lang/es_ar.json"
-            | "assets/horizon/lang/es_cl.json"
-            | "assets/horizon/lang/es_ec.json"
-            | "assets/horizon/lang/es_mx.json"
-            | "assets/horizon/lang/es_uy.json"
-            | "assets/horizon/lang/es_ve.json" => {
+            "assets/horizon/lang/es_es.json" => {
                 include_str!("../../horizon-client/assets/horizon/lang/es_es.json")
             }
             _ => return None,
         };
+        if swiss {
+            return Some(body.replace('ß', "ss").into_bytes());
+        }
         Some(body.as_bytes().to_vec())
     }
     fn namespaces(&self) -> Vec<String> {
         vec!["horizon".into()]
+    }
+}
+impl ResourceSource for horizon_assets::resource_source::ResourceSource {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        self.read(path).ok()
+    }
+    fn exists(&self, path: &str) -> bool {
+        self.contains(path)
+    }
+    fn namespaces(&self) -> Vec<String> {
+        self.namespaces("assets")
     }
 }
 impl ResourceSource for std::path::PathBuf {
@@ -434,10 +494,29 @@ pub fn read_lang_file(bytes: &[u8], map: &mut HashMap<String, String>) {
 }
 
 impl Language {
+    /// A language holding only `entries` (key, template), as `code`: the part of the current
+    /// language a text needs, carried where no language is loaded.
+    pub fn of(code: &str, entries: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            code: code.to_owned(),
+            bidirectional: false,
+            map: entries.into_iter().collect(),
+        }
+    }
     /// ClientLanguage.loadFrom: en_us first, then the selected language, each
     /// from every namespace and every source in priority order (later sources
     /// override).
     pub fn load(sources: &[&dyn ResourceSource], code: &str) -> Self {
+        let crate_files = CRATE_FILES.get().copied().unwrap_or_default();
+        Self::load_with(sources, code, crate_files)
+    }
+
+    /// [`Language::load`] with these crates' lang files.
+    fn load_with(
+        sources: &[&dyn ResourceSource],
+        code: &str,
+        crate_files: &[&[(&str, &str)]],
+    ) -> Self {
         let mut map = HashMap::new();
         let mut codes = vec![DEFAULT];
         if code != DEFAULT {
@@ -453,12 +532,14 @@ impl Language {
             sources.iter().flat_map(|s| s.namespaces()).collect();
         for c in codes {
             for namespace in &namespaces {
-                for source in sources {
-                    let Some(bytes) = source.read(&format!("assets/{namespace}/lang/{c}.json"))
-                    else {
-                        continue;
-                    };
-                    read_lang_file(&bytes, &mut map);
+                for (i, source) in sources.iter().enumerate() {
+                    if let Some(bytes) = source.read(&format!("assets/{namespace}/lang/{c}.json")) {
+                        read_lang_file(&bytes, &mut map);
+                    }
+                    // The crates' text right after the engine's own (`Bundled`, the first source).
+                    if i == 0 && namespace == "horizon" {
+                        read_crate_files(crate_files, c, &mut map);
+                    }
                 }
             }
         }
@@ -536,13 +617,86 @@ pub fn available(sources: &[&dyn ResourceSource]) -> Vec<LanguageInfo> {
     found.into_values().collect()
 }
 
+#[cfg(feature = "test-language-publication")]
+thread_local! {
+    static PUBLICATION: RefCell<Option<Arc<Language>>> = const { RefCell::new(None) };
+}
+
+/// Isolate language reload publication on this fixture thread, including nested scopes.
+/// Unlike `scoped`, subsequent `set` calls replace the visible language.
+#[cfg(feature = "test-language-publication")]
+pub fn isolate_publication(language: Language) -> impl Drop {
+    struct Restore(
+        Option<Arc<Language>>,
+        std::marker::PhantomData<std::rc::Rc<()>>,
+    );
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PUBLICATION.with(|slot| *slot.borrow_mut() = self.0.take());
+            scope_changed();
+        }
+    }
+    let previous = PUBLICATION.with(|slot| slot.replace(Some(Arc::new(language))));
+    scope_changed();
+    Restore(previous, std::marker::PhantomData)
+}
+
+#[cfg(all(test, feature = "test-language-publication"))]
+#[test]
+fn isolated_reload_publications_are_mutable_nested_and_thread_local() {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|scope| {
+        for value in ["first", "second"] {
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                let _outer = isolate_publication(Language::of("en_us", []));
+                set(Language::of(
+                    "en_us",
+                    [("fixture.key".into(), value.into())],
+                ));
+                barrier.wait();
+                assert_eq!(get("fixture.key"), value);
+                {
+                    let _inner = isolate_publication(Language::of("en_us", []));
+                    set(Language::of(
+                        "en_us",
+                        [("fixture.key".into(), "nested".into())],
+                    ));
+                    assert_eq!(get("fixture.key"), "nested");
+                }
+                assert_eq!(get("fixture.key"), value);
+            });
+        }
+    });
+}
+
 pub fn set(language: Language) {
+    #[cfg(feature = "test-language-publication")]
+    let language = match PUBLICATION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            *slot = Some(Arc::new(language));
+            None
+        } else {
+            Some(language)
+        }
+    }) {
+        Some(language) => language,
+        None => {
+            scope_changed();
+            return;
+        }
+    };
     BIDIRECTIONAL.store(language.bidirectional, Ordering::Relaxed);
     *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(language));
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 pub fn current() -> Option<Arc<Language>> {
     if let Some(language) = SCOPE.with(|s| s.borrow().as_ref().map(|s| s.language.clone())) {
+        return Some(language);
+    }
+    #[cfg(feature = "test-language-publication")]
+    if let Some(language) = PUBLICATION.with(|slot| slot.borrow().clone()) {
         return Some(language);
     }
     CURRENT.read().unwrap_or_else(|e| e.into_inner()).clone()
@@ -590,6 +744,10 @@ fn missed(key: &str) {
 }
 /// `ClientLanguage.defaultRightToLeft` of the current language.
 pub fn bidirectional() -> bool {
+    #[cfg(feature = "test-language-publication")]
+    if let Some(language) = PUBLICATION.with(|slot| slot.borrow().clone()) {
+        return language.bidirectional;
+    }
     BIDIRECTIONAL.load(Ordering::Relaxed)
 }
 pub fn code() -> String {
@@ -689,6 +847,43 @@ mod tests {
     }
 
     #[test]
+    fn a_crates_text_loads_after_the_engines_and_before_packs() {
+        static CRATE: &[(&str, &str)] = &[
+            (
+                "en_us",
+                r#"{"test.crate.hello": "Hello", "horizon.osk.close": "Shut", "test.crate.packed": "Crate"}"#,
+            ),
+            (
+                "de_de",
+                r#"{"test.crate.hello": "Grüß dich", "horizon.osk.close": "Zu"}"#,
+            ),
+            ("fr_fr", r#"{"test.crate.hello": "Bonjour"}"#),
+        ];
+        let pack = Mem(HashMap::from([(
+            "assets/horizon/lang/en_us.json".to_owned(),
+            br#"{"test.crate.packed": "Pack"}"#.to_vec(),
+        )]));
+        let load = |code| Language::load_with(&[&pack], code, &[CRATE]);
+        let en = load("en_us");
+        assert_eq!(en.get("test.crate.hello"), Some("Hello"));
+        // The engine's own file wins on a key both have; a pack wins over both.
+        assert_eq!(en.get("horizon.osk.close"), Some("Close"));
+        assert_eq!(en.get("test.crate.packed"), Some("Pack"));
+        let de = load("de_de");
+        assert_eq!(de.get("test.crate.hello"), Some("Grüß dich"));
+        assert_eq!(de.get("horizon.osk.close"), Some("Schließen"));
+        // Regional variants read their language's file, as the engine's do.
+        assert_eq!(load("de_ch").get("test.crate.hello"), Some("Grüss dich"));
+        assert_eq!(load("fr_ca").get("test.crate.hello"), Some("Bonjour"));
+        // A language the crate lacks falls back to its English.
+        assert_eq!(load("pl_pl").get("test.crate.hello"), Some("Hello"));
+        // Without crate files, nothing changes.
+        let plain = Language::load_with(&[&pack], "de_de", &[]);
+        assert_eq!(plain.get("test.crate.hello"), None);
+        assert_eq!(plain.len() + 1, de.len());
+    }
+
+    #[test]
     fn a_scoped_language_is_the_calling_threads_and_reports_what_it_lacks() {
         let empty = Mem(HashMap::new());
         let outside = code();
@@ -739,6 +934,20 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../horizon-client/assets/horizon/lang")
     }
+    /// The crates whose own lang files the game loads (`crates/<name>/assets/lang`,
+    /// registered through `horizon_hooks::lang`), with that folder.
+    fn crate_lang_dirs() -> Vec<(String, std::path::PathBuf)> {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut dirs: Vec<_> = std::fs::read_dir(&crates)
+            .unwrap()
+            .flatten()
+            .map(|e| (e.file_name().into_string().unwrap(), e.path()))
+            .map(|(name, path)| (name, path.join("assets/lang")))
+            .filter(|(_, dir)| dir.join("en_us.json").is_file())
+            .collect();
+        dirs.sort();
+        dirs
+    }
     /// The keys of a flat bundled file in file order, duplicates included (a map
     /// would keep only the last of two equal keys). One `"key": "value"` per line.
     fn file_keys(body: &str) -> Vec<String> {
@@ -753,34 +962,364 @@ mod tests {
             })
             .collect()
     }
-    /// The fields the code fills in (`%s`, `%d`, `%1$s`, `%.2f`, `%%`), sorted. A
-    /// percent sign that starts none of them ("100% is") is plain text.
-    fn placeholders(text: &str) -> Vec<String> {
-        let mut found = Vec::new();
-        let mut rest = text;
-        while let Some(at) = rest.find('%') {
-            rest = &rest[at + 1..];
-            let spec = rest
-                .find(|c: char| !(c.is_ascii_digit() || c == '$' || c == '.'))
-                .unwrap_or(rest.len());
-            let after = rest[spec..].chars().next();
-            if after.is_some_and(|c| matches!(c, 's' | 'd' | 'f' | '%')) {
-                let end = spec + 1;
-                found.push(format!("%{}", &rest[..end]));
-                rest = &rest[end..];
+    /// How the game reads `text` as a template, walked by the formatter's own parser
+    /// (`crate::text::walk_template`): the argument indices it fills in, once per use and
+    /// sorted, and its literal text; `None` where it shows the template as written whatever the
+    /// arguments (`%d`, `%q`, a `%` at the end, `%0$s`). `tools/lang_coverage.py` mirrors it.
+    fn template(text: &str) -> Option<(Vec<usize>, String)> {
+        use crate::text::{TemplatePiece, TemplateWalk, walk_template};
+        use std::ops::ControlFlow;
+        let mut fields = Vec::new();
+        let mut literal = String::new();
+        let walk = walk_template(text, |piece| match piece {
+            // `%0$s`: no call has an argument at usize::MAX.
+            TemplatePiece::Argument(usize::MAX) => ControlFlow::Break(()),
+            TemplatePiece::Argument(index) => {
+                fields.push(index);
+                ControlFlow::Continue(())
+            }
+            TemplatePiece::Literal(text) => {
+                literal.push_str(text);
+                ControlFlow::Continue(())
+            }
+        });
+        if walk != TemplateWalk::Done {
+            return None;
+        }
+        fields.sort_unstable();
+        Some((fields, literal))
+    }
+    /// The keys whose English text the game cannot format: read as plain text, never formatted.
+    /// The list may only shrink: `a_listed_unformattable_key_still_cannot_be_formatted` pins it.
+    fn unformattable() -> HashMap<String, String> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/lang_unformattable.json"
+        );
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+    /// Unicode's bidirectional embedding, override and isolate controls.
+    fn is_bidi_control(c: char) -> bool {
+        matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    }
+
+    /// What is wrong with one translated `value` of `key`, if anything: the game cannot format
+    /// it (it would show the template as written, `%s` and all), it fills in other arguments
+    /// than English, it drops the percent sign English writes as `%%`, or it carries a control
+    /// character. A line break is always allowed, a tab and a bidi control only where English
+    /// has one.
+    fn entry_problem(
+        key: &str,
+        value: &str,
+        english: &str,
+        plain: &HashMap<String, String>,
+    ) -> Option<&'static str> {
+        let (read, wanted) = (template(value), template(english));
+        if plain.contains_key(key) {
+            if read.map(|t| t.0).unwrap_or_default() != wanted.map(|t| t.0).unwrap_or_default() {
+                return Some("is read as plain text and must fill in no argument");
+            }
+        } else {
+            let Some((fields, literal)) = read else {
+                return Some("is a template the game cannot format");
+            };
+            if wanted.as_ref().map(|t| &t.0) != Some(&fields) {
+                return Some("changes the placeholders of the English text");
+            }
+            if english.contains("%%") && !literal.contains('%') {
+                return Some("drops the percent sign the English text shows");
             }
         }
-        found.sort();
+        text_problem(english, value).map(|rule| match rule {
+            "control" => "carries a control character its English text lacks",
+            "invisible" => "carries an invisible character its English text lacks",
+            "combining_marks" => "stacks more combining marks than its English text allows",
+            "bidi" => "opens bidi controls it does not close, or more than its English text",
+            "formatting_code" => "has other `§` formatting codes than its English text",
+            "line_break" => "has more line breaks than twice its English text's",
+            "length" => "is longer than its English text allows",
+            _ => "has a longer unbroken run than its English text allows",
+        })
+    }
+
+    /// At most this many times the English length in characters, or the English length plus
+    /// `LENGTH_SLACK`, whichever is more; the longest run without a break is `MAX_RUN`, and the
+    /// most combining marks in a row `MAX_MARKS`, unless English has more. The same as
+    /// `tools/lang_coverage.py`.
+    const LENGTH_FACTOR: usize = 4;
+    const LENGTH_SLACK: usize = 80;
+    const MAX_RUN: usize = 60;
+    const MAX_MARKS: usize = 4;
+
+    fn is_invisible(c: char) -> bool {
+        matches!(c,
+            '\u{200b}' | '\u{2060}' | '\u{2028}' | '\u{2029}' | '\u{feff}' | '\u{ad}' | '\u{34f}'
+            | '\u{180e}' | '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}'
+            | '\u{fdd0}'..='\u{fdef}'
+            | '\u{e000}'..='\u{f8ff}'
+            | '\u{f0000}'..='\u{ffffd}'
+            | '\u{100000}'..='\u{10fffd}')
+            || ((c as u32) & 0xfffe) == 0xfffe
+    }
+    fn is_variation_selector(c: char) -> bool {
+        matches!(c,
+            '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}' | '\u{180b}'..='\u{180d}' | '\u{180f}')
+    }
+    /// One of the sorted, disjoint range lists of `tools/lang_unicode_tables.json`, which
+    /// `tools/gen_lang_unicode_tables.py` writes from the Unicode Character Database and
+    /// `tools/lang_coverage.py` reads too: std has no general category or script.
+    fn in_table(name: &str, c: char) -> bool {
+        type Tables = HashMap<String, Vec<(u32, u32)>>;
+        static TABLES: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
+        let tables = TABLES.get_or_init(|| {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tools/lang_unicode_tables.json"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            ["spaceless", "combining", "transparent"]
+                .into_iter()
+                .map(|key| {
+                    let ranges = serde_json::from_value(body[key].clone()).unwrap();
+                    (key.to_owned(), ranges)
+                })
+                .collect()
+        });
+        let ranges = &tables[name];
+        let at = ranges.partition_point(|&(_, high)| high < c as u32);
+        ranges.get(at).is_some_and(|&(low, _)| low <= c as u32)
+    }
+    /// The legacy codes in `text` in order, ASCII ones lowercased: a `§` takes the character
+    /// after it, whatever it is, and neither is drawn (`Text::resolve_legacy`); a `§` at the end
+    /// is a code of its own.
+    fn formatting_codes(text: &str) -> Vec<Option<char>> {
+        let mut found = Vec::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '§' {
+                found.push(chars.next().map(|code| code.to_ascii_lowercase()));
+            }
+        }
         found
+    }
+    /// The most characters one token holds that the game's wrapper cannot break inside: a token
+    /// is what lies between spaces and line breaks (`Font::split_lines` breaks there only), and
+    /// letters of a script written without spaces do not count, since a line of them is cut
+    /// where it overflows.
+    fn longest_run(text: &str) -> usize {
+        text.split(['\n', ' '])
+            .map(|token| token.chars().filter(|&c| !in_table("spaceless", c)).count())
+            .max()
+            .unwrap_or(0)
+    }
+    /// The most combining marks in a row; a transparent character between them (a joiner, a
+    /// direction mark, an emoji modifier) neither counts nor ends the row.
+    fn most_marks(text: &str) -> usize {
+        let (mut most, mut current) = (0, 0);
+        for c in text.chars().filter(|&c| !in_table("transparent", c)) {
+            current = if in_table("combining", c) {
+                current + 1
+            } else {
+                0
+            };
+            most = most.max(current);
+        }
+        most
+    }
+    /// Every bidi embedding, override and isolate `text` opens it closes, nested, and no more of
+    /// each than English opens.
+    fn bidi_balanced(english: &str, text: &str) -> bool {
+        let embedding = |c: char| matches!(c, '\u{202a}' | '\u{202b}' | '\u{202d}' | '\u{202e}');
+        let isolate = |c: char| matches!(c, '\u{2066}'..='\u{2068}');
+        let count = |s: &str, c: char| s.chars().filter(|&x| x == c).count();
+        if text
+            .chars()
+            .filter(|&c| embedding(c) || isolate(c))
+            .any(|c| count(text, c) > count(english, c))
+        {
+            return false;
+        }
+        let mut open = Vec::new();
+        for c in text.chars() {
+            if embedding(c) || isolate(c) {
+                open.push(c);
+            } else if c == '\u{202c}' || c == '\u{2069}' {
+                let closes: fn(char) -> bool = if c == '\u{202c}' { embedding } else { isolate };
+                if !open.pop().is_some_and(closes) {
+                    return false;
+                }
+            }
+        }
+        open.is_empty()
+    }
+    /// The first rule `text`, a translation of `english`, breaks, by its name in
+    /// `tests/fixtures/translation_text_rules.json`: what it may carry beyond its placeholders.
+    fn text_problem(english: &str, text: &str) -> Option<&'static str> {
+        let stray = text.chars().any(|c| match c {
+            '\n' => false,
+            '\t' => !english.contains('\t'),
+            c if is_bidi_control(c) => !english.contains(c),
+            c => c.is_control(),
+        });
+        if stray {
+            return Some("control");
+        }
+        let mut previous: Option<char> = None;
+        for c in text.chars() {
+            if is_invisible(c) && !english.contains(c)
+                || is_variation_selector(c)
+                    && previous.is_none_or(|p| p.is_whitespace() || is_variation_selector(p))
+            {
+                return Some("invisible");
+            }
+            previous = Some(c);
+        }
+        if most_marks(text) > MAX_MARKS.max(most_marks(english)) {
+            return Some("combining_marks");
+        }
+        if !bidi_balanced(english, text) {
+            return Some("bidi");
+        }
+        if formatting_codes(text) != formatting_codes(english) {
+            return Some("formatting_code");
+        }
+        let breaks = |s: &str| s.matches('\n').count();
+        if breaks(text) > 2 * breaks(english) {
+            return Some("line_break");
+        }
+        let length = english.chars().count();
+        if text.chars().count() > (LENGTH_FACTOR * length).max(length + LENGTH_SLACK) {
+            return Some("length");
+        }
+        (longest_run(text) > MAX_RUN.max(longest_run(english))).then_some("unbroken_run")
+    }
+
+    #[test]
+    fn translated_text_keeps_what_its_english_allows() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/translation_text_rules.json"
+        );
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let (english, text) = (
+                case["english"].as_str().unwrap(),
+                case["text"].as_str().unwrap(),
+            );
+            assert_eq!(
+                text_problem(english, text),
+                case["rule"].as_str(),
+                "{}",
+                case["case"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_translation_the_game_cannot_format_or_with_a_control_character_is_refused() {
+        let plain = HashMap::from([("plain".to_owned(), String::new())]);
+        let problem = |value: &str, english: &str| entry_problem("k", value, english, &plain);
+        assert_eq!(problem("%2$s, %1$s", "%s and %s"), None);
+        assert_eq!(problem("50% off %s, %%", "%s"), None);
+        assert_eq!(problem("50 % de %s", "50%% off %s"), None);
+        assert_eq!(problem("line\nnext", "one\ntwo"), None);
+        assert_eq!(problem("a\u{2067}b\u{2069}", "\u{2067}x\u{2069}"), None);
+        for (value, english) in [
+            ("%s %q", "%s %s"),
+            ("%s in %", "%s in"),
+            ("%d", "%s"),
+            ("%s", "%s and %s"),
+            ("%s %s", "%s"),
+            ("%1$s %1$s", "%s %s"),
+            // Past any argument count a probe would supply, and an index no call has.
+            ("Durability %33$s", "Durability"),
+            ("%0$s", "%0$s"),
+            // Text that looks like a filled-in argument is still text.
+            ("\u{e000}0\u{e001}", "%s"),
+            ("50 off %s", "50%% off %s"),
+        ] {
+            assert!(
+                problem(value, english).is_some(),
+                "{value:?} for {english:?}"
+            );
+        }
+        for value in [
+            "a\u{1b}[0m",
+            "a\tb",
+            "a\u{7f}",
+            "a\u{85}",
+            "a\u{202e}b",
+            "a\u{2066}b",
+        ] {
+            assert!(problem(value, "a b").is_some(), "{value:?}");
+        }
+        // A key read as plain text is held to filling in nothing.
+        assert_eq!(
+            entry_problem("plain", "En %", "Durability in %", &plain),
+            None
+        );
+        assert!(entry_problem("plain", "En %s", "Durability in %", &plain).is_some());
+        assert!(entry_problem("plain", "En %33$s", "Durability in %", &plain).is_some());
+    }
+
+    #[test]
+    fn a_listed_unformattable_key_still_cannot_be_formatted() {
+        let en: HashMap<String, String> = serde_json::from_str(
+            &std::fs::read_to_string(bundled_dir().join("en_us.json")).unwrap(),
+        )
+        .unwrap();
+        let listed = unformattable();
+        // Growing the list takes changing this test (and tests/test_lang_coverage.py's twin).
+        let mut keys: Vec<&str> = listed.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["horizon.pvp.hud_armour_percent"]);
+        for key in listed.keys() {
+            let english = en
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} is not in en_us.json"));
+            assert_eq!(
+                template(english),
+                None,
+                "{key} formats now: take it off tools/lang_unformattable.json"
+            );
+        }
     }
 
     #[test]
     fn bundled_files_are_served_and_have_no_stale_or_repeated_keys() {
-        let dir = bundled_dir();
+        let engine = check_lang_dir(&bundled_dir(), true);
+        assert!(
+            engine.1 >= 7,
+            "found {} bundled lang files in {}",
+            engine.1,
+            bundled_dir().display()
+        );
+        // A crate's files pass the same checks. Its keys are its own: on a key the engine's
+        // files also have, the engine's text would win and hide the crate's.
+        for (name, dir) in crate_lang_dirs() {
+            let (en, _) = check_lang_dir(&dir, false);
+            for key in en.keys() {
+                assert!(
+                    !engine.0.contains_key(key),
+                    "{name}: {key} is also the engine's"
+                );
+            }
+        }
+    }
+
+    /// The checks every lang folder passes: flat maps, no repeated key, no key en_us lacks, text
+    /// the game can format with the same arguments as English, no control character English
+    /// lacks, no empty text. Its en_us and how many files it has.
+    fn check_lang_dir(dir: &std::path::Path, bundled: bool) -> (HashMap<String, String>, usize) {
         let en_body = std::fs::read_to_string(dir.join("en_us.json")).unwrap();
         let en: HashMap<String, String> = serde_json::from_str(&en_body).unwrap();
+        let plain = unformattable();
         let mut seen = 0;
-        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
             let name = entry.file_name().into_string().unwrap();
             let Some(code) = name.strip_suffix(".json") else {
                 continue;
@@ -789,7 +1328,7 @@ mod tests {
             // A file that Bundled::read does not name is never loaded.
             let path = format!("assets/horizon/lang/{name}");
             assert!(
-                Bundled.read(&path).is_some(),
+                !bundled || Bundled.read(&path).is_some(),
                 "{name} is not served by Bundled"
             );
             let body = std::fs::read_to_string(entry.path()).unwrap();
@@ -806,24 +1345,25 @@ mod tests {
                 let english = en
                     .get(key)
                     .unwrap_or_else(|| panic!("{code}: {key} is not in en_us.json"));
-                // A translation keeps the fields the code fills in.
-                assert_eq!(
-                    placeholders(value),
-                    placeholders(english),
-                    "{code}: {key} changes the placeholders of the English text"
-                );
+                if let Some(problem) = entry_problem(key, value, english, &plain) {
+                    panic!("{code}: {key} {problem}: {value:?}");
+                }
                 assert!(!value.trim().is_empty(), "{code}: {key} is empty");
             }
         }
-        assert!(
-            seen >= 7,
-            "found {seen} bundled lang files in {}",
-            dir.display()
-        );
+        (en, seen)
     }
 
-    #[test]
-    fn every_horizon_key_the_code_names_is_in_en_us() {
+    /// The crates whose `horizon.` keys must be in en_us.json.
+    const CLIENT_CRATES: [&str; 4] = [
+        "horizon-client",
+        "horizon-client-render",
+        "horizon-client-core",
+        "horizon-client-input",
+    ];
+
+    /// The Rust sources of `krates`, or of every crate under `crates/` when it is empty.
+    fn crate_sources(krates: &[&str]) -> Vec<std::path::PathBuf> {
         fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
                 let path = entry.path();
@@ -834,22 +1374,84 @@ mod tests {
                 }
             }
         }
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        if krates.is_empty() {
+            for entry in std::fs::read_dir(&crates).unwrap().flatten() {
+                rust_files(&entry.path().join("src"), &mut files);
+            }
+        }
+        for krate in krates {
+            rust_files(&crates.join(krate).join("src"), &mut files);
+        }
+        assert!(files.len() > 100, "found only {} sources", files.len());
+        files
+    }
+
+    /// A sentence key (the English text itself, not a `horizon.` id) that no
+    /// source names as a string literal is text the game no longer shows: its
+    /// rewording left it behind in every language (#13802).
+    #[test]
+    #[ignore = "daily"]
+    fn every_sentence_key_in_en_us_is_one_the_code_names() {
         let en: HashMap<String, String> = serde_json::from_str(
             &std::fs::read_to_string(bundled_dir().join("en_us.json")).unwrap(),
         )
         .unwrap();
-        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let mut files = Vec::new();
-        for krate in [
-            "horizon-client",
-            "horizon-client-render",
-            "horizon-client-core",
-        ] {
-            rust_files(&crates.join(krate).join("src"), &mut files);
+        // Every crate: a feature moved out of the client crates keeps its strings.
+        let code: String = crate_sources(&[])
+            .iter()
+            .map(|file| std::fs::read_to_string(file).unwrap())
+            .collect();
+        let sentences: Vec<&String> = en.keys().filter(|k| !k.starts_with("horizon.")).collect();
+        assert!(
+            sentences.len() > 100,
+            "found only {} sentence keys",
+            sentences.len()
+        );
+        // Every quote in the sources opens a candidate literal that runs to the next
+        // unescaped quote, quotes included. A needle is a quote, escaped text and a
+        // quote, so wherever it occurs it is exactly such a slice, and one pass
+        // over the sources replaces a `contains` scan per key.
+        let bytes = code.as_bytes();
+        let mut literals: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (start, _) in bytes.iter().enumerate().filter(|(_, b)| **b == b'"') {
+            let mut at = start + 1;
+            while at < bytes.len() && bytes[at] != b'"' {
+                at += if bytes[at] == b'\\' { 2 } else { 1 };
+            }
+            if at < bytes.len() {
+                literals.insert(&code[start..=at]);
+            }
         }
-        assert!(files.len() > 100, "found only {} sources", files.len());
+        // A JSON string literal escapes `"` and `\` as Rust's does.
+        let mut dead: Vec<&str> = sentences
+            .into_iter()
+            .filter(|key| !literals.contains(serde_json::to_string(key).unwrap().as_str()))
+            .map(String::as_str)
+            .collect();
+        dead.sort_unstable();
+        assert!(
+            dead.is_empty(),
+            "en_us.json keys no code asks for: {dead:#?}"
+        );
+    }
+
+    #[test]
+    fn every_horizon_key_the_code_names_is_in_en_us() {
+        let english = |dir: &std::path::Path| -> HashMap<String, String> {
+            serde_json::from_str(&std::fs::read_to_string(dir.join("en_us.json")).unwrap()).unwrap()
+        };
+        let mut en = english(&bundled_dir());
+        let mut krates = CLIENT_CRATES.to_vec();
+        // A crate that ships lang files names its keys in its own sources.
+        let lang_dirs = crate_lang_dirs();
+        for (name, dir) in &lang_dirs {
+            en.extend(english(dir));
+            krates.push(name);
+        }
         let mut found = 0;
-        for file in files {
+        for file in crate_sources(&krates) {
             let text = std::fs::read_to_string(&file).unwrap();
             for (at, _) in text.match_indices("\"horizon.") {
                 let rest = &text[at + 1..];
@@ -1081,5 +1683,34 @@ mod tests {
             }
         }
         assert!(failed.is_empty(), "{failed:?}");
+    }
+}
+
+#[cfg(test)]
+mod shared_source_tests {
+    use super::*;
+    #[test]
+    fn selected_language_and_english_fallback_read_resolved_resources() {
+        use horizon_assets::resource_source::{Resource, ResourceSource};
+        let source = ResourceSource::indexed(std::collections::BTreeMap::from([
+            (
+                "assets/reader/lang/en_us.json".into(),
+                Resource::bytes(
+                    br#"{"reader.hello":"Hello","reader.only":"English fallback"}"#.to_vec(),
+                ),
+            ),
+            (
+                "assets/reader/lang/fr_fr.json".into(),
+                Resource::bytes(br#"{"reader.hello":"Bonjour"}"#.to_vec()),
+            ),
+            (
+                "assets/mod_fixture/lang/fr_fr.json".into(),
+                Resource::bytes(br#"{"mod_fixture.menu":"Mod layer"}"#.to_vec()),
+            ),
+        ]));
+        let language = Language::load(&[&source], "fr_fr");
+        assert_eq!(language.map["reader.hello"], "Bonjour");
+        assert_eq!(language.map["reader.only"], "English fallback");
+        assert_eq!(language.map["mod_fixture.menu"], "Mod layer");
     }
 }
