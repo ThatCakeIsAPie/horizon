@@ -147,6 +147,8 @@ struct Memory {
     files: HashMap<WorldCoverFile, FileState>,
     tiles: HashMap<TileKey, (Arc<LandTile>, u64)>,
     absent: HashSet<WorldCoverFile>,
+    /// Tiles the source will not give this session: read as "no data", never stored.
+    blank: HashSet<TileKey>,
     clock: u64,
 }
 
@@ -185,6 +187,7 @@ impl LandCoverStore {
                 files: HashMap::new(),
                 tiles: HashMap::new(),
                 absent: HashSet::new(),
+                blank: HashSet::new(),
                 clock: 0,
             }),
         }
@@ -208,10 +211,61 @@ impl LandCoverStore {
         self.file_dir(file).join(format!("length-{len}"))
     }
 
-    /// Records that the source has no such file, so lookups there answer [`Lookup::NoFile`] (until the process
-    /// ends: nothing is written to disk).
+    fn absent_path(&self, file: WorldCoverFile) -> PathBuf {
+        self.file_dir(file).join("absent")
+    }
+
+    /// Records that the source has no such file (a 404: WorldCover has none for open sea), so lookups there
+    /// answer [`Lookup::NoFile`]. It is kept on disk too, so the next run does not ask again.
     pub fn mark_absent(&self, file: WorldCoverFile) {
         lock(&self.memory).absent.insert(file);
+        let _ = write_atomically(&self.absent_path(file), b"");
+    }
+
+    /// Records that the source will not give what `fetch` names (the player's approval was taken back, the
+    /// server refuses): for the rest of this run the file (for an index piece) or the tile reads as "no data", so
+    /// nothing waits for it. Nothing is written to disk, so another run asks again.
+    pub fn mark_unavailable(&self, fetch: &Fetch) {
+        let mut memory = lock(&self.memory);
+        match fetch.wanted {
+            Wanted::Index => {
+                memory.absent.insert(fetch.file);
+            }
+            Wanted::Tile { level, tile } => {
+                memory.blank.insert((fetch.file, level, tile));
+            }
+        }
+    }
+
+    /// Whether `fetch` is still something the store lacks: a stale request (the bytes arrived meanwhile, the file
+    /// turned out absent, a later piece of the index is the next one wanted) is not, so whoever fetches in the
+    /// background skips it instead of asking the source twice.
+    pub fn is_missing(&self, fetch: &Fetch) -> bool {
+        if self.is_absent(fetch.file) {
+            return false;
+        }
+        let Err(next) = self.index_of(fetch.file) else {
+            // The index is whole: only a tile can still be missing.
+            let Wanted::Tile { level, tile } = fetch.wanted else {
+                return false;
+            };
+            let Ok(index) = self.index_of(fetch.file) else {
+                return false;
+            };
+            let Some(l) = index.levels.get(usize::from(level)) else {
+                return false;
+            };
+            return self
+                .tile_of_local(fetch.file, usize::from(level), l, tile as usize)
+                .is_err();
+        };
+        fetch.wanted == Wanted::Index && next.range == fetch.range
+    }
+
+    /// Whether `file` is known to be absent at the source, from memory or from the marker on disk.
+    fn is_absent(&self, file: WorldCoverFile) -> bool {
+        self.load_pieces_from_disk(file);
+        lock(&self.memory).absent.contains(&file)
     }
 
     /// The class at `(lat, lon)`, read at the overview level whose pixels are no taller on the ground than
@@ -221,7 +275,7 @@ impl LandCoverStore {
         let Some(file) = WorldCoverFile::containing(lat, lon) else {
             return Lookup::NoFile;
         };
-        if lock(&self.memory).absent.contains(&file) {
+        if self.is_absent(file) {
             return Lookup::NoFile;
         }
         let index = match self.index_of(file) {
@@ -280,7 +334,7 @@ impl LandCoverStore {
                     continue;
                 };
                 // A pole's own row holds the pole: the 90th parallel is not a row of its own.
-                if r as f64 * step >= 90.0 || lock(&self.memory).absent.contains(&file) {
+                if r as f64 * step >= 90.0 || self.is_absent(file) {
                     continue;
                 }
                 // The box inside this cell, in the cell's own (unwrapped) coordinates.
@@ -467,6 +521,9 @@ impl LandCoverStore {
             }
             state.from_disk = true;
         }
+        if self.absent_path(file).exists() {
+            lock(&self.memory).absent.insert(file);
+        }
         let Ok(entries) = fs::read_dir(self.file_dir(file)) else {
             return;
         };
@@ -520,6 +577,9 @@ impl LandCoverStore {
         if let Some(tile) = self.in_memory(key) {
             return Ok(Some(tile));
         }
+        if lock(&self.memory).blank.contains(&key) {
+            return Ok(None);
+        }
         let range = match level.tile_range(tile_no) {
             Ok(Some(range)) => range,
             Ok(None) => return Ok(None),
@@ -561,8 +621,11 @@ impl LandCoverStore {
         tile_no: usize,
     ) -> Result<(), Fetch> {
         let key = (file, level_no as u8, tile_no as u32);
-        if lock(&self.memory).tiles.contains_key(&key) {
-            return Ok(());
+        {
+            let memory = lock(&self.memory);
+            if memory.tiles.contains_key(&key) || memory.blank.contains(&key) {
+                return Ok(());
+            }
         }
         let range = match level.tile_range(tile_no) {
             Ok(Some(range)) => range,

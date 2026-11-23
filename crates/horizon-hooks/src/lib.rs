@@ -101,6 +101,15 @@ pub trait Hooks: Sync {
         None
     }
 
+    /// The address of the land cover files Earth worlds with land cover on download from: the
+    /// folder (ending in `/`) that holds the dataset's paths (`v200/2021/map/...`). It is not in
+    /// the world's settings: a world file only says whether it wants land cover, and the player's
+    /// approval of this address's host is what lets the game contact it (docs/earth.md). The first
+    /// hook that offers one is used; without one the game has no land cover source.
+    fn earth_land_cover_address(&self) -> Option<&'static str> {
+        None
+    }
+
     /// What the player is doing, for a status shown outside the game (Discord's): called when it
     /// changes, not every frame. Splitscreen: the first player's only.
     fn activity(&self, _now: Activity) {}
@@ -283,6 +292,11 @@ pub mod engine {
     /// [`Hooks::earth_tile_address`]: the first hook that offers one.
     pub fn earth_tile_address() -> Option<&'static str> {
         all().iter().find_map(|h| h.earth_tile_address())
+    }
+
+    /// [`Hooks::earth_land_cover_address`]: the first hook that offers one.
+    pub fn earth_land_cover_address() -> Option<&'static str> {
+        all().iter().find_map(|h| h.earth_land_cover_address())
     }
 
     /// [`Hooks::shutdown`].

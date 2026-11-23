@@ -15,7 +15,8 @@ no code with it.**
 3. Press Customize. The Earth page opens.
 4. Pick a place (Mount Everest, Grand Canyon, Matterhorn, Mount Fuji, Yosemite Valley, Monaco coast, Uluru, Machu
    Picchu), or type a latitude and longitude. Pick the scale.
-5. To download tiles, turn on **Allow downloads**. The page shows the tile server's host when you do. Press Done.
+5. To download tiles, turn on **Allow downloads**. The page shows the tile server's host when you do (and the land
+   cover server's, see Land cover). Press Done.
 6. Create New World.
 
 The page keeps its fields and buttons reachable by mouse and keyboard like the other Customize pages: click a box to
@@ -29,11 +30,13 @@ type into it, Escape lets go of it, and Done and Cancel are in the footer.
 | Scale | Metres of ground per block, in width and height: "1 block = N metres". The page shows the heights the whole Earth would need at that scale (the deepest trench to the highest summit) and warns when they do not fit the world's height range. |
 | Tile server address | A template with `{z}`, `{x}` and `{y}` for the tile. With Horizon's official game it starts as AWS Terrain Tiles (below); the game built alone starts with the box empty. `https://` only (`http://` only to this computer, for testing). |
 | Allow downloads | Whether the game may download tiles it does not have, from the host shown. Off by default. |
+| Land cover | Whether the ground follows ESA WorldCover (forest, grass, sand, water...; see Land cover below). On for a new world when the game has a land cover source, off for a world whose file does not name it. Needs Allow downloads (or data already cached). |
 
 The Presets overlay shows the same settings as JSON, with four that have no box: `seaLevelY` (the block height of
 sea level, 0 by default), `verticalExaggeration` (1), `maxZoom` (the finest tile zoom, 15) and `structures`.
-Everything is saved in the world's `cubicgen.json`. A fifth, `landCover` (off; see Land cover below), is left out of
-the file while it is off.
+Everything is saved in the world's `cubicgen.json`. A fifth, `landCover`, is the Land cover box: `true` when the
+box is on, left out of the file while it is off, and absent in a world made before it existed (those stay as they
+were: their terrain does not change).
 
 ## Where tiles are kept
 
@@ -67,7 +70,16 @@ host a line; lines starting with `#` are ignored, and deleting a line takes the 
 - **Redirects.** A server may redirect a tile request only to another approved host.
 - A dedicated server reads the list from its own folder: its owner edits the file.
 
-A request carries only `User-Agent: Horizon/<version>`: no cookies, no identifier of the player, no referrer.
+A request carries only `User-Agent: Horizon/<version>`: no cookies, no identifier of the player, no referrer (a land
+cover request adds a `Range` header and nothing else).
+
+**Land cover has its own host**, approved the same way and on the same list: `esa-worldcover.s3.eu-central-1.amazonaws.com`.
+With Allow downloads and Land cover on, the Earth page names both hosts and Done approves both; Edit World's button
+approves or takes back all the hosts the world wants (it reads "Allow downloads from A and B" when there are two).
+Approving the tile server never approves the land cover server. A world with land cover on whose host is not
+approved (or with downloads off, or in a game with no land cover address) **runs exactly as if land cover were off**
+(its terrain and its far-view cache are the elevation-only ones), says so in the log, and, for an unapproved host,
+once in chat; it never waits for land cover. Cached land cover is not used while it is off.
 
 ## The data and its attribution
 
@@ -104,12 +116,21 @@ The dataset's publisher requires this attribution
 
 The publisher's page also gives the per-source details (licenses, credit lines) behind each item.
 
-## Land cover: used by the generator, off by default, no downloader yet
+Land cover comes from **ESA WorldCover 2021 v200** (CC BY 4.0, Zanaga et al. 2022, doi:10.5281/zenodo.7254221). ESA
+asks for this credit line (https://esa-worldcover.org/en/data-access, "Attribution text"), which the "Data credits..."
+screen and `THIRD_PARTY_NOTICES.md` show:
+
+```
+© ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) processed by ESA WorldCover consortium
+```
+
+## Land cover
 
 The next data layer is land cover from **ESA WorldCover 2021 v200**: 10 m classes (tree cover, shrubland, grassland,
 cropland, built-up, bare, snow and ice, water, wetland, mangroves, moss and lichen) under CC BY 4.0, in 3° by 3°
-GeoTIFF files on a public bucket, read with HTTP range requests. The generator can use it; nothing in the game
-fetches it yet. In `crates/horizon-earth`:
+GeoTIFF files on a public bucket, read with HTTP range requests. The game downloads only the pieces it reads (a
+file's first 32 KiB, then each compressed tile), never a whole file (they are 100 MB or more). In
+`crates/horizon-earth`:
 
 - **`tiff.rs`**: a minimal TIFF reader over byte slices. It reads exactly what those files are (classic TIFF in
   either byte order, tiled, 8 bits, one sample, DEFLATE with no predictor, a chain of overview levels) and refuses
@@ -122,7 +143,8 @@ fetches it yet. In `crates/horizon-earth`:
   its south-west corner, `N27E084`; the date line wraps and each pole is in its row's file), the pixel inside it,
   the choice of overview level for a ground resolution, and `LAND_COVER_RULES`, the version of all of that, which
   names the on-disk cache folder (`worldcover-2021-v200-rules1`) the way `CLEAN_RULES` keys the elevation cleaning.
-- **`landfield.rs`**: `LandCoverStore`, a bounded memory cache of decoded tiles over a disk cache, with no fetcher.
+- **`landfield.rs`**: `LandCoverStore`, a bounded memory cache of decoded tiles over a disk cache (see "Where land
+  cover is kept"), with no fetcher.
   A lookup that lacks data answers with the `Fetch` to make (file, byte range, index or tile); the caller fetches
   the bytes and hands them to `provide`, which refuses anything that does not decode and stores nothing then.
   `LandCoverField` places it on world blocks through a `Projection`, like the elevation field, with `needs` to list
@@ -131,16 +153,48 @@ fetches it yet. In `crates/horizon-earth`:
   a byte range of a file (cut short at the end of the file, as an HTTP range request does), `Ok(None)` when the
   file does not exist at the source (open sea has none), or an error. `LandCoverSource` is a field plus a fetcher:
   its blocking reads fetch what the store names, hand it over and ask again; a file the fetcher says is absent is
-  marked absent and counts as no data from then on, so it is not an error and nothing retries it.
+  marked absent (kept on disk) and counts as no data from then on, so it is not an error and nothing retries it. A
+  fetcher that refuses (`FetchError::Refused`) is answered as no data for the rest of the run (memory only).
 - **`testing.rs`**: a writer of synthetic tiled TIFFs and `MemoryLandCover`, a fetcher over them, so the tests need
   no real data.
 
+### Downloading, consent and the switch
+
+- **`earth_landnet.rs`** (`crates/horizon-client`) is the `LandCoverFetcher` over the bucket
+  (`https://esa-worldcover.s3.eu-central-1.amazonaws.com/<path>`, with `WorldCoverFile::path()` for the path): an
+  HTTP range request per piece on the same HTTP stack as the tile downloader (`earth_net::Http`: neutral
+  user agent, the same timeouts, redirects only to approved hosts, the same status classification: 404 is no file,
+  403 is a refusal, 5xx and timeouts are temporary). It checks the answer's `Content-Range`, caps the bytes of
+  a response, and has at most 3 requests in flight. Checked against the real bucket: a land file answers 206, an
+  open-sea file 404.
+- **The address** is not in the world file. The official game offers it through `Hooks::earth_land_cover_address`
+  (`horizon-addresses::EARTH_LAND_COVER`, registered by `horizon-earth-source`); `HORIZON_EARTH_LAND_COVER_URL`
+  overrides it (and is the only source in the game built alone). Without either, there is no land cover source:
+  the box is off and disabled, and a world that asks for it runs without.
+- **The switch** is the Land cover box on the Earth page (`landCover` in `cubicgen.json`). A new world has it on
+  when the game has a source; a world file without the key stays off.
+- **The prefetcher** (`earth_prefetch.rs`) fetches land cover on its thread: the pieces the far view recorded
+  (`take_land_requests`), then rounds of `land_needs` for the base-zoom area around the players; stale requests
+  are skipped (`LandCoverStore::is_missing`). A far node that waited for a class is asked again by the far view's
+  own retry (about once a second for nodes that answered "later") and is built once the bytes are in; nothing is
+  rebuilt that was not waiting. The generator's blocking reads (near cubes) fetch what they need themselves.
+
+### Where land cover is kept
+
+`.horizon-cache/earth-landcover/<hash of the address>/worldcover-2021-v200-rules1/<file name>/` in the game folder:
+`index-<offset>.bin` (the file's first 32 KiB and any further index piece), `length-<n>` (the file's size once
+known), `tile-<level>-<n>.bin` (each compressed tile as fetched, decoded again on load) and an empty `absent` for
+a file the bucket does not have. A second session at the same place reads everything from there and makes no
+request (a test serves a file over HTTP, drops the server, and reads it again). Delete the folder to start over;
+a new rule version starts a new folder.
+
 ### What the generator does with it
 
-Set `"landCover": true` in the world's `cubicgen.json` (there is no box for it yet; the file leaves the name out
-while it is off) **and** hand the generator a source (`EarthGenerator::with_land_cover`, built by
-`EarthSettings::land_cover_source`; `CustomCubicGenerator::earth_with_land_cover` for the game's cubic level). With
-either missing the terrain is the elevation-only terrain, block for block (a test compares them). Where a column's
+With `"landCover": true` in the world's `cubicgen.json` (the Land cover box; the file leaves the name out while it
+is off) **and** a source handed to the generator (`EarthGenerator::with_land_cover`, built by
+`EarthSettings::land_cover_source`; `CustomCubicGenerator::earth_with_land_cover` for the game's cubic level, which
+`cubic_gen.rs` calls with the world's `EarthTiles::land`). With either missing the terrain is the elevation-only
+terrain, block for block (a test compares them). Where a column's
 class is known it replaces the elevation rule for the top of the column (`surface.rs`); no data keeps the old rule.
 The class is read at the zoom of the sampling step, so a far voxel uses a coarser overview level than a block.
 
@@ -179,47 +233,21 @@ Choices worth knowing:
 - **The far view** never waits for land cover. A node whose class is not held yet is "later", never built from the
   elevation rule and kept: far nodes are cached on disk, so one built before its class arrived would have to be
   rebuilt when it did, and the whole distance would change colour at once. What is missing is recorded
-  (`EarthGenerator::take_land_requests`, with the same waker as tile requests) for the downloader, which hands it
-  to `LandCoverSource::satisfy` and has the nodes asked for again. A place with no file is no data at once.
+  (`EarthGenerator::take_land_requests`, with the same waker as tile requests) for the prefetcher, which hands it
+  to `LandCoverSource::satisfy`; the far view asks the nodes again. A place with no file is no data at once.
 - **The cache key.** `terrain_key()` ends with `#landcover<data rules>.<surface rules>` while land cover is on, and
   is exactly what it was while off, so worlds made either way never share a far-view cache.
 
 ### Still missing
 
-- The **downloader and the address** (they wait for the owner's decision on the bucket; an address lives in
-  `horizon-addresses`, the downloader next to `earth_net.rs`, with the same consent rules), and the prefetcher
-  taking `take_land_requests` and `land_needs`.
-- The **switch** in the Earth page (today only the JSON), and attribution in the Data credits screen and
-  `THIRD_PARTY_NOTICES.md`.
 - **Trees**, buildings, roads, farmland: the map only changes the ground and the biome.
-- Not checked against a real file: the half-pixel convention (the reader treats a pixel as the area it covers),
-  whether overview levels keep class boundaries well (they are taken as the file gives them), and how the rules
-  look on real places (the tests use synthetic data only).
-
-### Trying it once a downloader exists
-
-1. Implement `LandCoverFetcher` over the bucket (HTTP range requests of `WorldCoverFile::path()`, a 404 for a file
-   as `Ok(None)`), open a `LandCoverStore` under `.horizon-cache/`, and build the source with
-   `EarthSettings::land_cover_source(store, fetcher)`.
-2. Hand it to `CustomCubicGenerator::earth_with_land_cover` where the Earth level is built (`cubic_gen.rs`); when
-   the generator has land cover, `earth_biomes()` is the biome source (`Generation` already uses it).
-3. Make a world, add `"landCover": true` to its `cubicgen.json`, and open it at a place with every class: the
-   Netherlands (polders under the sea level), Death Valley, the Okavango delta, the Everglades, Svalbard.
-
-WorldCover's suggested attribution, when this layer is used (the wording from the land-cover research note, which
-takes it from ESA's data access page, https://esa-worldcover.org/en/data-access; check it against that page before
-it ships, then show it in the Data credits screen and in `THIRD_PARTY_NOTICES.md`):
-
-```
-(c) ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) processed by ESA WorldCover consortium
-```
-
-Citation: Zanaga et al. (2022), ESA WorldCover 10 m 2021 v200, doi:10.5281/zenodo.7254221.
+- Not checked against a real file by the tests (they use synthetic data only): the half-pixel convention (the reader
+  treats a pixel as the area it covers), and whether overview levels keep class boundaries well (they are taken as
+  the file gives them). See the real-data check in the pull request for how the rules look at the Grand Canyon.
 
 ## Known limits
 
-- **Elevation only, one biome (the default).** Without land cover (the default, and the only mode with no
-  downloader) there are no rivers or roads, no buildings. The surface is grass, bare stone or snow by height and
+- **Elevation only, one biome (land cover off).** Without land cover there are no rivers or roads, no buildings. The surface is grass, bare stone or snow by height and
   latitude; every column has the same biome, and vanilla structures are off (`structures` stays false).
 - **Land below sea level floods** unless land cover says otherwise. The sea is at `seaLevelY`: with elevation
   alone any ground lower than 0 m has water over it, so a dry depression such as the Dead Sea shore, or the
@@ -246,8 +274,9 @@ Citation: Zanaga et al. (2022), ESA WorldCover 10 m 2021 v200, doi:10.5281/zenod
 - **`crates/horizon-world/src/cubic/earth/`**: `EarthSettings` and the generator that turns heights (and, when
   on, land cover) into columns of soil, stone, sand and water, with blocking and batched (far view) forms, and the
   biome table (`biome.rs`).
-- **The downloader** (`earth_net.rs`): the only code that contacts a tile server: https only, only the world's
-  address, only when allowed and approved (`earth_consent.rs`).
+- **The downloaders** (`earth_net.rs` for tiles, `earth_landnet.rs` for land cover): the only code that contacts
+  a server: https only, only the world's tile address or the game's land cover address, only when allowed and
+  approved (`earth_consent.rs`); one shared HTTP stack.
 - **The prefetcher** (`earth_prefetch.rs`): works ahead of the players and fetches the tiles the generator and
   the far view will need, with gaps between requests and back-off for tiles that fail.
 - **The far view** (`cubic_lod/earth.rs`): far nodes are built from the elevation tiles alone, never waiting for a

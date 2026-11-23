@@ -183,15 +183,26 @@ impl Generation {
             // The settings name the place and the tiles; nothing else is
             // read from the generator data: one biome, no vegetation and
             // no structures (yet).
-            let settings = EarthSettings::from_json(&text)?;
+            let mut settings = EarthSettings::from_json(&text)?;
             let tiles = tiles.unwrap_or_else(|| {
                 Arc::new(crate::earth_net::open(
                     &settings,
                     &crate::earth_net::cache_root(),
                 ))
             });
-            let generator = CustomCubicGenerator::earth(&settings, tiles.store.clone(), registry)?;
-            // One biome, unless the generator reads land cover (no downloader hands it one yet).
+            // A world that wants land cover but has no source (downloads off, the host not approved, no address in
+            // this build) is the world with land cover off, block for block and in its far-view cache key.
+            if settings.land_cover && tiles.land.is_none() {
+                log::info!("Horizon: this Earth world runs without land cover (landCover is ignored)");
+                settings.land_cover = false;
+            }
+            let generator = CustomCubicGenerator::earth_with_land_cover(
+                &settings,
+                tiles.store.clone(),
+                tiles.land.clone(),
+                registry,
+            )?;
+            // One biome, unless the generator reads land cover.
             let columns = generator
                 .earth_biomes()
                 .unwrap_or_else(|| Arc::new(FixedBiome::new(horizon_world::cubic::earth::BIOME)));

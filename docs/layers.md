@@ -596,6 +596,7 @@ Horizon's own and third-party addresses (Horizon layer):
 | `github.com`, `raw.githubusercontent.com`, `gitlab.com`, `maven.neoforged.net` | modpack porting's sources | `horizon-port-pack` |
 | `playhorizon.dev` | the download link shown with no resources | `no_resources.rs` |
 | `s3.amazonaws.com` (AWS Terrain Tiles) | the tile address Earth's settings page offers (downloads still need the player's approval, docs/earth.md) | `horizon-addresses`, passed in through `Hooks::earth_tile_address` (`horizon-earth-source`) |
+| `esa-worldcover.s3.eu-central-1.amazonaws.com` (ESA WorldCover land cover) | the folder Earth worlds with land cover read byte ranges from (downloads still need the world's `allowDownloads` and the player's approval of the host, docs/earth.md) | `horizon-addresses`, passed in through `Hooks::earth_land_cover_address` (`horizon-earth-source`) |
 | `api.github.com`, `discord.com` | hosting: updates, Discord webhooks | `horizon-server` |
 | `api.github.com`, `uploads.github.com`, `playhorizon.dev` | the registry's submission service | `horizon-mod-registry` |
 | Modrinth, CurseForge, Fabric, Quilt, Forge, NeoForge, GitHub, Microsoft and Xbox sign-in, Tailscale, `discord.gg`, `mclo.gs`, Sculk Hosting, `static.rust-lang.org`, GitHub Sponsors | the launcher's browsers, loaders, sign-in, logs, hosting, partner and sponsor pages | `launcher/src/`, `launcher/links.json` |
