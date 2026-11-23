@@ -655,6 +655,30 @@ impl Title {
                     .does(crate::widgets::Action::Cancel),
                 ]
             }
+            Mode::EarthConsent { .. } => {
+                let y = confirm_top(h, self.message_lines.get())
+                    + 41.0
+                    + self.message_lines.get() as f32 * 9.0;
+                vec![
+                    b(
+                        (w / 2.0).floor() - 152.0,
+                        y,
+                        150.0,
+                        &lang::get_or("gui.yes", "Yes"),
+                        true,
+                        163,
+                    ),
+                    b(
+                        (w / 2.0).floor() + 2.0,
+                        y,
+                        150.0,
+                        &lang::get_or("gui.cancel", "Cancel"),
+                        true,
+                        164,
+                    )
+                    .does(crate::widgets::Action::Cancel),
+                ]
+            }
             Mode::Converting { .. } => Vec::new(),
             // No `does`: Escape is inert here on purpose, so B is too. A on the button stops it.
             Mode::Optimize { .. } => vec![b(

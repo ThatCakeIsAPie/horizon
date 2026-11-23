@@ -1,15 +1,15 @@
 //! Earth's page of the Customize screen: where on the globe world block (0, 0) is (typed, or one of a few
-//! places), how many metres a block spans, the tile server's address, and whether tiles may be downloaded
-//! from it. A second view of the same page shows the data's required credits.
+//! places), how many metres a block spans and the tile server's address. A second view of the same page shows
+//! the data's required credits.
 //!
 //! The other settings (sea level, vertical exaggeration, finest zoom, structures) keep the values they had,
 //! and the Presets overlay edits them as JSON.
 //!
-//! **Consent.** Download consent is the player's, not the world's (`earth_consent`): turning "Allow
-//! downloads" on says which host will be contacted, and pressing Done adds that host to the player's approved
-//! list. A world file that says `allowDownloads: true` for a host the player has not approved shows the
-//! switch off here.
-use super::{Builder, Item, Kind, ROW, State, WIDTH, Widget, button, disabled, toggle, tr};
+//! **Consent.** Downloads and land cover are always on for a new Earth world; there is no switch. Download
+//! consent is the player's, not the world's (`earth_consent`): before this page opens, and again when Done
+//! finds a tile server the player has not approved, the title screen asks one question naming the hosts
+//! ([`Draft::pending_hosts`]); Yes approves them, Cancel leaves Earth unused.
+use super::{Builder, Item, Kind, ROW, State, WIDTH, Widget, button, tr};
 use crate::earth_consent::Approved;
 use crate::{cubic_settings, earth_net, text::Text};
 use horizon_earth::VerticalMap;
@@ -65,12 +65,37 @@ pub(super) struct Context {
 impl Context {
     /// This game and this player.
     fn game() -> Self {
+        #[cfg(test)]
+        if let Some((default_url, land_address)) = TEST_OFFER.with(|o| o.borrow().clone()) {
+            return Self {
+                default_url,
+                land_address,
+                approved: Approved::for_player(),
+            };
+        }
         Self {
             default_url: horizon_hooks::engine::earth_tile_address().map(str::to_owned),
             land_address: crate::earth_landnet::address(),
             approved: Approved::for_player(),
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_OFFER: std::cell::RefCell<Option<(Option<String>, Option<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes this test's games offer the tile address and the land cover address (for [`Context::game`]).
+#[cfg(test)]
+pub(in crate::title) fn offer_for_test(default_url: Option<&str>, land_address: Option<&str>) {
+    TEST_OFFER.with(|o| {
+        *o.borrow_mut() = Some((
+            default_url.map(str::to_owned),
+            land_address.map(str::to_owned),
+        ));
+    });
 }
 
 /// A box's value the settings refuse, as a translatable message.
@@ -94,19 +119,13 @@ impl Problem {
     }
 }
 
-/// Earth's settings as the page holds them: the text of each box, and the switch.
+/// Earth's settings as the page holds them: the text of each box.
 #[derive(Clone, Debug)]
 pub(super) struct Draft {
     latitude: String,
     longitude: String,
     scale: String,
     url: String,
-    /// The switch as the player left it.
-    allow_downloads: bool,
-    /// The host the player turned the switch on for, on this page.
-    consent: Option<String>,
-    /// Whether the world uses land cover.
-    land_cover: bool,
     /// The settings the page does not show, as they were read.
     rest: EarthSettings,
     ctx: Context,
@@ -123,37 +142,26 @@ impl Default for Draft {
 }
 
 impl Draft {
-    /// The starting page: the default place, the offered tile address, downloads off.
+    /// The starting page: the default place and the offered tile address.
     fn start(ctx: Context) -> Self {
         let mut draft = Self::of(&cubic_settings::default_earth(), ctx);
         if let Some(url) = draft.ctx.default_url.clone() {
             draft.url = url;
         }
-        // A new world uses land cover when this game has somewhere to get it (an existing world keeps what its
-        // file says, which is off unless it names `landCover`).
-        draft.land_cover = draft.land_host().is_some();
         draft
     }
 
     fn of(settings: &EarthSettings, ctx: Context) -> Self {
-        let mut draft = Self {
+        Self {
             latitude: settings.origin_latitude.to_string(),
             longitude: settings.origin_longitude.to_string(),
             scale: settings.metres_per_block.to_string(),
             url: settings.tile_url.clone(),
-            allow_downloads: settings.allow_downloads,
-            consent: None,
-            land_cover: settings.land_cover,
             rest: settings.clone(),
             ctx,
             focus: None,
             credits: false,
-        };
-        // A world's own `allowDownloads` is not consent: the switch shows on only for an approved host.
-        draft.allow_downloads &= draft
-            .host()
-            .is_some_and(|h| draft.ctx.approved.contains(&h));
-        draft
+        }
     }
 
     /// The page for the settings text `text` (empty is the starting place), keeping this page's context;
@@ -181,50 +189,27 @@ impl Draft {
         crate::earth_landnet::host_for(&settings, self.ctx.land_address.as_deref())
     }
 
-    /// Whether land cover is on: the switch is, and the game has a source for it.
+    /// Whether the world uses land cover: always, when this game has a source for it.
     fn land_on(&self) -> bool {
-        self.land_cover && self.land_host().is_some()
+        self.land_host().is_some()
     }
 
-    /// The land cover switch.
-    fn toggle_land_cover(&mut self) {
-        self.land_cover = !self.land_on() && self.land_host().is_some();
-    }
-
-    /// Whether downloads are on: the switch is, for a host the player approved before or just now.
-    fn downloads_on(&self) -> bool {
-        self.allow_downloads
-            && self.host().is_some_and(|h| {
-                self.consent.as_ref() == Some(&h) || self.ctx.approved.contains(&h)
-            })
-    }
-
-    /// The switch: turning it on is the player's consent to downloads from the host the page shows.
-    fn toggle_downloads(&mut self) {
-        if self.downloads_on() {
-            self.allow_downloads = false;
-            self.consent = None;
-        } else if let Some(host) = self.host() {
-            self.allow_downloads = true;
-            self.consent = Some(host);
-        }
-    }
-
-    /// Done: the host the player turned downloads on for joins their approved list. Nothing else is.
-    pub(super) fn approve(&mut self) {
-        let Some(host) = self.host().filter(|_| self.downloads_on()) else {
-            return;
-        };
-        if let Err(e) = self.ctx.approved.approve(&host) {
-            log::warn!("Horizon: could not keep the approval of {host} for Earth tiles: {e}");
-        }
-        // The land cover server is a host of its own, approved the same way, by the same press of Done.
-        if self.land_on()
-            && let Some(land) = self.land_host()
-            && let Err(e) = self.ctx.approved.approve(&land)
+    /// The hosts a world made from this page downloads from, the tile server's then the land cover server's.
+    pub(super) fn hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self.host().into_iter().collect();
+        if let Some(land) = self.land_host()
+            && !hosts.contains(&land)
         {
-            log::warn!("Horizon: could not keep the approval of {land} for Earth land cover: {e}");
+            hosts.push(land);
         }
+        hosts
+    }
+
+    /// The hosts of [`Draft::hosts`] the player has not approved: what the consent question names.
+    pub(super) fn pending_hosts(&self) -> Vec<String> {
+        let mut hosts = self.hosts();
+        hosts.retain(|h| !self.ctx.approved.contains(h));
+        hosts
     }
 
     /// Fills the origin from place `n` of [`PLACES`].
@@ -255,7 +240,7 @@ impl Draft {
         settings.origin_longitude = number(&self.longitude, 1)?;
         settings.metres_per_block = number(&self.scale, 2)?;
         settings.tile_url = self.url.trim().to_owned();
-        settings.allow_downloads = self.downloads_on();
+        settings.allow_downloads = self.host().is_some();
         settings.land_cover = self.land_on();
         let limit = horizon_earth::projection::MAX_LATITUDE;
         if settings.origin_latitude.abs() > limit {
@@ -331,14 +316,24 @@ impl Draft {
 }
 
 impl State {
-    /// Done on Create World's Customize screen: an Earth world's tile server, when the player turned
-    /// downloads on for it, becomes an approved host (nothing else does).
-    /// The settings text Done hands back, after it.
+    /// Reads the player's approved hosts again (after the consent question's Yes wrote them).
+    pub fn refresh_approved(&mut self) {
+        self.earth.ctx.approved = Approved::for_player();
+    }
+
+    /// The settings text Done hands back.
     pub fn finish(&mut self) -> String {
-        if self.kind == cubic_settings::CubicKind::Earth {
-            self.earth.approve();
-        }
         self.json()
+    }
+
+    /// The hosts an Earth world made from this page downloads from that the player has not approved yet: what
+    /// the consent question names. Empty for another world type, and once they are approved.
+    pub fn earth_pending_hosts(&self) -> Vec<String> {
+        if self.kind == cubic_settings::CubicKind::Earth {
+            self.earth.pending_hosts()
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -451,8 +446,6 @@ pub(super) fn page(b: &mut Builder, state: &State) {
     b.note(label(3));
     field(b, 3);
     b.note(tr("horizon.cubic.earth.url.help"));
-    downloads(b, earth);
-    land_cover(b, earth);
     b.heading(tr("horizon.cubic.earth.credits.heading"));
     b.note(tr("horizon.cubic.earth.credits.short"));
     b.row(vec![button(tr("horizon.cubic.earth.credits.open"), |s| {
@@ -493,64 +486,6 @@ fn scale_notes(b: &mut Builder, earth: &Draft) {
             b.text(Kind::Warning, line);
         }
     }
-}
-
-/// The host the page will contact, and the switch.
-fn downloads(b: &mut Builder, earth: &Draft) {
-    b.space(4.0);
-    match earth.host() {
-        Some(host) => {
-            b.text(
-                Kind::Heading,
-                sentence("horizon.cubic.earth.server_is", std::slice::from_ref(&host)),
-            );
-            let key = if earth.downloads_on() {
-                "horizon.cubic.earth.downloads.on"
-            } else {
-                "horizon.cubic.earth.downloads.off"
-            };
-            for line in wrap(&sentence(key, &[host]), LINE) {
-                b.note(line);
-            }
-        }
-        None => b.note(tr("horizon.cubic.earth.no_url")),
-    }
-    let on = earth.downloads_on();
-    b.row(vec![disabled(
-        toggle("horizon.cubic.earth.downloads", on, |s, _| {
-            s.earth.toggle_downloads();
-        }),
-        earth.host().is_none(),
-    )]);
-}
-
-/// The land cover switch, and the second host the page will contact for it.
-fn land_cover(b: &mut Builder, earth: &Draft) {
-    b.heading(tr("horizon.cubic.earth.land_cover.heading"));
-    for line in wrap(&tr("horizon.cubic.earth.land_cover.help"), LINE) {
-        b.note(line);
-    }
-    let host = earth.land_host();
-    match &host {
-        None => b.note(tr("horizon.cubic.earth.land_cover.no_source")),
-        Some(host) if earth.land_on() => {
-            let key = if earth.downloads_on() {
-                "horizon.cubic.earth.land_cover.on"
-            } else {
-                "horizon.cubic.earth.land_cover.needs_downloads"
-            };
-            for line in wrap(&sentence(key, std::slice::from_ref(host)), LINE) {
-                b.note(line);
-            }
-        }
-        Some(_) => {}
-    }
-    b.row(vec![disabled(
-        toggle("horizon.cubic.earth.land_cover", earth.land_on(), |s, _| {
-            s.earth.toggle_land_cover();
-        }),
-        host.is_none(),
-    )]);
 }
 
 /// The credits view: the data source and the attribution it requires.
@@ -615,9 +550,6 @@ impl Draft {
             land_address: land_address.map(str::to_owned),
             approved,
         })
-    }
-    pub(super) fn approved(&self) -> &Approved {
-        &self.ctx.approved
     }
     pub(super) fn url(&self) -> &str {
         &self.url

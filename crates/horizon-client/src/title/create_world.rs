@@ -70,6 +70,9 @@ pub struct WorldOptions {
     /// for Custom Cubic and Hybrid, the layers for Flat Cubic. Empty is the
     /// type's defaults.
     pub cubic_json: String,
+    /// The Cubic Chunks type the button had before it came to Earth, which Cancel on Earth's consent
+    /// question goes back to.
+    pub cubic_before: Option<crate::cubic_settings::CubicKind>,
     /// Additional repository sources retained for this creation configuration.
     pub additional_data_packs: std::sync::Arc<[std::sync::Arc<crate::datapack::DataPack>]>,
     /// Alt is held (`CycleButton.DEFAULT_ALT_LIST_SELECTOR`): the world type
@@ -135,6 +138,7 @@ impl Default for WorldOptions {
             pack_dir: None,
             cubic: None,
             cubic_json: String::new(),
+            cubic_before: None,
             additional_data_packs: std::sync::Arc::from([]),
             alt_down: false,
         }
@@ -360,6 +364,15 @@ impl WorldOptions {
         if !same_format {
             self.cubic_json.clear();
         }
+        if self.cubic == Some(CubicKind::Earth) {
+            self.cubic_before = before;
+        }
+    }
+    /// Earth was refused (Cancel on the consent question): the world type it came from, with that type's own
+    /// defaults.
+    pub(super) fn leave_earth(&mut self) {
+        self.cubic = self.cubic_before.take();
+        self.cubic_json.clear();
     }
     /// A step on one of the open tab's cycle buttons or switches (mouse wheel or keyboard).
     pub(super) fn cycle(&mut self, id: u8, creative: &mut bool, step: i32) {

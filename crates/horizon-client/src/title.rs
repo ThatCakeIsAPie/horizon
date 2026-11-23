@@ -316,6 +316,15 @@ pub enum Mode {
         /// The Edit World screen's name field, restored by Cancel.
         name: String,
     },
+    /// Earth's consent question: Earth downloads terrain and land cover from `hosts`, which the player has not
+    /// approved. Yes approves them and goes to `yes` (and presses Create, for `create`); Cancel and Escape go
+    /// to `cancel`. Without the answer Earth is not used.
+    EarthConsent {
+        hosts: Vec<String>,
+        yes: Box<Mode>,
+        cancel: Box<Mode>,
+        create: bool,
+    },
     /// The conversion running in the background (`Title::convert`).
     Converting {
         world: WorldEntry,
@@ -853,6 +862,7 @@ impl Mode {
             Self::OptimizeConfirm { .. } => "world_optimize_confirm",
             Self::Optimize { .. } => "world_optimize",
             Self::ConvertConfirm { .. } => "world_convert_confirm",
+            Self::EarthConsent { .. } => "earth_consent",
             Self::Converting { .. } => "world_convert",
             Self::LowDiskSpace { .. } => "low_disk_space",
             Self::WorldRequest { .. } => "world_request",
@@ -1171,7 +1181,23 @@ impl Title {
         };
         match hit {
             Some(id) => match cubic_customize::press(cubic, id) {
-                cubic_customize::Exit::Apply => self.close_cubic(true),
+                cubic_customize::Exit::Apply => {
+                    // Done with a tile server the player has not approved asks the question first;
+                    // Cancel stays on the page.
+                    let pending = cubic.earth_pending_hosts();
+                    if pending.is_empty() {
+                        self.close_cubic(true);
+                    } else {
+                        let cancel = self.mode.clone();
+                        let yes = Self::cubic_closed(self.mode.clone(), true);
+                        self.set_mode(Mode::EarthConsent {
+                            hosts: pending,
+                            yes: Box::new(yes),
+                            cancel: Box::new(cancel),
+                            create: false,
+                        });
+                    }
+                }
                 cubic_customize::Exit::Cancel => self.close_cubic(false),
                 cubic_customize::Exit::Copy(text) => return (Action::CopyText(text), true),
                 cubic_customize::Exit::Stay => {}
@@ -1184,7 +1210,12 @@ impl Title {
     /// settings or dropping them (the Customize screen's Done and Cancel).
     fn close_cubic(&mut self, apply: bool) {
         let mode = std::mem::replace(&mut self.mode, Mode::Main);
-        if let Mode::CreateCubic {
+        self.mode = Self::cubic_closed(mode, apply);
+    }
+    /// The screen after Customize's Done (`apply`) or Cancel on `mode`: Create New World, with the settings or
+    /// without them.
+    fn cubic_closed(mode: Mode, apply: bool) -> Mode {
+        let Mode::CreateCubic {
             name,
             seed,
             creative,
@@ -1192,19 +1223,72 @@ impl Title {
             mut options,
             mut cubic,
         } = mode
-        {
-            if apply {
-                options.cubic = Some(cubic.kind());
-                options.cubic_json = cubic.finish();
-            }
-            self.mode = Mode::Create {
-                name,
-                seed,
-                creative,
-                focus,
-                options,
-            };
+        else {
+            return Mode::Main;
+        };
+        if apply {
+            options.cubic = Some(cubic.kind());
+            options.cubic_json = cubic.finish();
         }
+        Mode::Create {
+            name,
+            seed,
+            creative,
+            focus,
+            options,
+        }
+    }
+    /// Create New World's Create. An Earth world asks the consent question first while its hosts are not
+    /// approved (Cancel leaves the world type it had before Earth); it is always made with what the Customize
+    /// page would write, so a new Earth world has downloads and land cover on even if the page was never opened.
+    fn press_create(&mut self) -> Action {
+        if let Mode::Create { options, .. } = &mut self.mode
+            && options.cubic_kind() == Some(crate::cubic_settings::CubicKind::Earth)
+        {
+            let cubic = cubic_customize::State::new(
+                &self.resources,
+                crate::cubic_settings::CubicKind::Earth,
+                &options.cubic_json,
+            );
+            if cubic.can_finish() {
+                options.cubic_json = cubic.json();
+            }
+            let pending = cubic.earth_pending_hosts();
+            if !pending.is_empty() {
+                let yes = self.mode.clone();
+                let mut cancel = self.mode.clone();
+                if let Mode::Create { options, .. } = &mut cancel {
+                    options.leave_earth();
+                }
+                self.set_mode(Mode::EarthConsent {
+                    hosts: pending,
+                    yes: Box::new(yes),
+                    cancel: Box::new(cancel),
+                    create: true,
+                });
+                return Action::None;
+            }
+        }
+        self.create_or_upload()
+    }
+    /// The Edit button of the world list: an Earth world that downloads from hosts the player has not approved
+    /// asks the consent question first (Cancel is the list again).
+    fn open_edit_world(&mut self, world: WorldEntry) {
+        let pending = earth_edit::pending_hosts(
+            &self.saves.join(&world.folder),
+            &crate::earth_consent::Approved::for_player(),
+        );
+        if pending.is_empty() {
+            return self.edit_world(world.name.clone(), world);
+        }
+        let yes = self.edit_mode(world.name.clone(), world);
+        let cancel = self.mode.clone();
+        self.set_mode(Mode::EarthConsent {
+            hosts: pending,
+            yes: Box::new(yes),
+            cancel: Box::new(cancel),
+            create: false,
+        });
     }
     /// Return to Create New World, keeping (`apply`) or dropping the layers.
     fn close_flat(&mut self, apply: bool) {
@@ -2262,6 +2346,13 @@ impl Title {
                 "convert_confirm",
                 get("horizon.cubic.convert.title", "Convert to Cubic Chunks?"),
             ),
+            Mode::EarthConsent { .. } => ScreenInfo::new(
+                "earth_consent",
+                get(
+                    "horizon.cubic.earth.consent.title",
+                    "Allow Earth downloads?",
+                ),
+            ),
             Mode::Converting { world } => ScreenInfo::new(
                 "convert_world",
                 translate(
@@ -2881,10 +2972,29 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 self.escape();
                 Action::None
             }
-            (Mode::Edit { world, name, .. }, Some(160)) => {
-                if earth_edit::press(&self.saves.join(&world.folder)) {
-                    return Action::None;
+            (
+                Mode::EarthConsent {
+                    hosts, yes, create, ..
+                },
+                Some(163),
+            ) => {
+                let (hosts, mut next, create) = (hosts.clone(), (**yes).clone(), *create);
+                // Yes approves every host named; the page it opens reads the list again.
+                let _ = crate::earth_consent::Approved::approve_all(&hosts);
+                if let Mode::CreateCubic { cubic, .. } = &mut next {
+                    cubic.refresh_approved();
                 }
+                self.set_mode(next);
+                if create {
+                    return self.create_or_upload();
+                }
+                Action::None
+            }
+            (Mode::EarthConsent { .. }, Some(164)) => {
+                self.escape();
+                Action::None
+            }
+            (Mode::Edit { world, name, .. }, Some(160)) => {
                 self.mode = Mode::ConvertConfirm {
                     world: world.clone(),
                     name: name.clone(),
@@ -2926,7 +3036,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                     return Action::None;
                 };
                 match id {
-                    13 => self.edit_world(world.name.clone(), world),
+                    13 => self.open_edit_world(world),
                     14 => self.set_mode(Mode::Delete { world }),
                     _ => {
                         let level = Level::read(&self.saves.join(&world.folder));
@@ -3105,7 +3215,15 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                     .cubic_kind()
                     .unwrap_or(crate::cubic_settings::CubicKind::Custom);
                 let cubic = cubic_customize::State::new(&self.resources, kind, &options.cubic_json);
-                self.mode = Mode::CreateCubic {
+                let pending = cubic.earth_pending_hosts();
+                let cancel = Mode::Create {
+                    name: name.clone(),
+                    seed: seed.clone(),
+                    creative: *creative,
+                    focus: *focus,
+                    options: options.clone(),
+                };
+                let page = Mode::CreateCubic {
                     name: name.clone(),
                     seed: seed.clone(),
                     creative: *creative,
@@ -3113,6 +3231,17 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                     options: options.clone(),
                     cubic: Box::new(cubic),
                 };
+                // Earth's page opens behind the consent question while its hosts are not approved.
+                if pending.is_empty() {
+                    self.mode = page;
+                } else {
+                    self.set_mode(Mode::EarthConsent {
+                        hosts: pending,
+                        yes: Box::new(page),
+                        cancel: Box::new(cancel),
+                        create: false,
+                    });
+                }
                 Action::None
             }
             // CreateBuffetWorldScreen for the single-biome preset.
@@ -3181,7 +3310,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 *self.experiments.get_mut() = Some(experiments::ExperimentsScreen::new(flags));
                 Action::None
             }
-            (Mode::Create { .. }, Some(21)) => self.create_or_upload(),
+            (Mode::Create { .. }, Some(21)) => self.press_create(),
             (Mode::Create { options, .. }, Some(31)) => {
                 if options.pack_dir.is_none() {
                     match crate::datapack::temp_folder() {
@@ -4041,13 +4170,16 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             // OptimizeWorldScreen: `shouldCloseOnEsc` is false; the Backup wait takes no input.
             Mode::Backup { .. } | Mode::Optimize { .. } | Mode::Converting { .. } => {}
             Mode::MissingMods { .. } => self.leave_closed_for_missing_mods(),
+            // Escape answers the question like Cancel: Earth stays unused.
+            Mode::EarthConsent { cancel, .. } => {
+                let cancel = (**cancel).clone();
+                self.set_mode(cancel);
+            }
             // BackupConfirmScreen.keyPressed: Escape runs `onCancel`, the Edit World screen again.
             // Convert to Cubic Chunks' Cancel does the same.
             Mode::OptimizeConfirm { world, name, .. }
             | Mode::AdoptBiomeRegions { world, name }
-            | Mode::ConvertConfirm { world, name } => {
-                self.edit_world(name.clone(), world.clone())
-            }
+            | Mode::ConvertConfirm { world, name } => self.edit_world(name.clone(), world.clone()),
             Mode::Edit { world, .. }
             | Mode::Delete { world }
             | Mode::Recover { world, .. }

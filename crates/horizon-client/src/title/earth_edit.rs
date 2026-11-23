@@ -1,12 +1,13 @@
-//! Edit World's button for an Earth world that wants to download tiles: it names the tile server's host and
-//! approves it for this player (or takes the approval back) with one press. The world file's own
-//! `allowDownloads` is not consent (`earth_consent`); this is the way to give it for a world that is already made.
+//! Edit World on an Earth world: when the world downloads from hosts the player has not approved, Edit World asks
+//! the consent question first (`Mode::EarthConsent`); this names the hosts. There is no approve/stop button: the
+//! world file's own `allowDownloads` is not consent (`earth_consent`), and Yes is.
 use crate::earth_consent::Approved;
 use crate::{cubic_settings, lang};
 use std::path::Path;
 
 /// The hosts the Earth world in `root` wants to download from: its tile server (when it wants downloads and names
-/// a usable address) and, when it uses land cover, the land cover server.
+/// a usable address) and, when it uses land cover, the land cover server. A world keeps what its file says: an old
+/// world with no land cover does not get it now, because switching its terrain mid-world would leave seams.
 fn wanted_hosts(root: &Path) -> Vec<String> {
     let Some((kind, json)) = cubic_settings::load_world_generation(root) else {
         return Vec::new();
@@ -20,62 +21,21 @@ fn wanted_hosts(root: &Path) -> Vec<String> {
     crate::earth_consent::wanted_hosts(&settings, crate::earth_landnet::address().as_deref())
 }
 
-fn text(key: &str, fallback: &str, hosts: &[String]) -> String {
-    hosts.iter().fold(lang::get_or(key, fallback), |text, host| {
-        text.replacen("%s", host, 1)
-    })
+/// The hosts the Earth world in `root` wants that the player has not approved: what the consent question names.
+/// Empty for another kind of world.
+pub(super) fn pending_hosts(root: &Path, approved: &Approved) -> Vec<String> {
+    let mut hosts = wanted_hosts(root);
+    hosts.retain(|h| !approved.contains(h));
+    hosts
 }
 
 /// The label and whether it is enabled of the world's button in the slot of Convert to Cubic Chunks, which an
-/// Earth world (already cubic) has no use for: Convert's own for any other world.
+/// Earth world (already cubic) has no use for: it stays off there like for any cubic world.
 pub(super) fn convert_button(root: &Path, locked: bool) -> (String, bool) {
-    let hosts = wanted_hosts(root);
-    if !hosts.is_empty() {
-        let approved = Approved::for_player();
-        let all = hosts.iter().all(|h| approved.contains(h));
-        let key = match (hosts.len() > 1, all) {
-            (false, true) => (
-                "horizon.cubic.earth.edit.revoke",
-                "Tiles allowed: %s (stop)",
-            ),
-            (false, false) => ("horizon.cubic.earth.edit.approve", "Allow tiles from %s"),
-            (true, true) => (
-                "horizon.cubic.earth.edit.revoke.land",
-                "Downloads allowed: %s, %s (stop)",
-            ),
-            (true, false) => (
-                "horizon.cubic.earth.edit.approve.land",
-                "Allow downloads from %s and %s",
-            ),
-        };
-        return (text(key.0, key.1, &hosts), true);
-    }
     (
         lang::get_or("horizon.cubic.convert.button", "Convert to Cubic Chunks..."),
         !locked && !crate::cubic::is_cubic_world(root),
     )
-}
-
-/// The button was pressed: approves the world's servers (all or none: they are one consent to the world's
-/// downloads), or takes the approval back. Whether it was an Earth world's (else the press is Convert's).
-pub(super) fn press(root: &Path) -> bool {
-    let hosts = wanted_hosts(root);
-    if hosts.is_empty() {
-        return false;
-    }
-    let mut approved = Approved::for_player();
-    let revoke = hosts.iter().all(|h| approved.contains(h));
-    for host in &hosts {
-        let done = if revoke {
-            approved.revoke(host)
-        } else {
-            approved.approve(host)
-        };
-        if let Err(e) = done {
-            log::warn!("Horizon: could not keep the approval list: {e}");
-        }
-    }
-    true
 }
 
 #[cfg(test)]
@@ -86,7 +46,12 @@ mod tests {
     fn a_world_with_land_cover_names_the_land_cover_host_too_when_the_game_has_one() {
         let dir = horizon_earth::testing::TempDir::new();
         let root = dir.path().join("w");
-        world(&root, "earth", true, "https://tiles.example.com/{z}/{x}/{y}.png");
+        world(
+            &root,
+            "earth",
+            true,
+            "https://tiles.example.com/{z}/{x}/{y}.png",
+        );
         let mut settings = horizon_world::cubic::earth::EarthSettings::at(1.0, 2.0);
         settings.tile_url = "https://tiles.example.com/{z}/{x}/{y}.png".into();
         settings.allow_downloads = true;
@@ -144,7 +109,13 @@ mod tests {
         for other in ["off", "custom", "insecure", "missing"] {
             assert!(wanted_hosts(&at(other)).is_empty(), "{other}");
         }
-        // Another world type's press is the Convert button's.
-        assert!(!press(&at("custom")));
+        // A world kept from before, and not approved: the question names its host; approved: none.
+        let none = Approved::of(&[]);
+        assert_eq!(
+            pending_hosts(&at("wants"), &none),
+            vec!["tiles.example.com"]
+        );
+        assert!(pending_hosts(&at("wants"), &Approved::of(&["tiles.example.com"])).is_empty());
+        assert!(pending_hosts(&at("custom"), &none).is_empty());
     }
 }

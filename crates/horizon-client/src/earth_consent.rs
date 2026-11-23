@@ -4,9 +4,10 @@
 //!
 //! Download consent belongs to the player, not to the world: a world file can say `allowDownloads: true` and
 //! name any address, but the game contacts a host only when it is in this list too (`earth_net`). A host is
-//! added when the player turns on "Allow downloads" for its address on Earth's settings page (Create World) or
-//! from the world's Edit screen, and removed the same way. A world from someone else therefore runs on the
-//! tiles already on this computer until the player says otherwise.
+//! added when the player answers Yes to the consent question that Earth's Customize page (Create World) and
+//! Edit World ask before they open. There is no switch: without the answer Earth is not used, and a player who
+//! wants an approval back deletes the host's line. A world from someone else therefore runs on the tiles
+//! already on this computer until the player says otherwise.
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -61,9 +62,30 @@ impl Approved {
         }
     }
 
-    /// This player's list ([`crate::logging::player_dir`]).
+    /// This player's list ([`crate::logging::player_dir`]). Tests get a list that is not kept, unless the test
+    /// named a folder with [`set_test_dir`].
     pub fn for_player() -> Self {
+        #[cfg(test)]
+        return match TEST_DIR.with(|d| d.borrow().clone()) {
+            Some(dir) => Self::load(&dir),
+            None => Self::default(),
+        };
+        #[cfg(not(test))]
         Self::load(&crate::logging::player_dir())
+    }
+
+    /// Approves each of `hosts` for this player and keeps the list; the first failure is the answer, after
+    /// the rest were tried.
+    pub fn approve_all(hosts: &[String]) -> std::io::Result<()> {
+        let mut list = Self::for_player();
+        let mut result = Ok(());
+        for host in hosts {
+            if let Err(e) = list.approve(host) {
+                log::warn!("Horizon: could not keep the approval of {host} for Earth: {e}");
+                result = Err(e);
+            }
+        }
+        result
     }
 
     /// A list of `hosts` that is never written, for tests.
@@ -193,6 +215,17 @@ pub fn wanted_hosts(
         hosts.push(host);
     }
     hosts
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Makes this test's player list live in `dir`.
+#[cfg(test)]
+pub fn set_test_dir(dir: &Path) {
+    TEST_DIR.with(|d| *d.borrow_mut() = Some(dir.to_owned()));
 }
 
 /// Hosts the player was told about this run, and the one not yet told.

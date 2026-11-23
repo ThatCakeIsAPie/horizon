@@ -12,12 +12,13 @@ no code with it.**
 
 1. Singleplayer, Create New World.
 2. Press the Cubic Chunks button until it reads Earth.
-3. Press Customize. The Earth page opens.
+3. Press Customize. If you have not yet allowed Earth to download from its hosts, a question comes first (see
+   "Who decides about downloads"); Yes opens the Earth page, Cancel goes back.
 4. Pick a place (Mount Everest, Grand Canyon, Matterhorn, Mount Fuji, Yosemite Valley, Monaco coast, Uluru, Machu
    Picchu), or type a latitude and longitude. Pick the scale.
-5. To download tiles, turn on **Allow downloads**. The page shows the tile server's host when you do (and the land
-   cover server's, see Land cover). Press Done.
-6. Create New World.
+5. Press Done. (Changed the tile server address to another host? Done asks the same question for that host.)
+6. Create New World. If Earth is still not allowed, Create asks the question too; Cancel there puts the world type
+   back to what it was before Earth.
 
 The page keeps its fields and buttons reachable by mouse and keyboard like the other Customize pages: click a box to
 type into it, Escape lets go of it, and Done and Cancel are in the footer.
@@ -29,14 +30,13 @@ type into it, Escape lets go of it, and Done and Cancel are in the footer.
 | Origin latitude, longitude | The place at world block (0, 0), in degrees (latitude -85.0511 to 85.0511, the limit of web maps; longitude -180 to 180). Places fill both. |
 | Scale | Metres of ground per block, in width and height: "1 block = N metres". The page shows the heights the whole Earth would need at that scale (the deepest trench to the highest summit) and warns when they do not fit the world's height range. |
 | Tile server address | A template with `{z}`, `{x}` and `{y}` for the tile. With Horizon's official game it starts as AWS Terrain Tiles (below); the game built alone starts with the box empty. `https://` only (`http://` only to this computer, for testing). |
-| Allow downloads | Whether the game may download tiles it does not have, from the host shown. Off by default. |
-| Land cover | Whether the ground follows ESA WorldCover (forest, grass, sand, water...; see Land cover below). On for a new world when the game has a land cover source, off for a world whose file does not name it. Needs Allow downloads (or data already cached). |
 
 The Presets overlay shows the same settings as JSON, with four that have no box: `seaLevelY` (the block height of
 sea level, 0 by default), `verticalExaggeration` (1), `maxZoom` (the finest tile zoom, 15) and `structures`.
-Everything is saved in the world's `cubicgen.json`. A fifth, `landCover`, is the Land cover box: `true` when the
-box is on, left out of the file while it is off, and absent in a world made before it existed (those stay as they
-were: their terrain does not change).
+Everything is saved in the world's `cubicgen.json`. There are no switches for downloads or land cover: a new Earth
+world is always saved with `allowDownloads: true` and, when the game has a land cover source, `landCover: true`.
+A world made before this keeps what its file says (a world with no `landCover` stays elevation-only, because
+switching its terrain mid-world would leave seams).
 
 ## Where tiles are kept
 
@@ -61,12 +61,17 @@ the world's**. The game downloads tiles only when both are true:
 The list is the file `horizon-earth-servers.txt` in the player's folder (the game folder, or `--player-dir`), one
 host a line; lines starting with `#` are ignored, and deleting a line takes the approval back.
 
-- **Approving.** Turning on Allow downloads on the Earth page shows "Tile server: host", and pressing Done adds
-  that host. Cancel adds nothing.
-- **A world that arrives with downloads on.** Its switch shows off on the page. When you open it, the game runs on
-  cached tiles, says in chat which host the world wants and that you have not approved it, and logs it. To approve:
-  Singleplayer, select the world, Edit, and press the "Allow tiles from <host>" button, which approves that host
-  (it then reads "Tiles allowed: <host> (stop)", and pressing it again takes the approval back).
+- **Approving.** Earth's Customize page (Create World) and Edit World on an Earth world ask one question before
+  they open, while a host they need is not on the list: "Allow Earth downloads?", naming the tile server's host
+  and the land cover host, with the data credit line, and **Yes** or **Cancel**. Yes adds the hosts and opens the
+  page. Cancel (or Escape) goes back to where you were: Earth can't be customized, edited or created without the
+  answer. Choosing the Earth world type and pressing Create asks it too; Cancel there leaves the world type you
+  had before Earth. When everything is already approved there is no question. Changing the tile address to a new
+  host makes Done ask for that host.
+- **A world that arrives with downloads on.** When you open it, the game runs on cached tiles, says in chat which
+  host the world wants and that you have not approved it, and logs it. Singleplayer, select the world, Edit: the
+  question asks for the hosts, and Yes approves them. To take an approval back, delete the host's line from the
+  file.
 - **Redirects.** A server may redirect a tile request only to another approved host.
 - A dedicated server reads the list from its own folder: its owner edits the file.
 
@@ -74,9 +79,8 @@ A request carries only `User-Agent: Horizon/<version>`: no cookies, no identifie
 cover request adds a `Range` header and nothing else).
 
 **Land cover has its own host**, approved the same way and on the same list: `esa-worldcover.s3.eu-central-1.amazonaws.com`.
-With Allow downloads and Land cover on, the Earth page names both hosts and Done approves both; Edit World's button
-approves or takes back all the hosts the world wants (it reads "Allow downloads from A and B" when there are two).
-Approving the tile server never approves the land cover server. A world with land cover on whose host is not
+The question names both hosts and Yes approves both. Approving only the tile server (an older approval) never
+approves the land cover server; the question then names the land cover host alone. A world with land cover on whose host is not
 approved (or with downloads off, or in a game with no land cover address) **runs exactly as if land cover were off**
 (its terrain and its far-view cache are the elevation-only ones), says so in the log, and, for an unapproved host,
 once in chat; it never waits for land cover. Cached land cover is not used while it is off.
@@ -158,7 +162,7 @@ file's first 32 KiB, then each compressed tile), never a whole file (they are 10
 - **`testing.rs`**: a writer of synthetic tiled TIFFs and `MemoryLandCover`, a fetcher over them, so the tests need
   no real data.
 
-### Downloading, consent and the switch
+### Downloading and consent
 
 - **`earth_landnet.rs`** (`crates/horizon-client`) is the `LandCoverFetcher` over the bucket
   (`https://esa-worldcover.s3.eu-central-1.amazonaws.com/<path>`, with `WorldCoverFile::path()` for the path): an
@@ -170,9 +174,10 @@ file's first 32 KiB, then each compressed tile), never a whole file (they are 10
 - **The address** is not in the world file. The official game offers it through `Hooks::earth_land_cover_address`
   (`horizon-addresses::EARTH_LAND_COVER`, registered by `horizon-earth-source`); `HORIZON_EARTH_LAND_COVER_URL`
   overrides it (and is the only source in the game built alone). Without either, there is no land cover source:
-  the box is off and disabled, and a world that asks for it runs without.
-- **The switch** is the Land cover box on the Earth page (`landCover` in `cubicgen.json`). A new world has it on
-  when the game has a source; a world file without the key stays off.
+  a new world is saved without land cover, and a world that asks for it runs without.
+- **No switch.** `landCover` in `cubicgen.json` is written `true` for every new Earth world when the game has a
+  source (the Create World page writes it even if Customize was never opened); a world file without the key stays
+  off.
 - **The prefetcher** (`earth_prefetch.rs`) fetches land cover on its thread: the pieces the far view recorded
   (`take_land_requests`), then rounds of `land_needs` for the base-zoom area around the players; stale requests
   are skipped (`LandCoverStore::is_missing`). A far node that waited for a class is asked again by the far view's
@@ -190,8 +195,8 @@ a new rule version starts a new folder.
 
 ### What the generator does with it
 
-With `"landCover": true` in the world's `cubicgen.json` (the Land cover box; the file leaves the name out while it
-is off) **and** a source handed to the generator (`EarthGenerator::with_land_cover`, built by
+With `"landCover": true` in the world's `cubicgen.json` (a new world's file always has it; an old world's file leaves
+the name out while it is off) **and** a source handed to the generator (`EarthGenerator::with_land_cover`, built by
 `EarthSettings::land_cover_source`; `CustomCubicGenerator::earth_with_land_cover` for the game's cubic level, which
 `cubic_gen.rs` calls with the world's `EarthTiles::land`). With either missing the terrain is the elevation-only
 terrain, block for block (a test compares them). Where a column's

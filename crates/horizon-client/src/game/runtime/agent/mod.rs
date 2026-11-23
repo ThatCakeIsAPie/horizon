@@ -709,6 +709,9 @@ impl Game<'_> {
             Mode::ConvertConfirm { world, .. } => {
                 json!({ "mode": "convert-cubic-confirm", "folder": world.folder, "name": world.name })
             }
+            Mode::EarthConsent { hosts, .. } => {
+                json!({ "mode": "earth-consent", "hosts": hosts })
+            }
             Mode::Converting { world } => {
                 json!({ "mode": "converting-cubic", "folder": world.folder, "name": world.name })
             }

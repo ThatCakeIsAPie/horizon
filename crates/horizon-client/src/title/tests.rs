@@ -3310,3 +3310,166 @@ fn an_earth_world_has_its_own_settings_that_no_other_type_keeps() {
         "Earth starts over from its defaults"
     );
 }
+
+// ---------------------------------------------------------------- Earth's consent question
+
+const TILES: &str = "https://tiles.example.com/{z}/{x}/{y}.png";
+const LAND: &str = "https://land.example.org/";
+
+/// A game that offers Earth its two hosts, with the player's approved list in a folder of its own: the world type
+/// button on Earth (after Flat, so Cancel has somewhere to go back to), on the World tab.
+fn earth_fixture() -> (Fixture, (f32, f32), horizon_earth::testing::TempDir) {
+    let dir = horizon_earth::testing::TempDir::new();
+    crate::earth_consent::set_test_dir(dir.path());
+    cubic_customize::offer_earth_for_test(Some(TILES), Some(LAND));
+    let mut f = Fixture::new();
+    let size = open_world_tab(&mut f);
+    for _ in 0..4 {
+        press_id(&mut f, size, 36);
+    }
+    assert_eq!(
+        cubic_kind(&f),
+        Some(crate::cubic_settings::CubicKind::Earth)
+    );
+    (f, size, dir)
+}
+
+fn consent_hosts(f: &Fixture) -> Vec<String> {
+    match &f.title.mode {
+        Mode::EarthConsent { hosts, .. } => hosts.clone(),
+        other => panic!("the consent question is open, not {}", other.id()),
+    }
+}
+
+#[test]
+fn earths_customize_page_asks_first_and_yes_approves_both_hosts_and_opens_it() {
+    let (mut f, size, dir) = earth_fixture();
+    press_id(&mut f, size, 37);
+    assert_eq!(f.title.mode.id(), "earth_consent");
+    assert_eq!(
+        consent_hosts(&f),
+        vec!["tiles.example.com", "land.example.org"]
+    );
+    // Nothing is approved until Yes.
+    assert!(!crate::earth_consent::Approved::load(dir.path()).contains("tiles.example.com"));
+    f.click("Yes");
+    assert_eq!(f.title.mode.id(), "world_create_cubic");
+    let list = crate::earth_consent::Approved::load(dir.path());
+    assert!(list.contains("tiles.example.com") && list.contains("land.example.org"));
+}
+
+#[test]
+fn cancel_on_the_question_leaves_earth_unused_and_escape_does_the_same() {
+    let (mut f, size, dir) = earth_fixture();
+    press_id(&mut f, size, 37);
+    f.click("Cancel");
+    assert_eq!(f.title.mode.id(), "world_create");
+    assert!(!crate::earth_consent::Approved::load(dir.path()).contains("tiles.example.com"));
+    press_id(&mut f, size, 37);
+    f.title.escape();
+    assert_eq!(f.title.mode.id(), "world_create");
+    // Create asks too, and its Cancel puts the world type back to what it was before Earth.
+    let (action, _) = press_id(&mut f, size, 21);
+    assert_eq!(action, Action::None);
+    assert_eq!(f.title.mode.id(), "earth_consent");
+    f.click("Cancel");
+    assert_eq!(f.title.mode.id(), "world_create");
+    assert_eq!(cubic_kind(&f), Some(crate::cubic_settings::CubicKind::Flat));
+    assert!(!crate::earth_consent::Approved::load(dir.path()).contains("land.example.org"));
+}
+
+#[test]
+fn approved_hosts_skip_the_question() {
+    let (mut f, size, dir) = earth_fixture();
+    let mut list = crate::earth_consent::Approved::load(dir.path());
+    list.approve("tiles.example.com").unwrap();
+    list.approve("land.example.org").unwrap();
+    press_id(&mut f, size, 37);
+    assert_eq!(f.title.mode.id(), "world_create_cubic");
+}
+
+#[test]
+fn a_new_earth_world_writes_land_cover_and_downloads_on_even_without_opening_customize() {
+    let (mut f, size, dir) = earth_fixture();
+    // Create asks; Yes approves and creates.
+    press_id(&mut f, size, 21);
+    assert_eq!(f.title.mode.id(), "earth_consent");
+    let action = f.click("Yes");
+    let Action::Create { options, .. } = action else {
+        panic!("Yes on Create's question creates the world: {action:?}")
+    };
+    let settings =
+        horizon_world::cubic::earth::EarthSettings::from_json(&options.cubic_json).unwrap();
+    assert!(
+        settings.land_cover && settings.allow_downloads,
+        "{}",
+        options.cubic_json
+    );
+    assert_eq!(settings.tile_url, TILES);
+    assert!(crate::earth_consent::Approved::load(dir.path()).contains("land.example.org"));
+}
+
+#[test]
+fn done_asks_again_for_a_tile_server_that_is_a_new_host() {
+    let (mut f, size, dir) = earth_fixture();
+    let mut list = crate::earth_consent::Approved::load(dir.path());
+    list.approve("tiles.example.com").unwrap();
+    list.approve("land.example.org").unwrap();
+    press_id(&mut f, size, 37);
+    let Mode::CreateCubic { cubic, .. } = &mut f.title.mode else {
+        panic!("the page opens")
+    };
+    cubic
+        .load_json(
+            r#"{"originLatitude":1,"originLongitude":2,"tileUrl":"https://elsewhere.example.net/{z}/{x}/{y}.png"}"#,
+        )
+        .unwrap();
+    press_id(&mut f, size, 100);
+    assert_eq!(consent_hosts(&f), vec!["elsewhere.example.net"]);
+    // Cancel stays on the page; Yes approves the host and applies Done.
+    f.click("Cancel");
+    assert_eq!(f.title.mode.id(), "world_create_cubic");
+    press_id(&mut f, size, 100);
+    f.click("Yes");
+    let Mode::Create { options, .. } = &f.title.mode else {
+        panic!("Done returned to Create World")
+    };
+    assert!(options.cubic_json.contains("elsewhere.example.net"));
+    assert!(crate::earth_consent::Approved::load(dir.path()).contains("elsewhere.example.net"));
+}
+
+#[test]
+fn edit_world_on_an_earth_world_asks_for_its_unapproved_hosts() {
+    let dir = horizon_earth::testing::TempDir::new();
+    crate::earth_consent::set_test_dir(dir.path());
+    cubic_customize::offer_earth_for_test(None, Some(LAND));
+    let mut f = Fixture::new();
+    f.world("Terra", "Terra");
+    // Edit World reads the hosts from the world's own file: the tile server (this build's land cover address is
+    // its own, not the test's).
+    let root = f.title.saves.join("Terra");
+    std::fs::write(
+        root.join("horizon_cubic.json"),
+        r#"{"cubic":true,"type":"earth"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("cubicgen.json"),
+        format!(
+            r#"{{"originLatitude":1,"originLongitude":2,"tileUrl":"{TILES}","allowDownloads":true,"landCover":true}}"#
+        ),
+    )
+    .unwrap();
+    f.select();
+    f.click("Edit");
+    assert_eq!(consent_hosts(&f), vec!["tiles.example.com"]);
+    f.click("Cancel");
+    assert_eq!(f.title.mode.id(), "world_select");
+    f.click("Edit");
+    f.click("Yes");
+    assert_eq!(f.title.mode.id(), "world_edit");
+    // Approved now: Edit opens at once. An old world with no land cover asks for the tile host alone.
+    f.title.escape();
+    f.click("Edit");
+    assert_eq!(f.title.mode.id(), "world_edit");
+}

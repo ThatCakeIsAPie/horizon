@@ -611,6 +611,26 @@ impl Title {
                     centered(atlas, batch, line, top + 17.0 + i as f32 * 9.0, u32::MAX);
                 }
             }
+            Mode::EarthConsent { hosts, .. } => {
+                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+                phases(crate::screen_draw::RenderPhase::Background, batch);
+                let lines = earth_consent_lines(atlas, hosts, w - 50.0);
+                self.message_lines.set(lines.len());
+                let top = confirm_top(h, lines.len());
+                centered(
+                    atlas,
+                    batch,
+                    &lang::get_or(
+                        "horizon.cubic.earth.consent.title",
+                        "Allow Earth downloads?",
+                    ),
+                    top,
+                    u32::MAX,
+                );
+                for (i, line) in lines.iter().enumerate() {
+                    centered(atlas, batch, line, top + 17.0 + i as f32 * 9.0, u32::MAX);
+                }
+            }
             Mode::Converting { world } => {
                 crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
                 phases(crate::screen_draw::RenderPhase::Background, batch);
@@ -979,4 +999,28 @@ impl Title {
             toast.draw(atlas, batch, 0.0);
         }
     }
+}
+
+/// The consent question's lines: what Earth does, each host it will contact on a line of its own, and the data
+/// credit line.
+fn earth_consent_lines(atlas: &HudAtlas, hosts: &[String], width: f32) -> Vec<String> {
+    let mut lines = wrapped(
+        atlas,
+        &lang::get_or(
+            "horizon.cubic.earth.consent.message",
+            "Earth worlds download their terrain and land cover from the internet. This game will contact:",
+        ),
+        width,
+    );
+    lines.extend(hosts.iter().map(|host| format!("  {host}")));
+    lines.push(String::new());
+    lines.extend(wrapped(
+        atlas,
+        &lang::get_or(
+            "horizon.cubic.earth.credits.short",
+            "Elevation: Terrain Tiles (Mapzen). Land cover: ESA WorldCover.",
+        ),
+        width,
+    ));
+    lines
 }

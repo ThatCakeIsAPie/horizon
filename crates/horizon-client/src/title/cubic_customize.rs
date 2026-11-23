@@ -36,6 +36,12 @@ use std::{cell::RefCell, collections::BTreeSet, path::Path, rc::Rc};
 
 mod earth;
 
+/// Makes this test's games offer Earth a tile address and a land cover address.
+#[cfg(test)]
+pub(super) fn offer_earth_for_test(tiles: Option<&str>, land: Option<&str>) {
+    earth::offer_for_test(tiles, land);
+}
+
 /// Writes into the ore `i` of the combined list (standard ores, then periodic
 /// ones); `$body` sees it as `$o`, of either type.
 macro_rules! ore {
@@ -678,7 +684,7 @@ impl State {
     }
     /// Whether Done may be pressed: always, except when Earth's boxes hold
     /// something its settings refuse.
-    fn can_finish(&self) -> bool {
+    pub(super) fn can_finish(&self) -> bool {
         self.kind != CubicKind::Earth || self.earth.settings().is_ok()
     }
     /// The Presets overlay's JSON, pretty, while it parses.
@@ -3579,7 +3585,6 @@ mod tests {
         type_into(&mut s, 1, " 139.69 ");
         type_into(&mut s, 2, "8");
         type_into(&mut s, 3, "https://tiles.example.com/{z}/{x}/{y}.png");
-        press_button(&mut s, "horizon.cubic.earth.downloads");
         assert!(done_enabled(&s));
         assert_eq!(press(&mut s, DONE), Exit::Apply);
         let returned = EarthSettings::from_json(&s.json()).unwrap();
@@ -3596,8 +3601,6 @@ mod tests {
         with_more.sea_level_y = 40;
         with_more.vertical_exaggeration = 3.0;
         let again = state(CubicKind::Earth, &with_more.to_json_compact());
-        // A world file's allowDownloads is not consent: read back, the switch shows off until the host is approved.
-        with_more.allow_downloads = false;
         assert_eq!(earth_settings(&again).unwrap(), with_more);
         assert!(s.json().contains('\n'), "Done hands back the pretty form");
     }
@@ -3743,19 +3746,24 @@ mod tests {
         s
     }
     const OFFER: &str = "https://tiles.example.com/dem/{z}/{x}/{y}.png";
+    const LAND: &str = "https://land.example.org/";
+
+    fn earth_with_land(approved: crate::earth_consent::Approved) -> State {
+        let mut s = state(CubicKind::Earth, "");
+        s.earth = earth::Draft::with_land(Some(OFFER), Some(LAND), approved);
+        s
+    }
 
     #[test]
-    fn the_offered_address_fills_the_box_with_downloads_still_off() {
+    fn the_offered_address_fills_the_box_and_downloads_are_on() {
         let s = earth_with(crate::earth_consent::Approved::of(&[]), Some(OFFER));
         let settings = earth_settings(&s).unwrap();
         assert_eq!(settings.tile_url, OFFER);
-        assert!(
-            !settings.allow_downloads,
-            "an offered address is not consent"
-        );
-        // Nothing offered (the game built alone): the box starts empty.
+        assert!(settings.allow_downloads, "there is no switch: always on");
+        // Nothing offered (the game built alone): the box starts empty, with nothing to download from.
         let none = earth_with(crate::earth_consent::Approved::of(&[]), None);
         assert_eq!(earth_settings(&none).unwrap().tile_url, "");
+        assert!(!earth_settings(&none).unwrap().allow_downloads);
         // Reading back what Done handed over keeps the box as it was.
         let again = s.earth.reload(&s.json()).unwrap();
         assert_eq!(again.url(), OFFER);
@@ -3797,10 +3805,7 @@ mod tests {
     fn the_scale_reads_as_blocks_to_metres_with_what_the_earth_needs() {
         let mut s = earth_with(crate::earth_consent::Approved::of(&[]), None);
         let lines = earth_lines(&s);
-        assert!(
-            lines.contains(&"1 block = 1 metre".to_owned()),
-            "{lines:?}"
-        );
+        assert!(lines.contains(&"1 block = 1 metre".to_owned()), "{lines:?}");
         assert!(
             lines.iter().any(|l| l.contains("y -11000 to 8849")),
             "{lines:?}"
@@ -3871,120 +3876,66 @@ mod tests {
     }
 
     #[test]
-    fn turning_downloads_on_shows_the_host_and_done_approves_it() {
+    fn the_question_names_the_hosts_not_yet_approved_and_the_page_has_no_switches() {
         let dir = horizon_earth::testing::TempDir::new();
-        let approved = crate::earth_consent::Approved::load(dir.path());
-        let mut s = earth_with(approved, Some(OFFER));
-        let host_line = |s: &State| {
-            earth_lines(s)
-                .into_iter()
-                .find(|l| l.starts_with("Tile server:"))
-        };
+        let mut s = earth_with_land(crate::earth_consent::Approved::load(dir.path()));
+        // Nothing approved: both hosts, the tile server's first.
         assert_eq!(
-            host_line(&s).as_deref(),
-            Some("Tile server: tiles.example.com")
+            s.earth_pending_hosts(),
+            vec!["tiles.example.com", "land.example.org"]
         );
-        assert!(!earth_settings(&s).unwrap().allow_downloads);
-        press_button(&mut s, "horizon.cubic.earth.downloads");
-        assert!(earth_settings(&s).unwrap().allow_downloads);
+        // Downloads and land cover are on, with no switch to turn them off.
+        let settings = earth_settings(&s).unwrap();
+        assert!(settings.allow_downloads && settings.land_cover);
+        let json = s.json();
+        assert!(json.contains("\"landCover\": true") && json.contains("\"allowDownloads\": true"));
+        let labels: Vec<String> = page(&s)
+            .widgets
+            .iter()
+            .map(|w| w.item.label.clone())
+            .collect();
         assert!(
-            earth_lines(&s)
+            !labels
                 .iter()
-                .any(|l| l.contains("approves this server")),
-            "the page says what Done does"
+                .any(|l| l.contains("downloads") || l.contains("land_cover")),
+            "{labels:?}"
         );
-        // Not approved until Done: cancelling Create World leaves the list alone.
-        assert!(!crate::earth_consent::Approved::load(dir.path()).contains("tiles.example.com"));
-        let json = s.finish();
-        assert!(EarthSettings::from_json(&json).unwrap().allow_downloads);
-        // The player's list has it, and a new game reads it from the file.
-        assert!(crate::earth_consent::Approved::load(dir.path()).contains("tiles.example.com"));
-        assert!(s.earth.approved().contains("tiles.example.com"));
-        // Turned off again, the world does not download.
-        press_button(&mut s, "horizon.cubic.earth.downloads");
-        assert!(!earth_settings(&s).unwrap().allow_downloads);
-    }
-
-    #[test]
-    fn a_world_files_allow_downloads_is_not_consent_and_a_changed_host_needs_it_again() {
-        let dir = horizon_earth::testing::TempDir::new();
-        let mut world = EarthSettings::at(1.0, 2.0);
-        world.tile_url = OFFER.to_owned();
-        world.allow_downloads = true;
-        // Someone else's world: the switch shows off and Done approves nothing.
-        let mut s = earth_with(crate::earth_consent::Approved::load(dir.path()), None);
-        s.load_json(&world.to_json_compact()).unwrap();
-        assert!(!earth_settings(&s).unwrap().allow_downloads);
-        s.finish();
-        assert!(!crate::earth_consent::Approved::load(dir.path()).contains("tiles.example.com"));
-        // The same world once the player approved the host: on.
+        // Approved: no question. One approved: only the other.
         let mut list = crate::earth_consent::Approved::load(dir.path());
         list.approve("tiles.example.com").unwrap();
-        s.earth = earth::Draft::with(None, list);
-        s.load_json(&world.to_json_compact()).unwrap();
-        assert!(earth_settings(&s).unwrap().allow_downloads);
-        // Another host in the box is another approval.
+        s.earth = earth::Draft::with_land(Some(OFFER), Some(LAND), list.clone());
+        assert_eq!(s.earth_pending_hosts(), vec!["land.example.org"]);
+        list.approve("land.example.org").unwrap();
+        s.earth = earth::Draft::with_land(Some(OFFER), Some(LAND), list);
+        assert!(s.earth_pending_hosts().is_empty());
+        // Another tile server in the box is another host to ask about, and only that one.
         type_into(&mut s, 3, "https://elsewhere.example.org/{z}/{x}/{y}.png");
-        assert!(!earth_settings(&s).unwrap().allow_downloads);
-        press_button(&mut s, "horizon.cubic.earth.downloads");
+        assert_eq!(s.earth_pending_hosts(), vec!["elsewhere.example.org"]);
+        // Done approves nothing by itself; another world type has no question.
         s.finish();
-        assert!(crate::earth_consent::Approved::load(dir.path()).contains("elsewhere.example.org"));
-    }
-
-    const LAND: &str = "https://land.example.org/";
-
-    fn earth_with_land(approved: crate::earth_consent::Approved) -> State {
-        let mut s = state(CubicKind::Earth, "");
-        s.earth = earth::Draft::with_land(Some(OFFER), Some(LAND), approved);
-        s
+        assert!(
+            !crate::earth_consent::Approved::load(dir.path()).contains("elsewhere.example.org")
+        );
+        assert!(
+            state(CubicKind::Custom, "")
+                .earth_pending_hosts()
+                .is_empty()
+        );
     }
 
     #[test]
-    fn a_new_world_has_land_cover_on_when_the_game_has_a_source_and_an_old_world_keeps_its_file() {
+    fn a_new_world_has_land_cover_on_when_the_game_has_a_source() {
         let s = earth_with_land(crate::earth_consent::Approved::of(&[]));
-        assert!(earth_settings(&s).unwrap().land_cover, "on by default");
+        assert!(earth_settings(&s).unwrap().land_cover);
         assert!(s.json().contains("\"landCover\": true"));
-        // A game with no source: the box is off and cannot be turned on.
-        let none = earth_with(crate::earth_consent::Approved::of(&[]), Some(OFFER));
-        assert!(!earth_settings(&none).unwrap().land_cover);
-        // A world file without the key stays off whatever the default; one with it keeps it.
+        // Settings text from a world that had it off (Re-Create, or the Presets box) still makes a world with it on.
         let mut old = earth_with_land(crate::earth_consent::Approved::of(&[]));
-        old.load_json(r#"{"originLatitude":1,"originLongitude":2}"#).unwrap();
-        assert!(!earth_settings(&old).unwrap().land_cover);
-        old.load_json(r#"{"originLatitude":1,"originLongitude":2,"landCover":true}"#)
+        old.load_json(r#"{"originLatitude":1,"originLongitude":2,"landCover":false}"#)
             .unwrap();
         assert!(earth_settings(&old).unwrap().land_cover);
-    }
-
-    #[test]
-    fn the_land_cover_box_toggles_and_done_approves_its_host_with_the_tile_server() {
-        let dir = horizon_earth::testing::TempDir::new();
-        let mut s = earth_with_land(crate::earth_consent::Approved::load(dir.path()));
-        press_button(&mut s, "horizon.cubic.earth.land_cover");
-        assert!(!earth_settings(&s).unwrap().land_cover);
-        press_button(&mut s, "horizon.cubic.earth.land_cover");
-        assert!(earth_settings(&s).unwrap().land_cover);
-        // Without Allow downloads Done approves nothing.
-        s.finish();
-        assert!(!crate::earth_consent::Approved::load(dir.path()).contains("land.example.org"));
-        press_button(&mut s, "horizon.cubic.earth.downloads");
-        assert!(
-            earth_lines(&s)
-                .iter()
-                .any(|l| l.contains("land.example.org")),
-            "the page names the second host"
-        );
-        s.finish();
-        let list = crate::earth_consent::Approved::load(dir.path());
-        assert!(list.contains("tiles.example.com") && list.contains("land.example.org"));
-        // Land cover off: Done approves the tile server only.
-        let dir = horizon_earth::testing::TempDir::new();
-        let mut s = earth_with_land(crate::earth_consent::Approved::load(dir.path()));
-        press_button(&mut s, "horizon.cubic.earth.land_cover");
-        press_button(&mut s, "horizon.cubic.earth.downloads");
-        s.finish();
-        let list = crate::earth_consent::Approved::load(dir.path());
-        assert!(list.contains("tiles.example.com") && !list.contains("land.example.org"));
+        // A game with no source has none to use.
+        let none = earth_with(crate::earth_consent::Approved::of(&[]), Some(OFFER));
+        assert!(!earth_settings(&none).unwrap().land_cover);
     }
 
     #[test]
@@ -3992,23 +3943,12 @@ mod tests {
         let mut s = earth_with_land(crate::earth_consent::Approved::of(&[]));
         press_button(&mut s, "horizon.cubic.earth.credits.open");
         let text = earth_lines(&s).join(" ");
-        let wording = earth::land_attribution().split_whitespace().collect::<Vec<_>>().join(" ");
+        let wording = earth::land_attribution()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(text.contains(&wording), "{text}");
         assert!(wording.contains("ESA WorldCover project 2021"));
-    }
-
-    #[test]
-    fn the_switch_is_unavailable_without_a_usable_address() {
-        let mut s = earth_with(crate::earth_consent::Approved::of(&[]), None);
-        let switch = |s: &State| match button_labelled(s, "horizon.cubic.earth.downloads") {
-            (Some(_), enabled) => Some(enabled),
-            _ => None,
-        };
-        assert_eq!(switch(&s), Some(false));
-        type_into(&mut s, 3, OFFER);
-        assert_eq!(switch(&s), Some(true));
-        type_into(&mut s, 3, "http://example.com/{z}/{x}/{y}");
-        assert_eq!(switch(&s), Some(false));
     }
 
     #[test]
@@ -4081,19 +4021,16 @@ mod tests {
             "horizon.cubic.earth.tiles",
             "horizon.cubic.earth.url",
             "horizon.cubic.earth.url.help",
-            "horizon.cubic.earth.downloads",
-            "horizon.cubic.earth.no_url",
             "horizon.cubic.earth.invalid",
             "horizon.cubic.earth.places",
             "horizon.cubic.earth.scale.is",
             "horizon.cubic.earth.scale.is.one",
             "horizon.cubic.earth.scale.needs",
             "horizon.cubic.earth.scale.too_tall",
-            "horizon.cubic.earth.server_is",
-            "horizon.cubic.earth.downloads.on",
-            "horizon.cubic.earth.downloads.off",
             "horizon.cubic.earth.credits.heading",
             "horizon.cubic.earth.credits.short",
+            "horizon.cubic.earth.consent.title",
+            "horizon.cubic.earth.consent.message",
             "horizon.cubic.earth.credits.open",
             "horizon.cubic.earth.credits.back",
             "horizon.cubic.earth.credits.title",
@@ -4101,16 +4038,6 @@ mod tests {
             "horizon.cubic.earth.credits.required",
             "horizon.cubic.earth.credits.idea",
             "horizon.cubic.earth.unapproved",
-            "horizon.cubic.earth.edit.approve",
-            "horizon.cubic.earth.edit.revoke",
-            "horizon.cubic.earth.edit.approve.land",
-            "horizon.cubic.earth.edit.revoke.land",
-            "horizon.cubic.earth.land_cover.heading",
-            "horizon.cubic.earth.land_cover",
-            "horizon.cubic.earth.land_cover.help",
-            "horizon.cubic.earth.land_cover.no_source",
-            "horizon.cubic.earth.land_cover.on",
-            "horizon.cubic.earth.land_cover.needs_downloads",
             "horizon.cubic.earth.credits.land_source",
             "horizon.cubic.earth.credits.land_about",
             "horizon.cubic.earth.credits.land_required",

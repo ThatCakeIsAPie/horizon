@@ -23,13 +23,19 @@ impl Title {
     /// Opens Edit World on `world` with `name` in its field; the opt-in is offered only while
     /// adopting would change the world's saved regions.
     pub(super) fn edit_world(&mut self, name: String, world: WorldEntry) {
+        let mode = self.edit_mode(name, world);
+        self.set_mode(mode);
+    }
+
+    /// The Edit World screen of [`Title::edit_world`], not yet shown.
+    pub(super) fn edit_mode(&self, name: String, world: WorldEntry) -> Mode {
         let adopt_regions = crate::save::biome_regions::adoptable(&self.saves.join(&world.folder));
-        self.set_mode(Mode::Edit {
+        Mode::Edit {
             world,
             name,
             focused: true,
             adopt_regions,
-        });
+        }
     }
 
     pub(super) fn draw_edit(
