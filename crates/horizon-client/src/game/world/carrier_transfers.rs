@@ -2160,8 +2160,8 @@ mod tests {
             assert_eq!(game.dim, crate::game::Dim::Overworld);
             // A fresh open holds no parked level: drop the Nether so
             // recovery has to open it from disk, as at world load.
-            game.levels.parked.remove(&crate::game::Dim::Nether);
-            assert!(!game.levels.parked.contains_key(&crate::game::Dim::Nether));
+            game.levels.parked.remove(&(crate::game::Dim::Nether, 0));
+            assert!(!game.levels.parked.contains_key(&(crate::game::Dim::Nether, 0)));
             game.carrier_recover_all_levels().unwrap();
             assert_eq!(
                 game.dim,

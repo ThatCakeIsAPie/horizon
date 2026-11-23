@@ -463,7 +463,7 @@ fn an_unload_drops_a_save_waiting_for_its_level() {
         assert!(!game.levels.save_pending(dim));
         game.run_requested_saves();
         assert!(!game.runtime_level_is_open("saved:a"));
-        assert!(!game.levels.parked.contains_key(&dim));
+        assert!(!game.levels.parked.contains_key(&(dim, 0)));
         assert_eq!(*seen.loads.lock().unwrap(), ["saved:a"]);
     });
 }
@@ -1446,7 +1446,7 @@ fn a_reset_regenerates_the_vanilla_levels_from_the_new_seed_and_keeps_the_world_
         assert_eq!(game.dim, hold, "the mod's level holds the place");
         for dim in [super::Dim::Overworld, super::Dim::Nether, super::Dim::End] {
             assert!(
-                !game.levels.parked.contains_key(&dim),
+                !game.levels.parked.contains_key(&(dim, 0)),
                 "{dim:?} was dropped"
             );
         }
@@ -1467,7 +1467,7 @@ fn a_reset_regenerates_the_vanilla_levels_from_the_new_seed_and_keeps_the_world_
         assert_eq!(game.dim, super::Dim::Overworld);
         // The world spawn the reset cleared is found again in the new terrain, as the Overworld's turn does.
         assert!(game.level.world_spawn.is_none() && game.world_spawn_pending);
-        assert!(game.levels_to_tick().contains(&super::Dim::Overworld), "the search needs the Overworld's turn");
+        assert!(game.levels_to_tick().contains(&(super::Dim::Overworld, 0)), "the search needs the Overworld's turn");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while game.world_spawn_pending {
             game.find_pending_world_spawn().unwrap();

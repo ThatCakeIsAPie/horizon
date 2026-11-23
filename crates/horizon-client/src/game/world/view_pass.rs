@@ -346,7 +346,7 @@ pub(in crate::game) mod tests {
         while all.chunks.len() < 9 && Instant::now() < deadline {
             game.tick_server(false).unwrap();
             assert_eq!(
-                game.levels_to_tick().contains(&Dim::Nether),
+                game.levels_to_tick().contains(&(Dim::Nether, 0)),
                 ticking,
                 "ticked only for a Ticking area"
             );

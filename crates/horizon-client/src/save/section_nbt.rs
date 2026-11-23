@@ -379,6 +379,8 @@ mod tests {
             &["minecraft:air", "minecraft:stone", "minecraft:dirt"],
             false,
         );
+        // `SaveDir::save` keeps the registry for its cubic level (`'static`).
+        let registry: &'static _ = Box::leak(Box::new(registry));
         let biomes = test_biomes(&["plains", "forest"]);
         let dir = tempfile::tempdir().unwrap();
         let mut save = SaveDir::new(dir.path().to_path_buf(), LevelShape::OVERWORLD);
@@ -386,7 +388,7 @@ mod tests {
         save.section_palettes = Arc::new(SavedPaletteBudget::new(3000));
 
         let chunks: Vec<Arc<Chunk>> = (0..4).map(|x| Arc::new(sample_chunk(x, 0, 3, 2))).collect();
-        save.save(&chunks, &registry, &biomes).unwrap();
+        save.save(&chunks, registry, &biomes).unwrap();
         assert!(save.section_palettes.used() > 0);
         assert!(save.section_palettes.used() <= save.section_palettes.limit());
 

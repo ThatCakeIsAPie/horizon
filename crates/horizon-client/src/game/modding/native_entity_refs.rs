@@ -3268,7 +3268,7 @@ pub(super) mod tests {
                     .update(1, |guest| guest.dimension = value);
             }
             let ticking = game.levels_to_tick();
-            assert!(!ticking.contains(&super::super::Dim::Nether));
+            assert!(!ticking.contains(&(super::super::Dim::Nether, 0)));
             {
                 let value = "minecraft:the_nether".into();
                 game.lan
@@ -3278,7 +3278,7 @@ pub(super) mod tests {
                     .guests
                     .update(0, |guest| guest.dimension = value);
             }
-            assert!(game.levels_to_tick().contains(&super::super::Dim::Nether));
+            assert!(game.levels_to_tick().contains(&(super::super::Dim::Nether, 0)));
             {
                 let value = "minecraft:overworld".into();
                 game.lan

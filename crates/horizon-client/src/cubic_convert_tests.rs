@@ -256,7 +256,7 @@ fn a_vanilla_world_becomes_a_hybrid_cubic_world() {
     };
     let root = scratch("hybrid");
     let assets = crate::assets::Assets::load(&resources).expect("assets");
-    let biomes = Arc::new(Biomes::load(&resources).expect("biomes"));
+    let biomes = Arc::new(Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(resources.clone())).expect("biomes"));
     let source = make_source(&root, &assets, &biomes);
     let before = snapshot(&source.world);
     let dst = root.join("World (Cubic)");
@@ -385,7 +385,7 @@ fn bedrock_can_be_kept_and_the_wrong_worlds_are_refused() {
     };
     let root = scratch("options");
     let assets = crate::assets::Assets::load(&resources).expect("assets");
-    let biomes = Arc::new(Biomes::load(&resources).expect("biomes"));
+    let biomes = Arc::new(Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(resources.clone())).expect("biomes"));
     let source = make_source(&root, &assets, &biomes);
     let mut options = ConvertOptions::new(&resources);
     options.keep_bedrock = true;

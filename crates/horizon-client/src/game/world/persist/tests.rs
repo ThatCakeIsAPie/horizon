@@ -1051,7 +1051,10 @@ fn a_slide_takes_only_the_entities_of_the_leaving_cubes() {
     };
     game.world
         .loaded_entities
-        .push(((0, 0), vec![zombie(70.0, 1), zombie(200.0, 2)]));
+        .push((
+            (0, 0),
+            vec![zombie(70.0, 1).into(), zombie(200.0, 2).into()],
+        ));
     game.spawn_loaded_entities();
     let columns = HashSet::from([(0, 0)]);
     // Cubes 8..=15 (y 128..=255) leave: the zombie at y 200 goes, the one at y 70 stays.
