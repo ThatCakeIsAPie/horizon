@@ -339,7 +339,12 @@ mod sampler {
     pub fn earth(name: &str) -> Option<Earth> {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES")?);
         let assets = crate::assets::Assets::load(&root).expect("assets");
-        let biomes = Arc::new(Biomes::load(&root).expect("biomes"));
+        let biomes = Arc::new(
+            Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(
+                root.clone(),
+            ))
+            .expect("biomes"),
+        );
         let dir = std::env::temp_dir().join(format!(
             "horizon-cubic-lod-{name}-{}-{:?}",
             std::process::id(),
