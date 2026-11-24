@@ -54,6 +54,7 @@ fn cf_shade(dir: u32) -> f32 {
     let dir = (q.x >> 20u) & 7u;
     let shaded = (q.x >> 23u) & 1u;
     let overlay = (q.x >> 24u) & 1u;
+    let dim = (q.x >> 25u) & 1u;
     let state = q.y & 0x1ffffu;
     let biome = (q.y >> 17u) & 255u;
     let instance = cf_instances[node * 2u];
@@ -107,7 +108,13 @@ fn cf_shade(dir: u32) -> f32 {
     let uv = vec2<f32>(av - u0, v1 - bv);
 
     let f = cf_face(state, dir, overlay, biome);
-    let light = vec2<u32>(select(240u, 64u, shaded == 1u), 0u);
+    // Sky light 15 in the open, 13 under foliage (as under near trees), 4 under a roof
+    // (lod/mesh.rs `SUNLIT`, `UNDER_FOLIAGE`, `SHADED`).
+    var sky = select(240u, 208u, dim == 1u);
+    if shaded == 1u {
+        sky = 64u;
+    }
+    let light = vec2<u32>(sky, 0u);
     return to_wire(cf_by_level(
         terrain_vertex(position, uv, f.layer, unorm8x4(f.color), light, instance.xyz, instance.w),
         countTrailingZeros(u32(scale))));
