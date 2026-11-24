@@ -2,10 +2,11 @@
 //!
 //! With `s` the surface block height of a column and `sea` the sea level:
 //!
-//! * `y <= s - 4`: stone;
+//! * `y <= s - 4`: stone (for the dry places' kinds, `y < s - 32`);
 //! * on land (`s >= sea`), by the column's [`SurfaceKind`] (see [`super::surface`] for the snow line and the
 //!   alpine band): grass over three dirt (`s - 3 <= y < s` dirt, a grass block at `y == s`); bare stone up to
-//!   `s`; or snow for `s - 1 <= y <= s` over stone; air above;
+//!   `s`; or snow for `s - 1 <= y <= s` over stone; air above; the dry places of a world with climate
+//!   ([`super::dry`]) have terracotta bands by absolute height from 32 blocks under `s` up to their top;
 //! * under water (`s < sea`): sand for `s - 3 <= y <= s`, water for `s < y < sea`, air above.
 //!
 //! A far voxel (a sample `step > 1` blocks tall, from `lo` to `lo + step - 1`) that holds the surface block is
@@ -35,9 +36,12 @@ use std::time::Duration;
 
 use horizon_core::position::SectionPos;
 use horizon_earth::{
-    ElevationField, Fetch, FetchError, LandClass, LandCoverSource, LoadError, TileId, TileStore,
+    ClimateLookup, ElevationField, Fetch, FetchError, LandClass, LandCoverSource, LoadError,
+    TileId, TileStore,
 };
 
+use super::biome::BIOME_SAMPLE_M;
+use super::dry::{BAND_COUNT, DRY_ROCK_DEPTH, DryColumn, DryTop, band_index, band_table};
 use super::far_trees::MAX_TREE_UP;
 use super::settings::EarthSettings;
 use super::surface::{
@@ -63,6 +67,16 @@ pub struct EarthBlocks {
     pub gravel: u32,
     pub mud: u32,
     pub moss_block: u32,
+    /// The dry places' ground and the seven terracotta blocks of the bands ([`super::dry`]).
+    pub red_sand: u32,
+    pub coarse_dirt: u32,
+    pub terracotta: u32,
+    pub orange_terracotta: u32,
+    pub yellow_terracotta: u32,
+    pub brown_terracotta: u32,
+    pub red_terracotta: u32,
+    pub white_terracotta: u32,
+    pub light_gray_terracotta: u32,
     /// What the far view's trees and snow are made of.
     pub far: super::far_trees::FarBlocks,
 }
@@ -82,6 +96,15 @@ impl EarthBlocks {
             gravel: get("gravel")?,
             mud: get("mud")?,
             moss_block: get("moss_block")?,
+            red_sand: get("red_sand")?,
+            coarse_dirt: get("coarse_dirt")?,
+            terracotta: get("terracotta")?,
+            orange_terracotta: get("orange_terracotta")?,
+            yellow_terracotta: get("yellow_terracotta")?,
+            brown_terracotta: get("brown_terracotta")?,
+            red_terracotta: get("red_terracotta")?,
+            white_terracotta: get("white_terracotta")?,
+            light_gray_terracotta: get("light_gray_terracotta")?,
             far: super::far_trees::FarBlocks::from_registry(registry)?,
         })
     }
@@ -174,6 +197,8 @@ pub(super) enum Gap {
 pub struct EarthGenerator {
     pub(super) field: ElevationField,
     blocks: EarthBlocks,
+    /// The terracotta bands of the dry places, by [`band_index`] of the absolute height.
+    bands: Box<[u32; BAND_COUNT]>,
     sea_level: i32,
     base_zoom: u8,
     pub(super) cancel: Arc<AtomicBool>,
@@ -203,6 +228,7 @@ impl EarthGenerator {
         Ok(Self {
             base_zoom: field.zoom_for(settings.metres_per_block),
             field,
+            bands: band_table(&blocks),
             blocks,
             sea_level: settings.sea_level_y,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -328,7 +354,12 @@ impl EarthGenerator {
         let sea = i64::from(self.sea_level);
         let b = &self.blocks;
         let ground = s - kind.sink();
-        if y < ground - SOIL_DEPTH {
+        let depth = if kind.is_dry() {
+            DRY_ROCK_DEPTH
+        } else {
+            SOIL_DEPTH
+        };
+        if y < ground - depth {
             return b.stone;
         }
         if y > ground {
@@ -351,6 +382,14 @@ impl EarthGenerator {
             SurfaceKind::Moss if y == ground => b.moss_block,
             SurfaceKind::Moss => b.dirt,
             SurfaceKind::Marsh => b.mud,
+            SurfaceKind::Scrub(top) | SurfaceKind::Barren(top) if y == ground => match top {
+                DryTop::GrassBlock => b.grass_block,
+                DryTop::CoarseDirt => b.coarse_dirt,
+                DryTop::RedSand => b.red_sand,
+            },
+            SurfaceKind::Banded | SurfaceKind::Scrub(_) | SurfaceKind::Barren(_) => {
+                self.bands[band_index(y)]
+            }
         }
     }
 
@@ -551,13 +590,47 @@ impl EarthGenerator {
         class: LandClass,
     ) -> Result<SurfaceKind, Gap> {
         let elevation = self.field.vertical().elevation_for_y(f64::from(s));
+        // Only open ground reads the climate: what a tree, crop, water or snow column is does not depend on it.
+        let dry = if matches!(class, LandClass::Bare | LandClass::Shrub | LandClass::Grass) {
+            self.dry_column(a, x, z)?
+        } else {
+            None
+        };
         SurfaceKind::on_classified(
             class,
             elevation,
             self.latitude_at(x, z),
             s < self.sea_level,
+            dry,
             || self.is_steep(a, x, z, s, stride, zoom_step),
         )
+    }
+
+    /// What the dry places' rules need of the column `(x, z)`: the climate at it, read as the biome reads it (at
+    /// [`BIOME_SAMPLE_M`]). `None` without climate, or where the climate has no data (today's rules). A local
+    /// read that lacks the climate records what to fetch and gives [`Gap::Land`].
+    pub(super) fn dry_column(&self, a: Access, x: i32, z: i32) -> Result<Option<DryColumn>, Gap> {
+        if !self.climate_wanted() {
+            return Ok(None);
+        }
+        let Some(source) = self.climate_source() else {
+            return Ok(None);
+        };
+        let (fx, fz) = (f64::from(x) + 0.5, f64::from(z) + 0.5);
+        let climate = match a {
+            Access::Local => match source.field().climate_at(fx, fz, BIOME_SAMPLE_M) {
+                ClimateLookup::Climate(c) => Some(c),
+                ClimateLookup::NoData => None,
+                ClimateLookup::Need(fetch) => {
+                    self.note_climate(fetch);
+                    return Err(Gap::Land);
+                }
+            },
+            Access::Fetch => source
+                .climate_at_blocking(fx, fz, BIOME_SAMPLE_M)
+                .map_err(|e| Gap::Load(LoadError::Fetch(e)))?,
+        };
+        Ok(climate.map(|c| DryColumn::new(c, x, z)))
     }
 
     /// `r` grown by what the kinds of its columns read beyond it (a bare column's neighbours), for the lists of
@@ -603,12 +676,13 @@ impl EarthGenerator {
         let (s_lo, s_hi) = (i64::from(s_lo), i64::from(s_hi));
         let sea = i64::from(self.sea_level);
         // With land cover a lake's bed lies lower under its surface, and what is under the sea level is water
-        // only where the map says so, which the heights do not prove.
+        // only where the map says so, which the heights do not prove. With climate the dry places have
+        // terracotta bands down to DRY_ROCK_DEPTH under the surface.
         let land = self.land.is_some();
-        let margin = if land {
-            SOIL_DEPTH + LAKE_DEPTH
-        } else {
-            SOIL_DEPTH
+        let margin = match (land, self.climate.is_some()) {
+            (false, _) => SOIL_DEPTH,
+            (true, false) => SOIL_DEPTH + LAKE_DEPTH,
+            (true, true) => (SOIL_DEPTH + LAKE_DEPTH).max(DRY_ROCK_DEPTH),
         };
         if ymax < s_lo - margin {
             Fill::Stone

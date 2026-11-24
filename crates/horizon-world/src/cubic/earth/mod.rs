@@ -18,20 +18,23 @@
 
 pub mod biome;
 pub mod blocking;
-pub mod far;
-pub mod far_trees;
-pub mod generator;
 #[cfg(test)]
 mod climate_tests;
+pub mod dry;
+#[cfg(test)]
+mod dry_tests;
+pub mod far;
+pub mod far_trees;
 #[cfg(test)]
 mod far_trees_tests;
+pub mod generator;
 #[cfg(test)]
 mod land_tests;
 pub mod settings;
 pub mod surface;
-pub mod vegetation;
 #[cfg(test)]
 mod tests;
+pub mod vegetation;
 #[cfg(test)]
 mod vegetation_tests;
 
@@ -40,4 +43,6 @@ pub use far_trees::{FarBlocks, FarDecor, MAX_TREE_UP};
 pub use generator::{BIOME, EarthBlocks, EarthGenerator, Fill, NotReady};
 pub use settings::EarthSettings;
 pub use surface::SurfaceKind;
-pub use vegetation::{EarthVegetationMask, FAR_TREE_RULES, FeatureKind, SNOW_RULES, VEGETATION_RULES};
+pub use vegetation::{
+    EarthVegetationMask, FAR_TREE_RULES, FeatureKind, SNOW_RULES, VEGETATION_RULES,
+};

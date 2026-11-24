@@ -29,7 +29,7 @@
 //! |---|---|---|---|---|
 //! | Tree cover | yes | yes | yes | yes |
 //! | Shrub | on about 20 % of the columns | no | yes | yes |
-//! | Grass | on about 2 % of the columns | no | no | yes |
+//! | Grass | on about 2 % of the columns | no | yes | yes |
 //! | Crop | no | no | no | yes |
 //! | Moss and lichen | no | no | no | yes |
 //! | Bare | no | no | yes | no |
@@ -38,6 +38,11 @@
 //! | Wetland, mangrove | yes | yes | yes | yes |
 //! | No data | yes | yes | yes | yes |
 //!
+//! In a dry biome ([`Biome::few_plants`]: desert, badlands, eroded badlands, savanna, savanna plateau; a world with
+//! climate) Plant features on shrub and grass grow on only [`PLANT_SHARE`](super::dry::PLANT_SHARE) (30 %) of the columns, by the same kind
+//! of fixed column hash, so dry ground has few plants. Dead bushes, cactus and dry grass (Dry) are the dry biomes'
+//! own and are not thinned; only dry biomes have them, so wet places are unchanged.
+//!
 //! A tree allowed on a share of columns uses a fixed hash of the column, not the world seed: the same columns
 //! whatever the world, and the vanilla feature still decides which of them get a tree, so the share thins
 //! vanilla's density by that factor.
@@ -45,16 +50,19 @@
 //! The mask reads the class at one block (the world's scale), like the surface. It waits for land cover
 //! tiles like the generator's other blocking reads and answers `false` if the world is shutting down.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use horizon_earth::{LandClass, LoadError};
 
+use super::biome::Biome;
+use super::dry::few_plants_allow;
 use super::generator::{EarthGenerator, Gap, Rect};
 use crate::cubic::custom::vegetation::VegetationMask;
 
 /// The version of the vegetation rules above. It goes up when what grows where changes, and is in the terrain
 /// key while land cover and vegetation are on.
-pub const VEGETATION_RULES: u32 = 1;
+pub const VEGETATION_RULES: u32 = 2;
 /// The version of the far view's trees (`far_trees`). It is in the terrain key while vegetation is on, so far
 /// caches made before trees were drawn far away are rebuilt.
 pub const FAR_TREE_RULES: u32 = 1;
@@ -62,6 +70,8 @@ pub const FAR_TREE_RULES: u32 = 1;
 /// in the terrain key while vegetation and `snow` are on.
 pub const SNOW_RULES: u32 = 1;
 
+/// Entries the mask's biome cache holds before it starts over.
+const BIOME_CACHE: usize = 8192;
 /// Columns out of 1,000 that allow a tree on shrub.
 const SHRUB_TREES: u64 = 200;
 /// Columns out of 1,000 that allow a tree on grass.
@@ -110,11 +120,7 @@ impl FeatureKind {
 
 /// A fixed hash of a column to 0..1000 (splitmix64 finalizer).
 fn column_bucket(x: i32, z: i32) -> u64 {
-    let mut h =
-        (u64::from(x as u32) << 32 | u64::from(z as u32)).wrapping_add(0x9E37_79B9_7F4A_7C15);
-    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    (h ^ (h >> 31)) % 1000
+    super::dry::column_bucket(x, z, 0)
 }
 
 /// The share (0 to 1) of columns [`allowed`] lets a tree grow on in a land class: the table above.
@@ -128,7 +134,27 @@ pub fn tree_share(class: LandClass) -> f64 {
 }
 
 /// Whether a feature of `kind` may grow at the column `(x, z)` whose land class is `class`; the table above.
+/// The biome-blind form of [`allowed_in`].
 pub fn allowed(class: LandClass, kind: FeatureKind, x: i32, z: i32) -> bool {
+    allowed_in(class, kind, x, z, None)
+}
+
+/// [`allowed`] where the biome of the column is `biome` (when known): in a biome that carries few plants
+/// ([`Biome::few_plants`]: deserts, badlands, savannas) plant features grow on only [`PLANT_SHARE`](super::dry::PLANT_SHARE) of the
+/// shrub and grass columns.
+pub fn allowed_in(
+    class: LandClass,
+    kind: FeatureKind,
+    x: i32,
+    z: i32,
+    biome: Option<Biome>,
+) -> bool {
+    let sparse = matches!(class, LandClass::Shrub | LandClass::Grass)
+        && kind == FeatureKind::Plant
+        && biome.is_some_and(Biome::few_plants);
+    if sparse && !few_plants_allow(x, z) {
+        return false;
+    }
     use FeatureKind::{Dry, Plant, Tree, Water};
     match class {
         LandClass::Tree => true,
@@ -139,8 +165,8 @@ pub fn allowed(class: LandClass, kind: FeatureKind, x: i32, z: i32) -> bool {
         },
         LandClass::Grass => match kind {
             Tree => column_bucket(x, z) < GRASS_TREES,
-            Plant => true,
-            Water | Dry => false,
+            Plant | Dry => true,
+            Water => false,
         },
         LandClass::Crop | LandClass::MossLichen => kind == Plant,
         LandClass::Bare => kind == Dry,
@@ -154,11 +180,44 @@ pub fn allowed(class: LandClass, kind: FeatureKind, x: i32, z: i32) -> bool {
 /// allows their kind ([`allowed`]).
 pub struct EarthVegetationMask {
     generator: Arc<EarthGenerator>,
+    /// The biomes asked for lately, by 4 by 4 column.
+    cache: Mutex<HashMap<(i32, i32), Biome>>,
 }
 
 impl EarthVegetationMask {
     pub fn new(generator: Arc<EarthGenerator>) -> Self {
-        Self { generator }
+        Self {
+            generator,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The biome of the block column `(x, z)` in a world with climate; `None` without (the biomes there do
+    /// not say which places are dry). Remembered per 4 by 4 column.
+    fn biome_at(&self, x: i32, z: i32) -> Option<Biome> {
+        let g = &*self.generator;
+        if !g.climate_wanted() || g.climate_source().is_none() {
+            return None;
+        }
+        let key = (x >> 2, z >> 2);
+        if let Some(&b) = self
+            .cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+        {
+            return Some(b);
+        }
+        let biome = g.biome_at_quart_blocking(key.0, key.1);
+        // A read cut short by the world shutting down is `plains` and not worth keeping.
+        if !g.is_cancelled() {
+            let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            if cache.len() >= BIOME_CACHE {
+                cache.clear();
+            }
+            cache.insert(key, biome);
+        }
+        Some(biome)
     }
 
     /// The class of the block column `(x, z)`, loading what it lacks; `None` without land cover or when the
@@ -186,7 +245,15 @@ impl EarthVegetationMask {
 impl VegetationMask for EarthVegetationMask {
     fn allows(&self, x: i32, z: i32, feature: &str) -> bool {
         match self.class_at(x, z) {
-            Some(class) => allowed(class, FeatureKind::of(feature), x, z),
+            Some(class) => {
+                let kind = FeatureKind::of(feature);
+                // The biome is asked for only where it can matter.
+                let biome = (kind == FeatureKind::Plant
+                    && matches!(class, LandClass::Shrub | LandClass::Grass))
+                .then(|| self.biome_at(x, z))
+                .flatten();
+                allowed_in(class, kind, x, z, biome)
+            }
             None => false,
         }
     }

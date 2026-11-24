@@ -51,7 +51,7 @@ fn files_near(lat: f64, lon: f64) -> BTreeSet<WorldCoverFile> {
 impl LandRig {
     /// Land cover `class(lat, lon)` (a code) over `elevation(lat, lon)` metres, with `settings` (land cover is
     /// turned on).
-    fn new(
+    pub(super) fn new(
         mut settings: EarthSettings,
         elevation: impl Fn(f64, f64) -> f64 + Send + Sync + 'static,
         class: impl Fn(f64, f64) -> u8 + Clone,
@@ -376,8 +376,9 @@ fn the_snow_line_still_whitens_peaks_the_map_calls_something_else() {
     }
     // The rule itself, on the places that matter.
     let steep = || Ok::<_, ()>(false);
-    let on =
-        |class, metres, lat| SurfaceKind::on_classified(class, metres, lat, false, steep).unwrap();
+    let on = |class, metres, lat| {
+        SurfaceKind::on_classified(class, metres, lat, false, None, steep).unwrap()
+    };
     for class in LandClass::ALL {
         if class == LandClass::NoData {
             continue;
