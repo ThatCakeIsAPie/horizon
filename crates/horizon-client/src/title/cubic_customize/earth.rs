@@ -14,6 +14,7 @@ use crate::earth_consent::Approved;
 use crate::{cubic_settings, earth_net, text::Text};
 use horizon_earth::VerticalMap;
 use horizon_world::cubic::earth::EarthSettings;
+use horizon_world::cubic::ores::OreGenSettings;
 use horizon_world::cubic::{MAX_Y, MIN_Y};
 
 /// The box ids the clipboard and the caret know the page's text boxes by.
@@ -176,6 +177,16 @@ impl Draft {
             return Ok(Self::start(ctx));
         }
         EarthSettings::from_json(text).map(|settings| Self::of(&settings, ctx))
+    }
+
+    /// The ore settings the Ores page reads: none = this Earth world has no ores.
+    pub(super) fn ore_gen(&self) -> &Option<OreGenSettings> {
+        &self.rest.ore_gen
+    }
+
+    /// The ore settings the Ores page edits.
+    pub(super) fn ore_gen_mut(&mut self) -> &mut Option<OreGenSettings> {
+        &mut self.rest.ore_gen
     }
 
     /// The tile server's host, when the address is one the game may use.

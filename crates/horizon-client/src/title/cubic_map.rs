@@ -139,31 +139,6 @@ pub fn heights_locked(s: &CustomGeneratorSettings) -> bool {
     )
 }
 
-/// An ore height in blocks: `h * expectedHeightVariation + expectedBaseHeight`.
-pub fn ore_block_y(h: f64, s: &CustomGeneratorSettings) -> f64 {
-    h * s.expected_height_variation + s.expected_base_height
-}
-
-/// The ends of an ore height range slider: a height at or past them is the
-/// range's open end (CWG's `-inf` / `+inf`).
-pub const ORE_RANGE: f64 = 2.0;
-
-/// The height range slider's value for `h` (an open end is the slider's end).
-pub fn ore_slider_value(h: f64) -> f64 {
-    h.clamp(-ORE_RANGE, ORE_RANGE)
-}
-/// The height a range slider value stands for: its ends are unbounded.
-pub fn ore_from_slider(value: f64) -> f64 {
-    if value <= -ORE_RANGE {
-        f64::NEG_INFINITY
-    } else if value >= ORE_RANGE {
-        f64::INFINITY
-    } else {
-        // Hundredths, as the slider steps.
-        (value * 100.0).round() / 100.0
-    }
-}
-
 /// The cube Y a cave height slider (in cubes, `-CAVE_RANGE..=CAVE_RANGE`)
 /// stands for: its ends are unbounded, as CWG's defaults are.
 pub const CAVE_RANGE: i32 = 64;
@@ -284,15 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn ore_heights_convert_to_blocks_and_back_and_the_slider_ends_are_open() {
-        let s = CustomGeneratorSettings::defaults();
-        // blockY = h * 64 + 64.
-        near(ore_block_y(0.5, &s), 96.0);
-        near(ore_block_y(-1.0, &s), 0.0);
-        assert_eq!(ore_from_slider(-2.0), f64::NEG_INFINITY);
-        assert_eq!(ore_from_slider(2.0), f64::INFINITY);
-        assert_eq!(ore_from_slider(0.504), 0.5);
-        assert_eq!(ore_slider_value(f64::INFINITY), 2.0);
+    fn cave_heights_convert_and_the_slider_ends_are_open() {
         assert_eq!(cave_from_slider(-CAVE_RANGE, true), i32::MIN / 16);
         assert_eq!(cave_from_slider(-CAVE_RANGE, false), -CAVE_RANGE);
         assert_eq!(cave_from_slider(CAVE_RANGE, false), i32::MAX / 16);
