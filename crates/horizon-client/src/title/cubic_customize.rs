@@ -4,9 +4,11 @@
 //! a [`CustomGeneratorSettings`]; Custom Cubic has a sixth after Basic,
 //! Horizon's Structures, which switches and tunes vanilla's structure sets
 //! (Hybrid's structures are vanilla's own, from its vanilla band). Flat Cubic
-//! opens a layer editor, and Earth ([`earth`]) one plain page of text boxes: where
-//! on the globe the world is, its scale and its tile server. All have Presets,
-//! an overlay that imports and exports the settings as JSON.
+//! opens a layer editor, and Earth ([`earth`]) a plain page of text boxes (where
+//! on the globe the world is, its scale and its tile server) with the Ores page
+//! after it. The Ores page ([`ores`]) edits the two-tier ore settings and the
+//! meteors of Custom Cubic, Hybrid and Earth. All have Presets, an overlay that
+//! imports and exports the settings as JSON.
 //!
 //! The controls of a page are rebuilt from the state each time they are drawn
 //! or pressed ([`page`]): a [`Widget`] is its rectangle, its label and a
@@ -28,32 +30,18 @@ use horizon_world::cubic::custom::{
     CustomGeneratorSettings, FlatGeneratorSettings,
     settings::{
         BiomeDesc, BlockStateDesc, CaveConfig, FilterType, FlatLayer, LakeConfig,
-        OVERWORLD_STRUCTURE_SETS, PeriodicGaussianOreConfig, StandardOreConfig, UserFunction,
-        UserFunctionPoint, VanillaPlacement,
+        OVERWORLD_STRUCTURE_SETS, UserFunction, UserFunctionPoint, VanillaPlacement,
     },
 };
 use std::{cell::RefCell, collections::BTreeSet, path::Path, rc::Rc};
 
 mod earth;
+mod ores;
 
 /// Makes this test's games offer Earth a tile address and a land cover address.
 #[cfg(test)]
 pub(super) fn offer_earth_for_test(tiles: Option<&str>, land: Option<&str>) {
     earth::offer_for_test(tiles, land);
-}
-
-/// Writes into the ore `i` of the combined list (standard ores, then periodic
-/// ones); `$body` sees it as `$o`, of either type.
-macro_rules! ore {
-    ($c:expr, $i:expr, |$o:ident| $body:expr) => {{
-        let n = $c.standard_ores.len();
-        if $i < n {
-            let $o = &mut $c.standard_ores[$i];
-            $body;
-        } else if let Some($o) = $c.periodic_gaussian_ores.get_mut($i - n) {
-            $body;
-        }
-    }};
 }
 
 /// The Presets overlay's JSON box and the picker's search box.
@@ -82,7 +70,7 @@ enum PageId {
     Lakes,
     Caves,
     Terrain,
-    /// Earth's one page: its place, scale and tile server.
+    /// Earth's first page: its place, scale and tile server.
     Earth,
 }
 impl PageId {
@@ -119,8 +107,8 @@ const HYBRID_PAGES: &[PageId] = &[
     PageId::Terrain,
 ];
 
-/// Earth's: the one page.
-const EARTH_PAGES: &[PageId] = &[PageId::Earth];
+/// Earth's: its place, scale and tile server, then its ores.
+const EARTH_PAGES: &[PageId] = &[PageId::Earth, PageId::Ores];
 
 const HEADER: f32 = 24.0;
 const FOOTER: f32 = 33.0;
@@ -361,7 +349,7 @@ impl State {
         self.page
     }
     /// The number of pages: six for Custom Cubic, five for Hybrid, one for
-    /// Flat Cubic's layers and one for Earth.
+    /// Flat Cubic's layers and two for Earth (its place, then its ores).
     pub fn page_count(&self) -> usize {
         self.pages().len().max(1)
     }
@@ -471,26 +459,6 @@ impl State {
                 .map(|id| (id.clone(), block_name(id)))
                 .collect::<Vec<_>>()
         };
-        let ore_biomes = |i: usize| {
-            let n = s.standard_ores.len();
-            if i < n {
-                s.standard_ores[i].biomes.clone()
-            } else {
-                s.periodic_gaussian_ores
-                    .get(i - n)
-                    .and_then(|o| o.biomes.clone())
-            }
-        };
-        let ore_block = |i: usize| {
-            let n = s.standard_ores.len();
-            if i < n {
-                s.standard_ores.get(i).map(|o| o.blockstate.name.clone())
-            } else {
-                s.periodic_gaussian_ores
-                    .get(i - n)
-                    .map(|o| o.blockstate.name.clone())
-            }
-        };
         let mut rows;
         let multi;
         let selected: BTreeSet<String> = match target {
@@ -503,8 +471,8 @@ impl State {
             Target::OreBiomes(i) => {
                 rows = self.biomes.clone();
                 multi = true;
-                match ore_biomes(i) {
-                    Some(list) => list.iter().map(|b| b.name().to_owned()).collect(),
+                match ores::biomes_of(self, i) {
+                    Some(list) => list.into_iter().collect(),
                     None => self.biomes.iter().map(|b| b.0.clone()).collect(),
                 }
             }
@@ -519,7 +487,7 @@ impl State {
             Target::OreBlock(i) => {
                 rows = blocks();
                 multi = false;
-                ore_block(i).into_iter().collect()
+                ores::block_of(self, i).into_iter().collect()
             }
             Target::LakeBlock(i) => {
                 rows = blocks();
@@ -598,12 +566,10 @@ impl State {
                 if id.is_empty() {
                     return;
                 }
-                self.edit(|c| ore!(c, i, |o| o.blockstate = BlockStateDesc::new(&id)));
+                ores::set_block(self, i, &id);
             }
             Target::OreBiomes(i) => {
-                let biomes =
-                    (!all).then(|| list.iter().map(|b| BiomeDesc::new(b)).collect::<Vec<_>>());
-                self.edit(|c| ore!(c, i, |o| o.biomes = biomes.clone()));
+                ores::set_biomes(self, i, (!all).then(|| list.clone()));
             }
             Target::LakeBlock(i) => {
                 let id = one();
@@ -855,7 +821,7 @@ fn page(state: &State) -> Page {
         Some(PageId::Earth) => earth::page(&mut b, state),
         Some(PageId::Basic) => basic_page(&mut b, state),
         Some(PageId::Structures) => structures_page(&mut b, state),
-        Some(PageId::Ores) => ores_page(&mut b, state),
+        Some(PageId::Ores) => ores::page(&mut b, state),
         Some(PageId::Lakes) => lakes_page(&mut b, state),
         Some(PageId::Caves) => caves_page(&mut b, state),
         Some(PageId::Terrain) => terrain_page(&mut b, state),
@@ -1104,205 +1070,6 @@ fn vanilla_structures(c: &mut CustomGeneratorSettings) {
     c.woodland_mansions = true;
     for set in OVERWORLD_STRUCTURE_SETS {
         c.structure_sets.remove(set.name);
-    }
-}
-
-/// One ore of the combined list, as the page shows it.
-struct OreView {
-    block: String,
-    size: i32,
-    tries: i32,
-    probability: f64,
-    min: f64,
-    max: f64,
-    biomes: Option<usize>,
-    periodic: Option<(f64, f64, f64)>,
-}
-fn ore_views(s: &CustomGeneratorSettings) -> Vec<OreView> {
-    let standard = s.standard_ores.iter().map(|o| OreView {
-        block: o.blockstate.name.clone(),
-        size: o.spawn_size,
-        tries: o.spawn_tries,
-        probability: o.spawn_probability,
-        min: o.min_height,
-        max: o.max_height,
-        biomes: o.biomes.as_ref().map(Vec::len),
-        periodic: None,
-    });
-    let periodic = s.periodic_gaussian_ores.iter().map(|o| OreView {
-        block: o.blockstate.name.clone(),
-        size: o.spawn_size,
-        tries: o.spawn_tries,
-        probability: o.spawn_probability,
-        min: o.min_height,
-        max: o.max_height,
-        biomes: o.biomes.as_ref().map(Vec::len),
-        periodic: Some((o.height_mean, o.height_std_deviation, o.height_spacing)),
-    });
-    standard.chain(periodic).collect()
-}
-
-fn ores_page(b: &mut Builder, state: &State) {
-    let s = &state.settings;
-    b.row(vec![
-        button(tr("horizon.cubic.ore.add"), |st| {
-            st.edit(|c| c.standard_ores.push(StandardOreConfig::default()));
-        }),
-        button(tr("horizon.cubic.ore.add_periodic"), |st| {
-            st.edit(|c| {
-                c.periodic_gaussian_ores
-                    .push(PeriodicGaussianOreConfig::default());
-            });
-        }),
-    ]);
-    let variation = s.expected_height_variation;
-    let blocks = |h: f64| show(cubic_map::ore_block_y(h, s).round());
-    for (i, ore) in ore_views(s).into_iter().enumerate() {
-        let kind = if ore.periodic.is_some() {
-            "horizon.cubic.ore.periodic"
-        } else {
-            "horizon.cubic.ore.standard"
-        };
-        b.heading(format!(
-            "{} {}: {}",
-            tr(kind),
-            i + 1,
-            block_name(&ore.block)
-        ));
-        b.row(vec![
-            button(
-                labelled("horizon.cubic.block", block_name(&ore.block)),
-                move |st| {
-                    st.open_picker(Target::OreBlock(i));
-                },
-            ),
-            button(tr("selectServer.delete"), move |st| {
-                st.edit(|c| {
-                    let n = c.standard_ores.len();
-                    if i < n {
-                        c.standard_ores.remove(i);
-                    } else if i - n < c.periodic_gaussian_ores.len() {
-                        c.periodic_gaussian_ores.remove(i - n);
-                    }
-                });
-            }),
-        ]);
-        b.row(vec![
-            int(
-                "horizon.cubic.ore.size",
-                1,
-                50,
-                ore.size.clamp(1, 50),
-                move |st, v| {
-                    st.edit(|c| ore!(c, i, |o| o.spawn_size = v));
-                },
-            ),
-            int(
-                "horizon.cubic.ore.tries",
-                1,
-                40,
-                ore.tries.clamp(1, 40),
-                move |st, v| {
-                    st.edit(|c| ore!(c, i, |o| o.spawn_tries = v));
-                },
-            ),
-        ]);
-        let biomes = match ore.biomes {
-            None => tr("horizon.cubic.biome.all"),
-            Some(n) => n.to_string(),
-        };
-        b.row(vec![
-            number(
-                "horizon.cubic.ore.probability",
-                Mapping::Linear { min: 0.0, max: 1.0 },
-                ore.probability,
-                move |st, v| st.edit(|c| ore!(c, i, |o| o.spawn_probability = v)),
-            ),
-            button(labelled("horizon.cubic.ore.biomes", biomes), move |st| {
-                st.open_picker(Target::OreBiomes(i));
-            }),
-        ]);
-        let height = |key: &str, value: f64, low: bool| {
-            let shown = if value.is_finite() {
-                format!("{} ({})", show(value), blocks(value))
-            } else {
-                tr("horizon.cubic.unbounded")
-            };
-            number_shown(
-                key,
-                Mapping::Linear {
-                    min: -cubic_map::ORE_RANGE,
-                    max: cubic_map::ORE_RANGE,
-                },
-                cubic_map::ore_slider_value(value),
-                shown,
-                move |st, v| {
-                    let h = cubic_map::ore_from_slider(v);
-                    st.edit(|c| {
-                        if low {
-                            ore!(c, i, |o| o.min_height = h);
-                        } else {
-                            ore!(c, i, |o| o.max_height = h);
-                        }
-                    });
-                },
-            )
-        };
-        b.row(vec![
-            height("horizon.cubic.ore.min_height", ore.min, true),
-            height("horizon.cubic.ore.max_height", ore.max, false),
-        ]);
-        if let Some((mean, deviation, spacing)) = ore.periodic {
-            b.row(vec![
-                number_shown(
-                    "horizon.cubic.ore.mean",
-                    Mapping::Linear {
-                        min: -4.0,
-                        max: 4.0,
-                    },
-                    mean,
-                    format!("{} ({})", show(mean), blocks(mean)),
-                    move |st, v| st.edit(|c| periodic(c, i, |o| o.height_mean = v)),
-                ),
-                number_shown(
-                    "horizon.cubic.ore.deviation",
-                    Mapping::Linear { min: 0.0, max: 1.0 },
-                    deviation,
-                    format!(
-                        "{} ({})",
-                        show(deviation),
-                        show((deviation * variation).round())
-                    ),
-                    move |st, v| {
-                        st.edit(|c| periodic(c, i, |o| o.height_std_deviation = v.max(0.001)));
-                    },
-                ),
-            ]);
-            b.row(vec![number_shown(
-                "horizon.cubic.ore.spacing",
-                Mapping::PosExp { lo: -1.0, hi: 6.0 },
-                spacing,
-                format!(
-                    "{} ({})",
-                    show(spacing),
-                    show((spacing * variation).round())
-                ),
-                move |st, v| st.edit(|c| periodic(c, i, |o| o.height_spacing = v)),
-            )]);
-        }
-    }
-}
-/// `f` on periodic ore `i` of the combined list, if it is one.
-fn periodic(
-    c: &mut CustomGeneratorSettings,
-    i: usize,
-    f: impl FnOnce(&mut PeriodicGaussianOreConfig),
-) {
-    let n = c.standard_ores.len();
-    if i >= n
-        && let Some(ore) = c.periodic_gaussian_ores.get_mut(i - n)
-    {
-        f(ore);
     }
 }
 
@@ -3068,9 +2835,13 @@ mod tests {
         press(&mut s, DONE);
         assert_eq!(s.settings.biome, "minecraft:desert");
         // An ore with no restriction starts with every biome chosen; leaving one
-        // out restricts it to the rest.
-        s.edit(|c| c.standard_ores.push(StandardOreConfig::default()));
-        let last = s.settings.standard_ores.len() - 1;
+        // out restricts it to the rest. The ore is an entry of the new list,
+        // which the first edit writes (the old lists are cleared).
+        ores::edit(&mut s, |o| {
+            o.ores.push(horizon_world::cubic::ores::OreEntry::default())
+        });
+        let last = ores::view(&s).unwrap().ores.len() - 1;
+        assert!(s.settings.standard_ores.is_empty());
         s.open_picker(Target::OreBiomes(last));
         let Overlay::Picker(p) = &mut s.overlay else {
             panic!()
@@ -3078,49 +2849,31 @@ mod tests {
         assert!(p.multi && p.selected.len() == p.rows.len());
         p.selected.remove("minecraft:plains");
         press(&mut s, DONE);
-        let restricted = s.settings.standard_ores[last].biomes.clone().unwrap();
+        let restricted = ores::view(&s).unwrap().ores[last].biomes.clone().unwrap();
         assert!(
             !restricted.is_empty() && !restricted.iter().any(|b| b.name() == "minecraft:plains")
         );
     }
 
     #[test]
-    fn ore_height_sliders_have_open_ends_and_hundredth_steps() {
-        let mut s = state(CubicKind::Custom, "");
-        s.edit(|c| c.standard_ores.push(StandardOreConfig::default()));
-        open(&mut s, PageId::Ores);
-        let last = s.settings.standard_ores.len() - 1;
-        // The new ore is unbounded both ways; a slider at 0.75 of the track
-        // (-2 to 2) is height 1.0, and the end is open again.
-        let min_slider = sliders(&s)
-            .into_iter()
-            .find(|&i| {
-                let mut probe = s.clone();
-                set(&mut probe, i, 0.75);
-                probe.settings.standard_ores[last].min_height != f64::NEG_INFINITY
-            })
-            .expect("a slider sets the minimum height");
-        set(&mut s, min_slider, 0.75);
-        assert_eq!(s.settings.standard_ores[last].min_height, 1.0);
-        set(&mut s, min_slider, 0.0);
-        assert_eq!(s.settings.standard_ores[last].min_height, f64::NEG_INFINITY);
-    }
-
-    #[test]
     fn adding_and_deleting_entries_edits_the_lists() {
         let mut s = state(CubicKind::Custom, "");
         let (ores, lakes, caves) = (
-            s.settings.standard_ores.len(),
+            ores::view(&s).unwrap().ores.len(),
             s.settings.lakes.len(),
             s.settings.caves.len(),
         );
-        // Each page's first button is its Add.
-        for id in [PageId::Ores, PageId::Lakes, PageId::Caves] {
+        // The lakes and caves pages' first button is their Add; the Ores page
+        // has its switch and Reset to defaults first, then Add ore.
+        open(&mut s, PageId::Ores);
+        let add = buttons_of(&s)[2].clone();
+        add(&mut s, 0.0);
+        for id in [PageId::Lakes, PageId::Caves] {
             open(&mut s, id);
             let add = buttons_of(&s)[0].clone();
             add(&mut s, 0.0);
         }
-        assert_eq!(s.settings.standard_ores.len(), ores + 1);
+        assert_eq!(ores::view(&s).unwrap().ores.len(), ores + 1);
         assert_eq!(s.settings.lakes.len(), lakes + 1);
         assert_eq!(s.settings.caves.len(), caves + 1);
         // On the caves page the buttons are Add, then per cave its block,
@@ -3559,9 +3312,9 @@ mod tests {
     }
 
     #[test]
-    fn earth_opens_one_page_of_the_origin_scale_and_tile_server() {
+    fn earth_opens_with_a_page_of_the_origin_scale_and_tile_server() {
         let s = state(CubicKind::Earth, "");
-        assert_eq!((s.page_count(), s.page_id()), (1, Some(PageId::Earth)));
+        assert_eq!((s.page_count(), s.page_id()), (2, Some(PageId::Earth)));
         let widgets = page(&s).widgets;
         let fields = widgets
             .iter()
@@ -3572,9 +3325,9 @@ mod tests {
         let defaults = earth_settings(&s).unwrap();
         assert_eq!(defaults, cubic_settings::default_earth());
         assert!(defaults.tile_url.is_empty() && !defaults.allow_downloads);
-        // The footer has no Prev or Next.
+        // The footer has Prev and Next, to Earth's Ores page.
         let ids: Vec<u8> = buttons(SIZE.0, SIZE.1, &s).iter().map(|b| b.id).collect();
-        assert!(!ids.contains(&PREV) && !ids.contains(&NEXT));
+        assert!(ids.contains(&PREV) && ids.contains(&NEXT));
         assert!(ids.contains(&DONE) && ids.contains(&PRESETS));
     }
 
