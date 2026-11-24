@@ -207,7 +207,8 @@ the name out while it is off) **and** a source handed to the generator (`EarthGe
 terrain, block for block (a test compares them). Where a column's
 class is known it replaces the elevation rule for the top of the column (`surface.rs`); no data keeps the old rule.
 The class is read at the zoom of the sampling step, so a far voxel uses a coarser overview level than a block.
-The biome column below is the one without climate; with `climate` on see [Climate](#climate).
+The biome column below is the one without climate; with `climate` on see [Climate](#climate), and
+[Dry places](#dry-places) for what a dry climate does to shrubland, grassland and bare ground.
 
 | Class | Top of the column (over stone) | Biome |
 |---|---|---|
@@ -268,7 +269,7 @@ cane, pumpkins, mushrooms, lily pads, leaf litter...).
 |---|---|
 | tree cover | everything the biome has (the forest's density is the biome's own) |
 | shrubland | plants and dry plants; trees on a fixed 20 % of the columns |
-| grassland | plants; trees on a fixed 2 % of the columns |
+| grassland | plants and dry plants; trees on a fixed 2 % of the columns |
 | cropland, moss and lichen | plants only |
 | bare | dry plants only (cactus and dead bush in a desert, as vanilla) |
 | built-up, snow and ice | nothing |
@@ -276,11 +277,16 @@ cane, pumpkins, mushrooms, lily pads, leaf litter...).
 | wetland, mangroves | everything (the `swamp` and `mangrove_swamp` features) |
 | no data, or no file | everything the biome has |
 
+In a world with climate, where the biome of a shrub or grass column is desert, badlands, eroded badlands, savanna or
+savanna plateau, plant features (not dry ones, not trees) grow on only 30 % of the columns, again a fixed column
+hash (see [Dry places](#dry-places)). Dry plants on grassland only show in biomes that have them, so wet places are
+unchanged.
+
 The share of columns that may hold a tree is a fixed hash of the column, so the vanilla feature still decides where
 a tree stands and the share thins its density. Lily pads count as plants, so they float on swamps but not on lakes.
 
-- **The cache key.** `terrain_key()` also ends with `#vegetation<rules>` while land cover and vegetation are on, so
-  old far-view caches are rebuilt. The far view draws its own simple trees
+- **The cache key.** `terrain_key()` also ends with `#vegetation<rules>` (now `#vegetation2`) while land cover and
+  vegetation are on, so old far-view caches are rebuilt. The far view draws its own simple trees
   (see Far view: trees and snow); the key also ends with `#fartrees1` then.
 
 ### Climate
@@ -312,14 +318,99 @@ land cover table above still decides the ground; the climate only picks the biom
   shrubland desert; bare ground desert or badlands where dry, else stony peaks or windswept gravelly hills; the sea
   warm, lukewarm, normal, cold or frozen ocean by temperature (deep under 200 m); rivers freeze below 0 °C. About a
   third of 2 km cells take vanilla's variant (sunflower plains, old growth birch, bamboo jungle, sparse jungle, ice
-  spikes, old growth pine taiga). Snow and the snow line, wetlands and mangroves stay as in the table above.
+  spikes, old growth pine taiga). Snow and the snow line, wetlands and mangroves stay as in the table above. In a dry climate, open ground follows the [Dry places](#dry-places) rules instead (badlands, desert, savanna).
 - **Fallback.** Where the climate has no data (no source, a refused host, a no-data pixel) land uses the table above
   exactly, and seas and rivers take a temperature from latitude and height (`27 - 0.0074 lat²` °C, 6.5 °C colder a
   kilometre up).
 - **The far view** waits for the climate as it does for land cover: a missing piece is "later" and recorded
   (`EarthGenerator::take_climate_requests`) for the prefetcher.
 - **The cache key.** `terrain_key()` also ends with `#climate<data rules>.<biome rules>` while land cover and climate
-  are on.
+  are on. Dry climates change the ground, the biome and the plants: see [Dry places](#dry-places).
+
+### Dry places
+
+With land cover, vegetation as wanted, and `climate` on, a **dry climate** changes the ground, the biome and the plants of
+open land (bare ground, shrubland, grassland). Without climate (the setting off, no source, or a column the climate has
+no data for) every rule is exactly what it was without it: a test compares the kinds and the biomes. All thresholds
+are named constants in one place, `earth/dry.rs`; the rules are in `surface.rs`, `biome.rs` and `vegetation.rs`.
+
+**What is dry.** The Koppen-style aridity ratio `r = P / (20 (T + 7))` (`T` mean annual temperature in °C, `P` annual
+rain in mm, the divisor at least 20), read at the column as the biome reads it (500 m of ground):
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `DRY_ARIDITY` | 1.3 | `r` below it, and `T` of 0 °C or more: a dry climate (steppe and desert); about 440 mm a year at 10 °C, 700 mm at 20 °C |
+| `DESERT_ARIDITY` | 0.5 | `r` below it: desert, sparser still; about 170 mm a year at 10 °C, 270 mm at 20 °C |
+| `HOT_C` | 18 °C | from here gentle dry bare ground is sand dunes rather than barren red ground |
+| `SAVANNA_FROM_C` | 8 °C | from here (vanilla's temperate row) dry shrub and grass are desert or savanna |
+| `RUGGED_M`, `ERODED_M` | 150 m, 400 m | relief from which dry ground is badlands, eroded badlands |
+| `BAND_BLOCKS`, `DRY_ROCK_DEPTH` | 4, 32 | blocks one terracotta band spans; blocks of bands under a dry top |
+| `PLANT_SHARE` | 300 of 1,000 | columns that keep plant features in a dry biome |
+
+Why 1.3 and 0.5: Koppen's dry boundary with this divisor (rain spread over the year) is `r` = 1 and its desert
+boundary 0.5; with summer rain the dry boundary is about 1.3 to 1.4. A mean annual climate alone cannot tell the
+seasons apart, so 1.3 takes in the semi-arid steppes with summer rain without taking in wet places. CHELSA as the
+game reads it (500 m of ground):
+
+| Place | T (°C) | P (mm) | r | Dry? |
+|---|---|---|---|---|
+| Grand Canyon, South Rim (Grand Canyon Village, 2,100 m) | 10.0 | 429 | 1.26 | dry scrub |
+| Grand Canyon, upper walls (36.07 N, 112.12 W) | 12.5 | 363 | 0.93 | dry scrub |
+| Grand Canyon, Indian Garden | 15.3 | 323 | 0.72 | dry scrub |
+| Grand Canyon, Phantom Ranch (inner canyon, 750 m) | 17.6 | 281 | 0.57 | dry scrub, near desert |
+| Grand Canyon, North Rim | 8.5 | 527 | 1.70 | no |
+| Flagstaff (pine forest) | 9.5 | 556 | 1.68 | no |
+| Denver / Lubbock (semi-arid steppe) | 9.9 / 15.8 | 433 / 515 | 1.28 / 1.13 | dry scrub |
+| Phoenix / Las Vegas / Death Valley | 23.2 / 20.9 / 26.1 | 218 / 137 / 79 | 0.36 / 0.25 / 0.12 | desert |
+| Sahara edge, Aïr mountains | 29.0 | 131 | 0.18 | desert |
+| Serengeti | 22.3 | 646 | 1.10 | dry scrub (savanna) |
+| Rome / Paris | 15.8 / 11.3 | 769 / 657 | 1.69 / 1.80 | no |
+| Alps, Bernese Oberland | 6.4 | 1,662 | 6.20 | no |
+| Amazon | 26.2 | 2,376 | 3.57 | no |
+| Pacific Northwest, Olympic Peninsula | 9.4 | 2,871 | 8.77 | no |
+
+**Surface** (`SurfaceKind::on_classified`). Snow and the alpine band still win first; tree cover (rim forest),
+cropland, water, wetland, mangroves, moss and built-up ground are unchanged.
+
+| Class in a dry climate | Steep (`STEEP_GRADIENT`) | Gentle |
+|---|---|---|
+| bare | `Banded`: terracotta bands | `T` of 18 °C or more: sand (dunes); else `Barren`: red sand 55 %, coarse dirt 45 % |
+| shrubland, grassland | `Banded` | `Scrub`: a mix by a fixed hash of the block column: desert (`r` < 0.5) 15 % grass block, 45 % coarse dirt, 40 % red sand; dry scrub (0.5 to 1.3) 40 %, 40 %, 20 % |
+
+Bare ground from 50° latitude stays gravel. The mix is carried in the kind (`Scrub(DryTop)`), so the far view, which
+calls `block_for` with the kind alone, shows the same tops as the near terrain; far trees may stand on `Scrub`.
+
+**Bands.** Under the top of a `Banded`, `Scrub` or `Barren` column the blocks are terracotta down to 32 blocks under
+the surface, stone below (the section fill shortcut uses the same depth while climate is on, and today's depth
+with it off). The band at height `y` is entry `(y div 4) mod 192` of Horizon's port of vanilla's clay bands
+(`worldgen/material_surface.rs`, `ClayBands::generate`: terracotta, orange, yellow, brown, red, white and light gray)
+made once from a fixed seed (not the world's, so every world and every far cache agree) and indexed by **absolute**
+height with no noise offset, so the strata run level across canyon walls whatever the surface. One band spans 4
+blocks, not vanilla's 1: real strata are tens of metres thick, and a 1,000 m wall of 1-block bands would be
+pin-stripes. The pattern repeats every 768 blocks.
+
+**Biomes** (`Biome::with_relief`; `with_climate` is the same without relief). Open ground in a dry climate:
+
+| Ground | Biome |
+|---|---|
+| relief 150 m or more | `badlands`; from 400 m `eroded_badlands` (a new biome, last in the list, ids of the others stay) |
+| bare, flat | `desert`; `badlands` from 1,000 m when temperate or warmer (as before) |
+| shrub or grass, flat, 8 °C or more | `desert` when `r` < 0.5; else `savanna` (`savanna_plateau` from 1,500 m) |
+| shrub or grass, flat, under 8 °C | as without the dry rule |
+
+Relief is the elevation range of the 500 m cell's middle and its four neighbours 250 m away, read at the biome's
+own zoom (so the far view's `biomes_ready` and the blocking read ask for the tiles around the cell too; it is read
+only for dry open ground). Wet places do not change.
+
+**Plants.** Grassland also allows dry plants (dead bush, cactus, dry grass), which only dry biomes have. In desert,
+badlands, eroded badlands, savanna and savanna plateau, shrub and grass columns keep plant features (grass, ferns,
+flowers, bushes) on only 30 % of the columns, by a fixed column hash, via the biome the mask asks the generator for
+(`biome_at_quart_blocking`, remembered per 4 by 4 column). It needs a climate source: without one the biomes do not
+say which places are dry.
+
+- **The cache key.** `surface::LAND_RULES`, `biome::CLIMATE_BIOME_RULES` and `vegetation::VEGETATION_RULES` are 2
+  (the key ends `#landcover<data>.2 ... #vegetation2 ... #climate<data>.2`), so caches made before the dry rules are
+  rebuilt.
 
 ### Snow
 

@@ -25,8 +25,9 @@ fn real_places_get_the_biomes_they_look_like() {
     // Sahara: hot, bone-dry bare ground is desert, a high bare plateau badlands.
     assert_eq!(of(LandClass::Bare, 400.0, 23.0, c(24.0, 6.5)), Desert);
     assert_eq!(of(LandClass::Bare, 1200.0, 23.0, c(22.0, 30.0)), Badlands);
-    // Sahel: hot and dry grass is savanna.
-    assert_eq!(of(LandClass::Grass, 450.0, 17.0, c(28.0, 160.0)), Savanna);
+    // Hot and dry grass is desert (dry places); wetter than that (r of 1 or more) it is savanna.
+    assert_eq!(of(LandClass::Grass, 450.0, 17.0, c(28.0, 160.0)), Desert);
+    assert_eq!(of(LandClass::Grass, 450.0, 12.0, c(26.0, 800.0)), Savanna);
     // Canadian boreal forest: below 0 C, taiga with snow.
     assert_eq!(of(LandClass::Tree, 400.0, 55.0, c(-0.9, 505.0)), SnowyTaiga);
     assert_eq!(of(LandClass::Tree, 300.0, 50.0, c(2.0, 600.0)), Taiga);

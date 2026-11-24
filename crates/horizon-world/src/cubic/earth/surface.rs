@@ -13,11 +13,25 @@
 //! With land cover (see [`SurfaceKind::on_classified`]) a column whose class is known takes its top from the
 //! class instead, and a column without data keeps the rule above. `docs/earth.md` has the table.
 //!
+//! With the real climate on as well, open ground (bare, shrub, grass) in a dry climate
+//! ([`DRY_ARIDITY`](super::dry::DRY_ARIDITY)) takes the dry places' tops ([`super::dry`]):
+//!
+//! | Class, in a dry climate | Steep | Gentle |
+//! |---|---|---|
+//! | bare | [`SurfaceKind::Banded`] (terracotta bands) | hot (from 18 C): sand dunes; else [`SurfaceKind::Barren`] (red sand, coarse dirt) |
+//! | shrub, grass | [`SurfaceKind::Banded`] | [`SurfaceKind::Scrub`] (grass block, coarse dirt, red sand mixed) |
+//!
+//! Snow and the alpine band still win first; tree cover, crops, water, wetland, moss and built-up ground are
+//! unchanged. Under the top of a dry kind the ground is terracotta bands by absolute height down to
+//! [`DRY_ROCK_DEPTH`](super::dry::DRY_ROCK_DEPTH) blocks, then stone.
+//!
 //! A column's elevation is read back from its surface block height `s` (`VerticalMap::elevation_for_y(s)`), so
 //! the material is a function of `s` and the latitude alone, and a block rectangle's materials follow from its
 //! range of surfaces.
 
 use horizon_earth::{LandClass, VerticalMap};
+
+use super::dry::{BARREN_MIX, DESERT_MIX, DryColumn, DryTop, SCRUB_MIX};
 
 /// The snow line up to [`SNOW_LINE_FLAT_TO_DEG`] of latitude, in metres.
 pub const SNOW_LINE_LOW_LATITUDE_M: f64 = 5500.0;
@@ -34,7 +48,7 @@ pub const SNOW_DEPTH: i64 = 2;
 pub const RULES: u32 = 2;
 /// The version of the land-cover surface rule and of the biome table ([`super::biome`]): it goes up when what a
 /// column with a known class is made of changes. It is in the terrain key only while land cover is on.
-pub const LAND_RULES: u32 = 1;
+pub const LAND_RULES: u32 = 2;
 /// With land cover, the lowest elevation (m) where the latitude snow line still turns a column that is not
 /// snow or ice on the map white. A map made from one summer's imagery misses seasonal snow on high peaks (Everest
 /// stays white), but the line falls to sea level at the poles, where lowland the map calls bare or moss is not
@@ -90,6 +104,14 @@ pub enum SurfaceKind {
     Lake,
     /// A marsh or mangrove: one block of water, at the surface block, over mud.
     Marsh,
+    /// Steep rock in a dry climate: terracotta bands by absolute height ([`super::dry`]), down to
+    /// [`DRY_ROCK_DEPTH`](super::dry::DRY_ROCK_DEPTH) blocks under the surface, stone below.
+    Banded,
+    /// Sparse ground of a dry climate under shrub and grass: the top is the given block (a fixed hash of the
+    /// column picks it), terracotta bands under it.
+    Scrub(DryTop),
+    /// Bare flat ground of a dry climate that is not hot: red sand or coarse dirt over terracotta bands.
+    Barren(DryTop),
 }
 
 impl SurfaceKind {
@@ -112,12 +134,17 @@ impl SurfaceKind {
     ///
     /// * snow and ice: snow, and so is any column at or above the latitude snow line or
     ///   [`LAND_SNOW_FLOOR_M`], whichever is higher (a lake that high is frozen);
-    /// * tree, shrub, grass and crop: grass over dirt (no block fits crops better: farmland dries out without
-    ///   water);
-    /// * bare: stone within the alpine band under the snow line, else stone where steep, else sand, or gravel
-    ///   from [`GRAVEL_FROM_LATITUDE`];
+    /// * tree and crop: grass over dirt (no block fits crops better: farmland dries out without water);
+    /// * shrub and grass: grass over dirt, but in a dry climate ([`DryColumn::is_dry`]): steep ground is
+    ///   [`SurfaceKind::Banded`], gentle ground [`SurfaceKind::Scrub`];
+    /// * bare: stone within the alpine band under the snow line, else (steep) stone, or in a dry climate
+    ///   [`SurfaceKind::Banded`], else sand, or gravel from [`GRAVEL_FROM_LATITUDE`]; gentle dry bare ground
+    ///   is sand (dunes) when hot ([`HOT_C`](super::dry::HOT_C)), else [`SurfaceKind::Barren`];
     /// * water: a lake, or the seabed (flooded to the sea level) when the surface is under the sea;
     /// * wetland and mangrove: a marsh; moss and lichen: moss; built-up: gravel.
+    ///
+    /// `dry` is the climate at the column with its hash; without it (`None`: no climate, or no data there) the
+    /// rules are exactly those without the dry places.
     ///
     /// Only [`SurfaceKind::Sand`] is flooded: a known class that is not water stays dry under the sea level.
     pub fn on_classified<E>(
@@ -125,6 +152,7 @@ impl SurfaceKind {
         elevation_m: f64,
         latitude: f64,
         below_sea: bool,
+        dry: Option<DryColumn>,
         steep: impl FnOnce() -> Result<bool, E>,
     ) -> Result<Self, E> {
         let line = snow_line_m(latitude);
@@ -134,14 +162,35 @@ impl SurfaceKind {
         Ok(match class {
             LandClass::NoData if below_sea => Self::Sand,
             LandClass::NoData => Self::on_land(elevation_m, latitude),
-            LandClass::Tree | LandClass::Shrub | LandClass::Grass | LandClass::Crop => Self::Grass,
+            LandClass::Tree | LandClass::Crop => Self::Grass,
+            LandClass::Shrub | LandClass::Grass => match dry.filter(DryColumn::is_dry) {
+                None => Self::Grass,
+                Some(d) => {
+                    if steep()? {
+                        Self::Banded
+                    } else {
+                        let mix = if d.is_desert() { DESERT_MIX } else { SCRUB_MIX };
+                        Self::Scrub(mix.pick(d.bucket))
+                    }
+                }
+            },
             LandClass::Bare => {
-                if elevation_m >= line - ALPINE_BAND_M || steep()? {
+                let dry = dry.filter(DryColumn::is_dry);
+                if elevation_m >= line - ALPINE_BAND_M {
                     Self::Alpine
+                } else if steep()? {
+                    if dry.is_some() {
+                        Self::Banded
+                    } else {
+                        Self::Alpine
+                    }
                 } else if latitude.abs() >= GRAVEL_FROM_LATITUDE {
                     Self::Gravel
                 } else {
-                    Self::Dune
+                    match dry {
+                        Some(d) if !d.is_hot() => Self::Barren(BARREN_MIX.pick(d.bucket)),
+                        _ => Self::Dune,
+                    }
                 }
             }
             LandClass::SnowIce => Self::Snow,
@@ -161,6 +210,12 @@ impl SurfaceKind {
             Self::Marsh => MARSH_DEPTH,
             _ => 0,
         }
+    }
+
+    /// Whether the kind is one of the dry places' ([`SurfaceKind::Banded`], [`SurfaceKind::Scrub`],
+    /// [`SurfaceKind::Barren`]): terracotta bands under the top, down to [`super::dry::DRY_ROCK_DEPTH`].
+    pub fn is_dry(self) -> bool {
+        matches!(self, Self::Banded | Self::Scrub(_) | Self::Barren(_))
     }
 
     /// The kind of a column whose surface block is `s`, at `latitude` degrees.

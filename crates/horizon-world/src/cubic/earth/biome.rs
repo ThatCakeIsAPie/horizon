@@ -46,13 +46,29 @@
 //! |---|---|---|
 //! | tree | the forests, taigas and jungles, wooded badlands; savanna when warm or hot; always snowy taiga when frozen | frozen snowy taiga, cold taiga, temperate forest, warm jungle (humidity 3+) or savanna, hot savanna; temperate with `r` of 6 or more: old growth spruce taiga (temperate rainforest) |
 //! | grass, no data on land | plains, sunflower plains, snowy plains, savanna, savanna plateau, meadow | frozen snowy plains, cold and temperate plains (meadow from 1,500 m), warm and hot savanna |
-//! | shrub | as grass, and desert | as grass, but desert when humidity is 0 and the row is temperate or warmer |
+//! | shrub | as grass, and desert | as grass, but desert when humidity is 0 and the row is temperate or warmer (dry places: see below) |
 //! | crop | plains, sunflower plains | frozen snowy plains, warm and hot savanna, else plains |
-//! | bare | - | desert when humidity is 0 or 1 and the row is not frozen (badlands from 1,000 m when temperate or warmer); else stony peaks from 2,000 m, windswept gravelly hills |
+//! | bare | - | in a dry climate (see below) desert (badlands from 1,000 m when temperate or warmer); else stony peaks from 2,000 m, windswept gravelly hills |
 //! | water at or under sea level, no data under it | - | by temperature: warm ocean from 24 C, lukewarm, ocean, cold, frozen ocean (the deep kinds under 200 m) |
 //! | water above sea level | - | river, frozen river when frozen |
 //! | wetland | - | swamp; snowy plains when frozen |
 //! | mangrove, moss and lichen, snow and ice / snow line | - | as without climate |
+//!
+//! ## Dry places
+//!
+//! Bare, shrub and grass ground in a dry climate (aridity `r` under [`DRY_ARIDITY`](super::dry::DRY_ARIDITY),
+//! not frozen) ignores the humidity column above:
+//!
+//! | Ground | Biome |
+//! |---|---|
+//! | rugged (relief from [`RUGGED_M`](super::dry::RUGGED_M) = 150 m) | `badlands`; `eroded_badlands` from [`ERODED_M`](super::dry::ERODED_M) = 400 m |
+//! | bare, flat | `desert`; `badlands` from 1,000 m when temperate or warmer |
+//! | shrub, grass, flat, temperate or warmer (8 C and up) | `desert` when `r` is under [`DESERT_ARIDITY`](super::dry::DESERT_ARIDITY) (0.5), else `savanna` (`savanna_plateau` from 1,500 m) |
+//! | shrub, grass, flat, under 8 C | as the table above |
+//!
+//! Relief is the elevation range of the 500 m cell's middle and its four neighbours half a cell (250 m) away,
+//! read at the biome's own zoom. Tree cover keeps the table (wooded badlands on a hot plateau). Wet places are
+//! unchanged.
 //!
 //! Where the climate has no data (no file, a refused host, a "no data" pixel), land uses the table without
 //! climate above; seas and rivers take a temperature from latitude and height (`27 - 0.0074 lat^2` C, minus
@@ -64,6 +80,7 @@ use std::sync::Arc;
 
 use horizon_earth::{Climate, ClimateLookup, LandClass, LoadError, Lookup};
 
+use super::dry::{DESERT_ARIDITY, ERODED_M, RUGGED_M, SAVANNA_FROM_C, aridity, is_dry};
 use super::generator::{Access, EarthGenerator, Gap, NotReady, Rect};
 use super::surface::{LAND_SNOW_FLOOR_M, snow_line_m};
 use crate::cubic::custom::biomes::BiomeColumns;
@@ -73,7 +90,7 @@ use crate::worldgen::biome::BiomeId;
 pub const BIOME_SAMPLE_M: f64 = 500.0;
 
 /// The version of the climate biome rules above; in the terrain key while climate is on.
-pub const CLIMATE_BIOME_RULES: u32 = 1;
+pub const CLIMATE_BIOME_RULES: u32 = 2;
 
 /// The ground size, in metres, of the cells a vanilla variant biome is chosen in.
 const VARIANT_CELL_M: f64 = 2000.0;
@@ -123,11 +140,12 @@ pub enum Biome {
     FrozenOcean,
     DeepFrozenOcean,
     FrozenRiver,
+    ErodedBadlands,
 }
 
 impl Biome {
     /// Every biome, in id order.
-    pub const ALL: [Biome; 39] = [
+    pub const ALL: [Biome; 40] = [
         Self::Plains,
         Self::Ocean,
         Self::River,
@@ -167,6 +185,7 @@ impl Biome {
         Self::FrozenOcean,
         Self::DeepFrozenOcean,
         Self::FrozenRiver,
+        Self::ErodedBadlands,
     ];
 
     /// Whether the far view and the snow rules treat the biome as one that snows: vanilla's own temperature
@@ -182,6 +201,19 @@ impl Biome {
                 | Self::FrozenOcean
                 | Self::DeepFrozenOcean
                 | Self::FrozenRiver
+        )
+    }
+
+    /// Whether the biome is one of the dry places' where only a share of the columns carry plants
+    /// ([`PLANT_SHARE`](super::dry::PLANT_SHARE)): deserts, badlands and savannas.
+    pub fn few_plants(self) -> bool {
+        matches!(
+            self,
+            Self::Desert
+                | Self::Badlands
+                | Self::ErodedBadlands
+                | Self::Savanna
+                | Self::SavannaPlateau
         )
     }
 
@@ -226,6 +258,7 @@ impl Biome {
             Self::FrozenOcean => "minecraft:frozen_ocean",
             Self::DeepFrozenOcean => "minecraft:deep_frozen_ocean",
             Self::FrozenRiver => "minecraft:frozen_river",
+            Self::ErodedBadlands => "minecraft:eroded_badlands",
         }
     }
 
@@ -321,6 +354,20 @@ impl Biome {
         climate: Option<Climate>,
         variant: bool,
     ) -> Self {
+        Self::with_relief(class, elevation_m, latitude, climate, variant, 0.0)
+    }
+
+    /// [`Biome::with_climate`] with the `relief_m` of the ground around the column (the elevation range of its
+    /// cell's middle and four neighbours half a cell away): dry rugged ground is badlands
+    /// ([`RUGGED_M`], [`ERODED_M`]).
+    pub fn with_relief(
+        class: LandClass,
+        elevation_m: f64,
+        latitude: f64,
+        climate: Option<Climate>,
+        variant: bool,
+        relief_m: f64,
+    ) -> Self {
         let Some(climate) = climate else {
             let t = fallback_temperature_c(elevation_m, latitude);
             return match class {
@@ -337,12 +384,34 @@ impl Biome {
         }
         let t = f64::from(climate.temperature_c);
         let p = f64::from(climate.precipitation_mm).max(0.0);
-        let r = p / (20.0 * (t + 7.0).max(1.0));
+        let r = aridity(t, p);
         let hum = humidity_index(r);
         let row = temperature_row(t, hum);
         let plateau = elevation_m >= 1500.0;
         let pick = vanilla(row, hum, plateau, variant);
         use Biome::*;
+        // The dry places: open ground in a dry climate is badlands where rugged, desert or savanna where flat.
+        if is_dry(t, r) && matches!(class, LandClass::Bare | LandClass::Shrub | LandClass::Grass) {
+            if relief_m >= ERODED_M {
+                return ErodedBadlands;
+            } else if relief_m >= RUGGED_M {
+                return Badlands;
+            }
+            match class {
+                LandClass::Bare => {
+                    return if elevation_m >= 1000.0 && row >= Row::Temperate {
+                        Badlands
+                    } else {
+                        Desert
+                    };
+                }
+                // Cold dry open ground (under the temperate row) stays as the table gives it.
+                _ if t < SAVANNA_FROM_C => {}
+                _ if r < DESERT_ARIDITY => return Desert,
+                _ if plateau => return SavannaPlateau,
+                _ => return Savanna,
+            }
+        }
         match class {
             LandClass::Water if elevation_m <= 0.0 => ocean(t, elevation_m),
             LandClass::NoData if elevation_m < 0.0 => ocean(t, elevation_m),
@@ -419,13 +488,7 @@ impl Biome {
                 _ => Plains,
             },
             LandClass::Bare => {
-                if hum <= 1 && row != Row::Frozen {
-                    if elevation_m >= 1000.0 && row >= Row::Temperate {
-                        Badlands
-                    } else {
-                        Desert
-                    }
-                } else if elevation_m >= 2000.0 {
+                if elevation_m >= 2000.0 {
                     StonyPeaks
                 } else {
                     WindsweptGravellyHills
@@ -602,24 +665,72 @@ impl EarthGenerator {
         if !self.climate_wanted() {
             return Ok(Biome::of(class, elevation, at.lat));
         }
-        Ok(Biome::with_climate(
+        // Only dry open ground reads the neighbours' heights, for how rugged it is.
+        let dry = climate.is_some_and(|c| {
+            let t = f64::from(c.temperature_c);
+            is_dry(t, aridity(t, f64::from(c.precipitation_mm)))
+        });
+        let relief =
+            if dry && matches!(class, LandClass::Bare | LandClass::Shrub | LandClass::Grass) {
+                self.relief_m(a, x, z, zoom, elevation)?
+            } else {
+                0.0
+            };
+        Ok(Biome::with_relief(
             class,
             elevation,
             at.lat,
             climate,
             variant_cell(at.lat, at.lon),
+            relief,
         ))
+    }
+
+    /// The relief around the point `(x, z)` whose height at `zoom` is `middle` (m): the range of that height
+    /// and the heights half a [`BIOME_SAMPLE_M`] cell away to the north, south, east and west.
+    fn relief_m(&self, a: Access, x: f64, z: f64, zoom: u8, middle: f64) -> Result<f64, Gap> {
+        let half = self.biome_half_cell();
+        let (mut lo, mut hi) = (middle, middle);
+        for (dx, dz) in [(half, 0.0), (-half, 0.0), (0.0, half), (0.0, -half)] {
+            let h = match a {
+                Access::Local => self.field.height_m(x + dx, z + dz, zoom),
+                Access::Fetch => self
+                    .field
+                    .height_m_blocking(x + dx, z + dz, zoom)
+                    .map_err(Gap::Load)?,
+            };
+            let h = f64::from(h.ok_or(Gap::Missing)?);
+            lo = lo.min(h);
+            hi = hi.max(h);
+        }
+        Ok(hi - lo)
+    }
+
+    /// Half a [`BIOME_SAMPLE_M`] cell, in blocks.
+    fn biome_half_cell(&self) -> f64 {
+        BIOME_SAMPLE_M / 2.0 / self.field.projection().metres_per_block()
+    }
+
+    /// The block rectangle a biome read of the 4 by 4 column `(qx, qz)` covers: the column itself, grown by half
+    /// a cell where the biome reads its neighbours' heights (a world with climate).
+    fn biome_rect(&self, qx: i32, qz: i32) -> Rect {
+        let grow = if self.climate_wanted() && self.climate_source().is_some() {
+            self.biome_half_cell().ceil().min(f64::from(1_u32 << 24)) as i32 + 1
+        } else {
+            0
+        };
+        Rect {
+            x0: qx.saturating_mul(4).saturating_sub(grow),
+            z0: qz.saturating_mul(4).saturating_sub(grow),
+            x1: qx.saturating_mul(4).saturating_add(3).saturating_add(grow),
+            z1: qz.saturating_mul(4).saturating_add(3).saturating_add(grow),
+            zoom: self.field.zoom_for(BIOME_SAMPLE_M),
+        }
     }
 
     /// [`EarthGenerator::biome_core`], loading what it lacks. `plains` when cancelled.
     pub fn biome_at_quart_blocking(&self, qx: i32, qz: i32) -> Biome {
-        let r = Rect {
-            x0: qx.saturating_mul(4),
-            z0: qz.saturating_mul(4),
-            x1: qx.saturating_mul(4).saturating_add(3),
-            z1: qz.saturating_mul(4).saturating_add(3),
-            zoom: self.field.zoom_for(BIOME_SAMPLE_M),
-        };
+        let r = self.biome_rect(qx, qz);
         self.wait_for(r, || self.biome_core(Access::Fetch, qx, qz))
             .unwrap_or(Biome::Plains)
     }
@@ -642,15 +753,8 @@ impl EarthGenerator {
                 }
                 last = Some((qx, qz));
                 if self.biome_core(Access::Local, qx, qz).is_err() {
-                    let r = Rect {
-                        x0: qx.saturating_mul(4),
-                        z0: qz.saturating_mul(4),
-                        x1: qx.saturating_mul(4).saturating_add(3),
-                        z1: qz.saturating_mul(4).saturating_add(3),
-                        zoom: self.field.zoom_for(BIOME_SAMPLE_M),
-                    };
                     return Err(NotReady {
-                        tiles: self.missing_in(r),
+                        tiles: self.missing_in(self.biome_rect(qx, qz)),
                     });
                 }
             }

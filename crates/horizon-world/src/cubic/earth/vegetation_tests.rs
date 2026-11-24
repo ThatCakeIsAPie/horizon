@@ -111,7 +111,7 @@ fn each_class_allows_what_the_table_says() {
         assert!(allowed(LandClass::Shrub, Dry, x, z));
         assert!(!allowed(LandClass::Shrub, Water, x, z));
         assert!(allowed(LandClass::Grass, Plant, x, z));
-        assert!(!allowed(LandClass::Grass, Dry, x, z));
+        assert!(allowed(LandClass::Grass, Dry, x, z));
         assert!(!allowed(LandClass::Grass, Water, x, z));
     }
 }

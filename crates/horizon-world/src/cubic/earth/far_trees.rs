@@ -430,7 +430,10 @@ impl EarthGenerator {
                     };
                     if !matches!(
                         cols.kind(i),
-                        SurfaceKind::Grass | SurfaceKind::Moss | SurfaceKind::Marsh
+                        SurfaceKind::Grass
+                            | SurfaceKind::Scrub(_)
+                            | SurfaceKind::Moss
+                            | SurfaceKind::Marsh
                     ) || !allowed(classes[i], FeatureKind::Tree, x, z)
                     {
                         continue;
@@ -601,7 +604,10 @@ impl EarthGenerator {
                 decor.trees
                     && matches!(
                         kind,
-                        SurfaceKind::Grass | SurfaceKind::Moss | SurfaceKind::Marsh
+                        SurfaceKind::Grass
+                            | SurfaceKind::Scrub(_)
+                            | SurfaceKind::Moss
+                            | SurfaceKind::Marsh
                     )
             });
             if let Some(style) = styled {
