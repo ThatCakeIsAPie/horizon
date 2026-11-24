@@ -486,4 +486,27 @@ H.P., Kessler, M. (2017). Climatologies at high resolution for the earth's land 
 170122. <https://doi.org/10.1038/sdata.2017.122>. Data: Karger, D.N. et al. (2021) CHELSA V2.1, EnviDat,
 <https://doi.org/10.16904/envidat.228.v2.1>
 
+## Ore richness data for Earth worlds
+
+Earth worlds shape where ores are richer with a grid shipped inside the game
+(`crates/horizon-earth/data/ore_richness.bin`, built by `tools/earth_ore_richness.py`; see
+[docs/earth.md](docs/earth.md)). It is derived from:
+
+* U.S. Geological Survey data, public domain (works of the United States Government): the Mineral Resources Data
+  System (<https://mrdata.usgs.gov/mrds/>), Major mineral deposits of the world (Open-File Report 2005-1294,
+  <https://mrdata.usgs.gov/major-deposits/>), Mineral operations outside the United States
+  (<https://mrdata.usgs.gov/mineral-operations/>), the World Coal Quality Inventory (Open-File Report 2010-1196,
+  <https://doi.org/10.3133/ofr20101196>) and Coal fields of the conterminous United States (Open-File Report
+  2012-1205, <https://pubs.usgs.gov/of/2012/1205/>).
+* Natural Earth 1:50m land polygons, public domain (<https://www.naturalearthdata.com/>).
+* **GLiM**, the Global Lithological Map Database v1.0 gridded to 0.5°, released under CC BY 3.0
+  (<https://creativecommons.org/licenses/by/3.0/>). Modified: its rock classes are only used, resampled and smoothed,
+  as a statistical prior blended into the richness grid; no GLiM values are shipped as they are. The game shows this
+  credit in Earth's settings ("Data credits..."):
+
+Citation: Hartmann, J. and Moosdorf, N. (2012). Global Lithological Map Database v1.0 (gridded to 0.5° spatial
+resolution). PANGAEA, <https://doi.org/10.1594/PANGAEA.788537>. Supplement to: Hartmann, J. and Moosdorf, N. (2012).
+The new global lithological map database GLiM: A representation of rock properties at the Earth surface. Geochemistry,
+Geophysics, Geosystems 13, Q12004, <https://doi.org/10.1029/2012GC004370>.
+
 Earth is inspired by the Terrarium mod by gegy; it shares no code with it.
