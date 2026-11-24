@@ -15,4 +15,6 @@ pub use settings::{
 };
 
 #[cfg(test)]
+mod defaults_tests;
+#[cfg(test)]
 mod engine_tests;

@@ -139,6 +139,9 @@ impl EarthSettings {
                 self.max_zoom
             ));
         }
+        if let Some(o) = &self.ore_gen {
+            o.validate()?;
+        }
         Ok(())
     }
 

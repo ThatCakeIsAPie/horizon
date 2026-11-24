@@ -122,7 +122,7 @@ fn population_places_a_plausible_number_of_ores() {
 fn json_settings_build_a_generator_and_unknown_blocks_are_named() {
     let reg = default_registry();
     let mut s = CustomGeneratorSettings::defaults();
-    s.standard_ores[0].blockstate = BlockStateDesc::new("mod:mystery_ore");
+    s.ore_gen.as_mut().unwrap().ores[0].blockstate = BlockStateDesc::new("mod:mystery_ore");
     let e = CustomGeneratorSettings::from_json(&s.to_json_compact()).unwrap();
     let err = CustomCubicGenerator::new(1, &e, reg, Arc::new(FixedBiome::new("plains")))
         .err()

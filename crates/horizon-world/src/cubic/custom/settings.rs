@@ -1488,8 +1488,20 @@ pub const OVERWORLD_STRUCTURE_SETS: &[VanillaStructureSet] = &[
         20,
         1.0,
     ),
-    spread("minecraft:desert_pyramids", Some(CwgToggle::Temples), 32, 8, 1.0),
-    spread("minecraft:jungle_temples", Some(CwgToggle::Temples), 32, 8, 1.0),
+    spread(
+        "minecraft:desert_pyramids",
+        Some(CwgToggle::Temples),
+        32,
+        8,
+        1.0,
+    ),
+    spread(
+        "minecraft:jungle_temples",
+        Some(CwgToggle::Temples),
+        32,
+        8,
+        1.0,
+    ),
     spread("minecraft:swamp_huts", Some(CwgToggle::Temples), 32, 8, 1.0),
     spread("minecraft:igloos", Some(CwgToggle::Temples), 32, 8, 1.0),
     spread("minecraft:abandoned_camp", None, 37, 8, 1.0),
@@ -1505,7 +1517,13 @@ pub const OVERWORLD_STRUCTURE_SETS: &[VanillaStructureSet] = &[
     spread("minecraft:ocean_ruins", None, 20, 8, 1.0),
     spread("minecraft:shipwrecks", None, 24, 4, 1.0),
     spread("minecraft:buried_treasures", None, 1, 0, 0.01),
-    spread("minecraft:mineshafts", Some(CwgToggle::Mineshafts), 1, 0, 0.004),
+    spread(
+        "minecraft:mineshafts",
+        Some(CwgToggle::Mineshafts),
+        1,
+        0,
+        0.004,
+    ),
     spread("minecraft:trial_chambers", None, 34, 12, 1.0),
     spread("minecraft:ancient_cities", None, 24, 8, 1.0),
     VanillaStructureSet {
@@ -1780,7 +1798,7 @@ fn triangle_ore(
     }
 }
 
-const MOUNTAIN_BIOMES: &[&str] = &[
+pub(crate) const MOUNTAIN_BIOMES: &[&str] = &[
     "windswept_hills",
     "windswept_forest",
     "windswept_gravelly_hills",
@@ -1790,7 +1808,49 @@ const MOUNTAIN_BIOMES: &[&str] = &[
     "snowy_slopes",
     "grove",
 ];
-const BADLANDS_BIOMES: &[&str] = &["badlands", "eroded_badlands", "wooded_badlands"];
+pub(crate) const BADLANDS_BIOMES: &[&str] = &["badlands", "eroded_badlands", "wooded_badlands"];
+
+/// 26.3's vanilla ores as CWG's two legacy lists (heights normalised around
+/// base 64 / variation 64). The new-world defaults carry them as `oreGen`
+/// entries instead (`OreGenSettings::custom_defaults`), built from these.
+pub(crate) fn legacy_vanilla_ores() -> (Vec<StandardOreConfig>, Vec<PeriodicGaussianOreConfig>) {
+    // Blobs. Granite, diorite and andesite use size 33 (vanilla 64) so a
+    // vein stays inside the 2 x 2 x 2 cubes a populate writes; tuff gets
+    // twice vanilla's count for the same reason.
+    let standard = vec![
+        uniform_ore("dirt", 33, 7.0, 0.0, 160.0, None),
+        uniform_ore("gravel", 33, 14.0, -64.0, 320.0, None),
+        uniform_ore("granite", 33, 1.0 / 6.0, 64.0, 128.0, None),
+        uniform_ore("granite", 33, 2.0, 0.0, 60.0, None),
+        uniform_ore("diorite", 33, 1.0 / 6.0, 64.0, 128.0, None),
+        uniform_ore("diorite", 33, 2.0, 0.0, 60.0, None),
+        uniform_ore("andesite", 33, 1.0 / 6.0, 64.0, 128.0, None),
+        uniform_ore("andesite", 33, 2.0, 0.0, 60.0, None),
+        uniform_ore("tuff", 33, 4.0, -64.0, 0.0, None),
+        uniform_ore("coal_ore", 17, 30.0, 136.0, 320.0, None),
+        uniform_ore("iron_ore", 4, 10.0, -64.0, 72.0, None),
+        uniform_ore("gold_ore", 9, 0.5, -64.0, -48.0, None),
+        uniform_ore("redstone_ore", 8, 4.0, -64.0, 15.0, None),
+        uniform_ore("diamond_ore", 12, 1.0 / 9.0, -144.0, 16.0, None),
+        uniform_ore("lapis_ore", 7, 4.0, -64.0, 64.0, None),
+        uniform_ore("gold_ore", 9, 50.0, 32.0, 256.0, Some(BADLANDS_BIOMES)),
+    ];
+    // Diamond (small and buried) are triangles; the large one above is
+    // uniform because its rarity makes the shape irrelevant.
+    let periodic = vec![
+        triangle_ore("coal_ore", 17, 20.0, 0.0, 192.0, None),
+        triangle_ore("iron_ore", 9, 90.0, 80.0, 384.0, None),
+        triangle_ore("iron_ore", 9, 10.0, -24.0, 56.0, None),
+        triangle_ore("copper_ore", 10, 16.0, -16.0, 112.0, None),
+        triangle_ore("gold_ore", 9, 4.0, -96.0, -32.0, None),
+        triangle_ore("redstone_ore", 8, 8.0, -96.0, -32.0, None),
+        triangle_ore("diamond_ore", 4, 7.0, -144.0, 16.0, None),
+        triangle_ore("diamond_ore", 8, 4.0, -144.0, 16.0, None),
+        triangle_ore("lapis_ore", 7, 2.0, -96.0, -32.0, None),
+        triangle_ore("emerald_ore", 3, 100.0, -16.0, 480.0, Some(MOUNTAIN_BIOMES)),
+    ];
+    (standard, periodic)
+}
 
 impl CustomGeneratorSettings {
     /// The preset (CWG's `defaults()` with 26.3's ores, deepslate and biome
@@ -1838,41 +1898,8 @@ impl CustomGeneratorSettings {
             },
         ];
 
-        // Blobs. Granite, diorite and andesite use size 33 (vanilla 64) so a
-        // vein stays inside the 2 x 2 x 2 cubes a populate writes; tuff gets
-        // twice vanilla's count for the same reason.
-        s.standard_ores = vec![
-            uniform_ore("dirt", 33, 7.0, 0.0, 160.0, None),
-            uniform_ore("gravel", 33, 14.0, -64.0, 320.0, None),
-            uniform_ore("granite", 33, 1.0 / 6.0, 64.0, 128.0, None),
-            uniform_ore("granite", 33, 2.0, 0.0, 60.0, None),
-            uniform_ore("diorite", 33, 1.0 / 6.0, 64.0, 128.0, None),
-            uniform_ore("diorite", 33, 2.0, 0.0, 60.0, None),
-            uniform_ore("andesite", 33, 1.0 / 6.0, 64.0, 128.0, None),
-            uniform_ore("andesite", 33, 2.0, 0.0, 60.0, None),
-            uniform_ore("tuff", 33, 4.0, -64.0, 0.0, None),
-            uniform_ore("coal_ore", 17, 30.0, 136.0, 320.0, None),
-            uniform_ore("iron_ore", 4, 10.0, -64.0, 72.0, None),
-            uniform_ore("gold_ore", 9, 0.5, -64.0, -48.0, None),
-            uniform_ore("redstone_ore", 8, 4.0, -64.0, 15.0, None),
-            uniform_ore("diamond_ore", 12, 1.0 / 9.0, -144.0, 16.0, None),
-            uniform_ore("lapis_ore", 7, 4.0, -64.0, 64.0, None),
-            uniform_ore("gold_ore", 9, 50.0, 32.0, 256.0, Some(BADLANDS_BIOMES)),
-        ];
-        // Diamond (small and buried) are triangles; the large one above is
-        // uniform because its rarity makes the shape irrelevant.
-        s.periodic_gaussian_ores = vec![
-            triangle_ore("coal_ore", 17, 20.0, 0.0, 192.0, None),
-            triangle_ore("iron_ore", 9, 90.0, 80.0, 384.0, None),
-            triangle_ore("iron_ore", 9, 10.0, -24.0, 56.0, None),
-            triangle_ore("copper_ore", 10, 16.0, -16.0, 112.0, None),
-            triangle_ore("gold_ore", 9, 4.0, -96.0, -32.0, None),
-            triangle_ore("redstone_ore", 8, 8.0, -96.0, -32.0, None),
-            triangle_ore("diamond_ore", 4, 7.0, -144.0, 16.0, None),
-            triangle_ore("diamond_ore", 8, 4.0, -144.0, 16.0, None),
-            triangle_ore("lapis_ore", 7, 2.0, -96.0, -32.0, None),
-            triangle_ore("emerald_ore", 3, 100.0, -16.0, 480.0, Some(MOUNTAIN_BIOMES)),
-        ];
+        // Ores: `oreGen` (the legacy lists stay empty).
+        s.ore_gen = Some(crate::cubic::ores::OreGenSettings::custom_defaults());
 
         let depth = |filter: Option<BiomeFilter>| MainSurfaceReplacerConfig {
             biome_filter: filter,
@@ -2179,15 +2206,14 @@ impl CustomGeneratorSettings {
     /// Checks the numbers a generator cannot work with.
     pub fn validate(&self) -> Result<(), String> {
         for (name, t) in &self.structure_sets {
-            let check = |field: &str, v: Option<i32>, range: std::ops::RangeInclusive<i32>| {
-                match v {
-                    Some(n) if !range.contains(&n) => Err(format!(
-                        "structureSets.{name}.{field} must be {} to {}",
-                        range.start(),
-                        range.end()
-                    )),
-                    _ => Ok(()),
-                }
+            let check = |field: &str, v: Option<i32>, range: std::ops::RangeInclusive<i32>| match v
+            {
+                Some(n) if !range.contains(&n) => Err(format!(
+                    "structureSets.{name}.{field} must be {} to {}",
+                    range.start(),
+                    range.end()
+                )),
+                _ => Ok(()),
             };
             check("spacing", t.spacing, 1..=4096)?;
             check("separation", t.separation, 0..=4095)?;
@@ -2334,6 +2360,9 @@ impl CustomGeneratorSettings {
             a.settings
                 .validate()
                 .map_err(|e| format!("cubeAreas[{i}]: {e}"))?;
+        }
+        if let Some(o) = &self.ore_gen {
+            o.validate()?;
         }
         Ok(())
     }
@@ -2598,7 +2627,10 @@ mod tests {
         assert!(!s.structure_enabled("minecraft:igloos"));
         assert!(s.structure_enabled("minecraft:desert_pyramids"));
         let v = &s.structure_sets["minecraft:villages"];
-        assert_eq!((v.spacing, v.separation, v.frequency), (Some(20), None, None));
+        assert_eq!(
+            (v.spacing, v.separation, v.frequency),
+            (Some(20), None, None)
+        );
         let text = s.to_json_compact();
         assert!(text.contains("structureSets"), "{text}");
         // (The whole preset does not round-trip exactly: serde_json reads
@@ -2625,7 +2657,12 @@ mod tests {
     fn cwg_toggles_switch_their_groups() {
         let mut s = CustomGeneratorSettings::defaults_without_structures();
         for v in OVERWORLD_STRUCTURE_SETS {
-            assert_eq!(s.structure_enabled(v.name), v.toggle.is_none(), "{}", v.name);
+            assert_eq!(
+                s.structure_enabled(v.name),
+                v.toggle.is_none(),
+                "{}",
+                v.name
+            );
         }
         // One temple back: the toggle comes on, its other sets stay off.
         s.set_structure_enabled("minecraft:jungle_temples", true);

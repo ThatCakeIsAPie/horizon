@@ -367,3 +367,96 @@ impl OreGenSettings {
         }
     }
 }
+
+impl OreGenSettings {
+    /// Checks the numbers the engine cannot work with, naming the setting
+    /// that is wrong (`oreGen.ores[3].rich.intensity: must be 0 to 4096`).
+    pub fn validate(&self) -> Result<(), String> {
+        const MAX_COUNT: f64 = 4096.0;
+        fn count(path: &str, v: f64) -> Result<(), String> {
+            if v.is_finite() && (0.0..=MAX_COUNT).contains(&v) {
+                Ok(())
+            } else {
+                Err(format!("{path}: must be 0 to {MAX_COUNT}, not {v}"))
+            }
+        }
+        fn band(path: &str, min: f64, max: f64) -> Result<(), String> {
+            if min.is_nan() || max.is_nan() || min > max {
+                Err(format!(
+                    "{path}.min: must not be above {path}.max (min {min}, max {max})"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn positive(path: &str, v: f64) -> Result<(), String> {
+            if v.is_finite() && v > 0.0 {
+                Ok(())
+            } else {
+                Err(format!("{path}: must be a number above 0, not {v}"))
+            }
+        }
+
+        if !(0..=ORE_GEN_VERSION).contains(&self.version) {
+            return Err(format!(
+                "oreGen.version: must be 0 to {ORE_GEN_VERSION}, not {}",
+                self.version
+            ));
+        }
+        let s = self.richness_strength;
+        if !(s.is_finite() && (0.0..=2.0).contains(&s)) {
+            return Err(format!("oreGen.richnessStrength: must be 0 to 2, not {s}"));
+        }
+        for (i, o) in self.ores.iter().enumerate() {
+            let at = format!("oreGen.ores[{i}]");
+            if !(1..=64).contains(&o.spawn_size) {
+                return Err(format!(
+                    "{at}.spawnSize: must be 1 to 64, not {}",
+                    o.spawn_size
+                ));
+            }
+            for (biome, m) in &o.biome_multipliers {
+                if !(m.is_finite() && *m >= 0.0) {
+                    return Err(format!(
+                        "{at}.biomeMultipliers[{biome}]: must be 0 or more, not {m}"
+                    ));
+                }
+            }
+            let r = &o.rich;
+            let rp = format!("{at}.rich");
+            count(&format!("{rp}.intensity"), r.intensity)?;
+            if !(r.probability.is_finite() && (0.0..=1.0).contains(&r.probability)) {
+                return Err(format!(
+                    "{rp}.probability: must be 0 to 1, not {}",
+                    r.probability
+                ));
+            }
+            band(&rp, r.min, r.max)?;
+            if let Some(sp) = r.spread
+                && !(sp.is_finite() && sp > 0.0)
+            {
+                return Err(format!("{rp}.spread: must be a number above 0, not {sp}"));
+            }
+            if let Some(p) = r.peak
+                && p.is_nan()
+            {
+                return Err(format!("{rp}.peak: must be a number"));
+            }
+            if !(r.repeat.is_finite() && r.repeat >= 0.0) {
+                return Err(format!("{rp}.repeat: must be 0 or more, not {}", r.repeat));
+            }
+            positive(&format!("{rp}.noiseScale"), r.noise_scale)?;
+            if !r.noise_threshold.is_finite() {
+                return Err(format!(
+                    "{rp}.noiseThreshold: must be a number, not {}",
+                    r.noise_threshold
+                ));
+            }
+            let b = &o.background;
+            let bp = format!("{at}.background");
+            count(&format!("{bp}.rate"), b.rate)?;
+            band(&bp, b.min, b.max)?;
+        }
+        self.meteors.validate().map_err(|e| format!("oreGen.{e}"))
+    }
+}

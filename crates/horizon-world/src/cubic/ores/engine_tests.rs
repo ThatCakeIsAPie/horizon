@@ -690,11 +690,10 @@ fn richness_scales_the_veins_of_the_eight_ores() {
 
 // --- legacy exactness -----------------------------------------------------------------
 
-/// The legacy ore lists a preset has. The defaults worker moves them to
-/// `custom::settings::legacy_vanilla_ores()`; switch this to that function then.
+/// The legacy ore lists of 26.3's vanilla ores (`defaults()` itself carries
+/// them as `oreGen` entries now).
 fn legacy_lists() -> (Vec<StandardOreConfig>, Vec<PeriodicGaussianOreConfig>) {
-    let d = CustomGeneratorSettings::defaults();
-    (d.standard_ores.clone(), d.periodic_gaussian_ores.clone())
+    crate::cubic::custom::settings::legacy_vanilla_ores()
 }
 
 /// `legacy` has the lists and no `oreGen`; `ported` the same lists as `oreGen`
