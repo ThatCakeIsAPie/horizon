@@ -549,6 +549,15 @@ fn credits_page(b: &mut Builder) {
             b.note(line);
         }
     }
+    b.heading(tr("horizon.cubic.earth.credits.ore_source"));
+    for key in [
+        "horizon.cubic.earth.credits.ore_about",
+        "horizon.cubic.earth.credits.ore_cite",
+    ] {
+        for line in wrap(&tr(key), LINE) {
+            b.note(line);
+        }
+    }
     b.space(4.0);
     for line in wrap(&tr("horizon.cubic.earth.credits.idea"), LINE) {
         b.note(line);
