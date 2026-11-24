@@ -198,7 +198,9 @@ impl TileStore {
         match self.load(id) {
             Err(LoadError::Fetch(why @ (FetchError::Refused(_) | FetchError::NotFound))) => {
                 if lock(&self.unavailable).insert(id) {
-                    log::warn!("Earth tile {id:?} cannot be had ({why}): it reads as flat sea floor");
+                    log::warn!(
+                        "Earth tile {id:?} cannot be had ({why}): it reads as flat sea floor"
+                    );
                 }
                 Ok(sea())
             }
