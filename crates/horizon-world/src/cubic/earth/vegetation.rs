@@ -55,6 +55,12 @@ use crate::cubic::custom::vegetation::VegetationMask;
 /// The version of the vegetation rules above. It goes up when what grows where changes, and is in the terrain
 /// key while land cover and vegetation are on.
 pub const VEGETATION_RULES: u32 = 1;
+/// The version of the far view's trees (`far_trees`). It is in the terrain key while vegetation is on, so far
+/// caches made before trees were drawn far away are rebuilt.
+pub const FAR_TREE_RULES: u32 = 1;
+/// The version of the snow rules (snow on cold ground and trees, ice on cold still water), near and far. It is
+/// in the terrain key while vegetation and `snow` are on.
+pub const SNOW_RULES: u32 = 1;
 
 /// Columns out of 1,000 that allow a tree on shrub.
 const SHRUB_TREES: u64 = 200;
@@ -109,6 +115,16 @@ fn column_bucket(x: i32, z: i32) -> u64 {
     h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     (h ^ (h >> 31)) % 1000
+}
+
+/// The share (0 to 1) of columns [`allowed`] lets a tree grow on in a land class: the table above.
+pub fn tree_share(class: LandClass) -> f64 {
+    match class {
+        LandClass::Tree | LandClass::Wetland | LandClass::Mangrove | LandClass::NoData => 1.0,
+        LandClass::Shrub => SHRUB_TREES as f64 / 1000.0,
+        LandClass::Grass => GRASS_TREES as f64 / 1000.0,
+        _ => 0.0,
+    }
 }
 
 /// Whether a feature of `kind` may grow at the column `(x, z)` whose land class is `class`; the table above.

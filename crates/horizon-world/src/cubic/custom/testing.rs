@@ -52,6 +52,20 @@ pub fn default_block_names() -> Vec<String> {
         names.push(format!("minecraft:{o}_ore"));
         names.push(format!("minecraft:deepslate_{o}_ore"));
     }
+    // The logs, leaves, snow and ice of the far view of Earth.
+    for tree in [
+        "oak", "birch", "spruce", "dark_oak", "jungle", "acacia", "mangrove",
+    ] {
+        for part in ["log", "leaves"] {
+            names.push(format!("minecraft:{tree}_{part}"));
+        }
+    }
+    for n in ["snow", "ice"] {
+        let name = format!("minecraft:{n}");
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
     names
 }
 

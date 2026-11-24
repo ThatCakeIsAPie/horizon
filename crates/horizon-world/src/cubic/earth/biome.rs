@@ -169,6 +169,22 @@ impl Biome {
         Self::FrozenRiver,
     ];
 
+    /// Whether the far view and the snow rules treat the biome as one that snows: vanilla's own temperature
+    /// is under 0.15 and it has precipitation (the frozen biomes and the snowy ones).
+    pub fn snows(self) -> bool {
+        matches!(
+            self,
+            Self::SnowyTaiga
+                | Self::SnowyPlains
+                | Self::SnowySlopes
+                | Self::FrozenPeaks
+                | Self::IceSpikes
+                | Self::FrozenOcean
+                | Self::DeepFrozenOcean
+                | Self::FrozenRiver
+        )
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Plains => "minecraft:plains",
@@ -536,7 +552,7 @@ pub fn variant_cell(lat: f64, lon: f64) -> bool {
 impl EarthGenerator {
     /// The biome of the 4 by 4 column `(qx, qz)` (block `x >> 2`), read at its middle: the class and the height
     /// at [`BIOME_SAMPLE_M`] of ground. Without land cover, `plains`.
-    fn biome_core(&self, a: Access, qx: i32, qz: i32) -> Result<Biome, Gap> {
+    pub(super) fn biome_core(&self, a: Access, qx: i32, qz: i32) -> Result<Biome, Gap> {
         let Some(land) = self.land_source() else {
             return Ok(Biome::Plains);
         };

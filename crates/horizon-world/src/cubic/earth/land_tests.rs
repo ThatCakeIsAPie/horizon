@@ -131,7 +131,7 @@ impl LandRig {
     }
 
     /// Loads every elevation tile and land-cover piece a local read of `read` lacks, until it answers.
-    fn loaded<T>(&self, read: impl Fn(&EarthGenerator) -> Result<T, NotReady>) -> T {
+    pub(super) fn loaded<T>(&self, read: impl Fn(&EarthGenerator) -> Result<T, NotReady>) -> T {
         for _ in 0..200 {
             match read(&self.generator) {
                 Ok(value) => return value,

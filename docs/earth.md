@@ -280,9 +280,8 @@ The share of columns that may hold a tree is a fixed hash of the column, so the 
 a tree stands and the share thins its density. Lily pads count as plants, so they float on swamps but not on lakes.
 
 - **The cache key.** `terrain_key()` also ends with `#vegetation<rules>` while land cover and vegetation are on, so
-  old far-view caches are rebuilt. The far view does not draw Earth's trees yet: Custom Cubic's far trees
-  (`cubic_far_structures.rs`) hang off its structures, which Earth has none of, and would read Earth's tiles with
-  blocking calls on the far view's idle thread, which would hang while a tile cannot be had.
+  old far-view caches are rebuilt. The far view draws its own simple trees
+  (see Far view: trees and snow); the key also ends with `#fartrees1` then.
 
 ### Climate
 
@@ -322,9 +321,60 @@ land cover table above still decides the ground; the climate only picks the biom
 - **The cache key.** `terrain_key()` also ends with `#climate<data rules>.<biome rules>` while land cover and climate
   are on.
 
+### Snow
+
+With `"snow": true` (new worlds get it with land cover; an old world's file leaves it out and keeps its look) the
+vegetation's population ends with vanilla's top layer step: each biome's own `freeze_top_layer` feature
+(`custom/vegetation.rs`, `Vegetation::with_snow`, run after the vegetal features). It puts a snow layer (`layers=1`)
+on the top block of every column whose biome is cold enough, on tree leaves too, turns the grass under it snowy,
+and freezes still water to ice. It needs `vegetation` (it runs in the same population) and is left out of the
+settings in force when there is none. Land cover has no say on it: the biome alone decides.
+
+- **No height drop.** Vanilla lowers a biome's temperature above sea level + 17. Earth's biomes already come from
+  the real temperature at the real ground height (or the snow line), so the pass is shown a sea level far above any
+  block and the drop never applies. Snow falls where the biome itself is cold: snowy taiga, snowy plains, snowy
+  slopes, frozen peaks, ice spikes, frozen river and frozen ocean (vanilla's own patchy rule); nothing falls in a
+  warm biome, however high.
+- **The order.** The pass takes each column's top from the whole 32-block region of the population, so a canopy
+  is snowed by the population whose region holds its top. A tree that a population grows after that pass (the cube
+  above populated first, or a neighbour's tree reaching over) keeps bare leaves.
+- **The far view** draws the same rule (see Far view: trees and snow).
+- **The cache key.** `terrain_key()` also ends with `#snow<rules>` while land cover, vegetation and `snow` are on.
+
+### Far view: trees and snow
+
+With land cover and vegetation on, the far view draws trees from data it already holds, without running vanilla's
+features (Custom Cubic's far trees, `cubic_far_structures.rs`, run those and read blocks with blocking calls, which
+would hang the far view while a tile cannot be had). Each far node also needs the land class and the Earth biome of
+its columns; when one is missing the node is *not ready* and the request is recorded, like a missing tile. Nothing
+waits. Style, shapes and sizes are in the table of `earth/far_trees.rs`.
+
+- **Which tree.** Each Earth biome has one style (oak, birch, spruce, dark oak, jungle, acacia, mangrove; round,
+  cone or flat; height, canopy radius, spacing) or none: deserts, badlands, peaks, slopes, oceans, rivers and ice
+  spikes have no trees. Trees stand on grass, moss and marsh tops only, and the land class thins them as near does
+  (tree cover, wetland, mangrove and no data all, shrub a fifth, grass a fiftieth, the rest none).
+- **Level 0 and 1.** Level 0 nodes are exact cubes: trees of a jittered grid (one candidate per cell of the
+  style's spacing at a fixed hash of the cell, no world seed) are drawn as real logs and leaves, only into air, and
+  a tree in a neighbouring cube still draws its canopy here (the columns are read 3 blocks beyond the cube). Level 1
+  is made of level 0 and gets the trees with it.
+- **Level 2 and up.** One canopy per column, no per-tree loop: a column has leaves when a fixed hash of it is under
+  the style's cover (class share times the share of ground the trees' canopies cover). From 16 blocks a step a cover
+  of 0.4 or more fills the column, so a forest reads as solid green. Voxels whose middle the canopy covers are
+  leaves; when none does (the canopy is thinner than a voxel) the ground's top voxel is leaves. No logs.
+- **Air above trees.** A node is called sky only from 32 blocks over the ground when trees are on, so canopies over a
+  node boundary are not cut. Sky cover (light) stays terrain only.
+- **Snow.** With snow on, a column is cold when its biome snows (snowy taiga, snowy plains, snowy slopes, frozen
+  peaks, ice spikes, frozen river and frozen ocean; the same rule as near, no height drop). Level 0 puts a snow
+  layer on top of the ground or a tree, makes the grass under it snowy and freezes the top water block. Level 2 and
+  up make the top voxel a snow block, the top water voxel ice, and the top of a canopy a snow block on about half the
+  columns (speckled like snowy spruce).
+- **Off.** With trees and snow off (an old world, or no land cover) the far output is what it was.
+- **The cache key.** `terrain_key()` ends with `#fartrees1` while land cover and vegetation are on, and `#snow1` when
+  snow is on too.
+
 ### Still missing
 
-- Trees in the far view (they grow near the player only), buildings, roads, farmland.
+- Buildings, roads, farmland. Far trees are simple stand-ins (no mangrove roots, no vines, no thick trunks).
 - Climate is the yearly mean only: no seasons, no snow that comes and goes.
 - Not checked against a real file by the tests (they use synthetic data only): the half-pixel convention (the reader
   treats a pixel as the area it covers), and whether overview levels keep class boundaries well (they are taken as

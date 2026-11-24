@@ -16,8 +16,9 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use horizon_earth::{Fetch, TileId};
+use horizon_earth::{Fetch, LandClass, TileId};
 
+use super::far_trees::ColumnsDecor;
 use super::generator::{Access, EarthGenerator, NotReady, Rect, node_box};
 use super::surface::SurfaceKind;
 
@@ -36,19 +37,36 @@ pub struct Requests {
     waker: Mutex<Option<Waker>>,
 }
 
-/// The 16 by 16 columns of a far node (`z << 4 | x`): each one's surface block height and kind of top.
+/// The columns of a far node (16 by 16, `z << 4 | x`) or of a wider block of them: each one's surface block
+/// height and kind of top, and with land cover its class.
 #[derive(Clone, Debug)]
 pub struct NodeColumns {
     /// Blocks per voxel.
     pub step: i32,
+    /// Columns in a row.
+    pub width: usize,
+    /// The block the first column is sampled at.
+    pub origin: [i32; 2],
     pub surfaces: Vec<i32>,
     kinds: Vec<SurfaceKind>,
+    /// The land class of each column; `None` without land cover.
+    pub(super) classes: Option<Vec<LandClass>>,
+    /// Trees and snow over the columns, once [`EarthGenerator::decorate_columns`] has made them.
+    pub(super) decor: Option<Box<ColumnsDecor>>,
 }
 
 impl NodeColumns {
     /// The kind of top of column `i`.
     pub fn kind(&self, i: usize) -> SurfaceKind {
         self.kinds[i]
+    }
+
+    /// The block `(x, z)` column `i` is sampled at.
+    pub(super) fn block_of(&self, i: usize) -> (i32, i32) {
+        (
+            self.origin[0].saturating_add((i % self.width) as i32 * self.step),
+            self.origin[1].saturating_add((i / self.width) as i32 * self.step),
+        )
     }
 }
 
@@ -93,27 +111,43 @@ impl EarthGenerator {
         stride: i32,
         zoom_step: i32,
     ) -> Result<NodeColumns, NotReady> {
+        self.columns_wide(x0, z0, 16, stride, zoom_step)
+    }
+
+    /// [`EarthGenerator::columns_at`] for `width` by `width` columns.
+    pub(super) fn columns_wide(
+        &self,
+        x0: i32,
+        z0: i32,
+        width: usize,
+        stride: i32,
+        zoom_step: i32,
+    ) -> Result<NodeColumns, NotReady> {
         let stride = stride.max(1);
         let (sx, sz) = (x0.saturating_add(stride / 2), z0.saturating_add(stride / 2));
-        let surfaces = self.surfaces_at(x0, z0, stride, zoom_step)?;
-        let span = 15 * stride;
-        let not_ready = |_| NotReady {
-            tiles: self.missing_in(self.kind_rect(
-                Rect {
-                    x0: sx,
-                    z0: sz,
-                    x1: sx.saturating_add(span),
-                    z1: sz.saturating_add(span),
-                    zoom: self.zoom_for_step(zoom_step),
-                },
-                stride,
-            )),
+        let zoom = self.zoom_for_step(zoom_step);
+        let span = (width as i32 - 1) * stride;
+        let rect = Rect {
+            x0: sx,
+            z0: sz,
+            x1: sx.saturating_add(span),
+            z1: sz.saturating_add(span),
+            zoom,
         };
-        let kinds = self
-            .kinds_core(
+        let surfaces = self
+            .field
+            .surface_ys_strided(sx, sz, width, width, stride, zoom)
+            .ok_or_else(|| NotReady {
+                tiles: self.missing_in(rect),
+            })?;
+        let not_ready = |_| NotReady {
+            tiles: self.missing_in(self.kind_rect(rect, stride)),
+        };
+        let (kinds, classes) = self
+            .kinds_classes_core(
                 Access::Local,
                 [sx, sz],
-                [16, 16],
+                [width, width],
                 stride,
                 zoom_step,
                 &surfaces,
@@ -121,8 +155,12 @@ impl EarthGenerator {
             .map_err(not_ready)?;
         Ok(NodeColumns {
             step: stride,
+            width,
+            origin: [sx, sz],
             surfaces,
             kinds,
+            classes,
+            decor: None,
         })
     }
 
@@ -134,9 +172,14 @@ impl EarthGenerator {
         self.columns_at(min[0], min[2], step, step)
     }
 
-    /// The block of the voxel in column `i` of `columns` whose lowest block is `lo`.
+    /// The block of the voxel in column `i` of `columns` whose lowest block is `lo`: the terrain's, with the
+    /// column's trees and snow over it once they were made ([`EarthGenerator::decorate_columns`]).
     pub fn far_voxel(&self, columns: &NodeColumns, i: usize, lo: i32) -> u32 {
-        self.voxel_block(lo, columns.step, columns.surfaces[i], columns.kind(i))
+        let block = self.voxel_block(lo, columns.step, columns.surfaces[i], columns.kind(i));
+        match &columns.decor {
+            Some(decor) => self.decorated_voxel(columns, decor, i, lo, block),
+            None => block,
+        }
     }
 
     /// Asks for `tiles` to be fetched in the background (see [`EarthGenerator::take_requests`]); a tile asked

@@ -38,6 +38,7 @@ use horizon_earth::{
     ElevationField, Fetch, FetchError, LandClass, LandCoverSource, LoadError, TileId, TileStore,
 };
 
+use super::far_trees::MAX_TREE_UP;
 use super::settings::EarthSettings;
 use super::surface::{
     LAKE_DEPTH, SLOPE_BASE_M, SNOW_DEPTH, SOIL_DEPTH, STEEP_GRADIENT, SurfaceKind,
@@ -62,6 +63,8 @@ pub struct EarthBlocks {
     pub gravel: u32,
     pub mud: u32,
     pub moss_block: u32,
+    /// What the far view's trees and snow are made of.
+    pub far: super::far_trees::FarBlocks,
 }
 
 impl EarthBlocks {
@@ -79,6 +82,7 @@ impl EarthBlocks {
             gravel: get("gravel")?,
             mud: get("mud")?,
             moss_block: get("moss_block")?,
+            far: super::far_trees::FarBlocks::from_registry(registry)?,
         })
     }
 }
@@ -432,7 +436,7 @@ impl EarthGenerator {
     /// The class of the column `(i, j)` of each of `width` by `depth` columns `stride` blocks apart from
     /// `(x0, z0)`, read at the zoom of `zoom_step`. A local read that lacks data records what to fetch
     /// ([`EarthGenerator::take_land_requests`]) and gives [`Gap::Land`].
-    fn classes_core(
+    pub(super) fn classes_core(
         &self,
         a: Access,
         land: &LandCoverSource,
@@ -471,12 +475,27 @@ impl EarthGenerator {
     pub(super) fn kinds_core(
         &self,
         a: Access,
+        origin: [i32; 2],
+        size: [usize; 2],
+        stride: i32,
+        zoom_step: i32,
+        surfaces: &[i32],
+    ) -> Result<Vec<SurfaceKind>, Gap> {
+        Ok(self
+            .kinds_classes_core(a, origin, size, stride, zoom_step, surfaces)?
+            .0)
+    }
+
+    /// [`EarthGenerator::kinds_core`] and the classes the kinds were made from (`None` without land cover).
+    pub(super) fn kinds_classes_core(
+        &self,
+        a: Access,
         [x0, z0]: [i32; 2],
         [width, depth]: [usize; 2],
         stride: i32,
         zoom_step: i32,
         surfaces: &[i32],
-    ) -> Result<Vec<SurfaceKind>, Gap> {
+    ) -> Result<(Vec<SurfaceKind>, Option<Vec<LandClass>>), Gap> {
         let at = |i: usize| {
             (
                 x0.saturating_add((i % width) as i32 * stride),
@@ -484,17 +503,18 @@ impl EarthGenerator {
             )
         };
         let Some(land) = &self.land else {
-            return Ok(surfaces
+            let kinds = surfaces
                 .iter()
                 .enumerate()
                 .map(|(i, &s)| {
                     let (x, z) = at(i);
                     self.surface_kind(x, z, s)
                 })
-                .collect());
+                .collect();
+            return Ok((kinds, None));
         };
         let classes = self.classes_core(a, land, [x0, z0], [width, depth], stride, zoom_step)?;
-        surfaces
+        let kinds = surfaces
             .iter()
             .zip(&classes)
             .enumerate()
@@ -502,7 +522,8 @@ impl EarthGenerator {
                 let (x, z) = at(i);
                 self.land_kind(a, [x, z], s, stride, zoom_step, class)
             })
-            .collect()
+            .collect::<Result<Vec<_>, Gap>>()?;
+        Ok((kinds, Some(classes)))
     }
 
     /// The kind of the one column at `(x, z)` whose surface is `s`, samples `step` blocks apart.
@@ -763,6 +784,19 @@ impl EarthGenerator {
         max: [i32; 3],
         step: i32,
     ) -> Result<Fill, Gap> {
+        self.box_core_up(a, min, max, step, 0)
+    }
+
+    /// [`EarthGenerator::box_core`] where the air counts only from `up` blocks over the highest ground: what
+    /// trees and snow put over it are not proven away by the heights.
+    pub(super) fn box_core_up(
+        &self,
+        a: Access,
+        min: [i32; 3],
+        max: [i32; 3],
+        step: i32,
+        up: i32,
+    ) -> Result<Fill, Gap> {
         let r = Rect {
             x0: min[0],
             z0: min[2],
@@ -775,7 +809,8 @@ impl EarthGenerator {
         let step = step.max(1);
         let ymin = Self::voxel_floor(min[1].min(max[1]), step);
         let ymax = Self::voxel_floor(min[1].max(max[1]), step).saturating_add(step - 1);
-        Ok(self.classify_heights(ymin, ymax, self.vertical_block(lo), self.vertical_block(hi)))
+        let s_hi = self.vertical_block(hi).saturating_add(up);
+        Ok(self.classify_heights(ymin, ymax, self.vertical_block(lo), s_hi))
     }
 
     pub(super) fn node_core(
@@ -783,11 +818,12 @@ impl EarthGenerator {
         a: Access,
         level: u32,
         [x, y, z]: [i32; 3],
+        up: i32,
     ) -> Result<Fill, Gap> {
         let (min, mut max) = node_box(level, [x, y, z]);
         // Its voxels are the `16 << level` blocks from `min`; the far face is only read for the columns.
         max[1] = min[1].saturating_add((16_i32 << level.min(24)) - 1);
-        self.box_core(a, min, max, 1 << level.min(24))
+        self.box_core_up(a, min, max, 1 << level.min(24), up)
     }
 
     pub(super) fn cube_core(
@@ -935,8 +971,40 @@ impl EarthGenerator {
     pub fn classify_node(&self, level: u32, x: i32, y: i32, z: i32) -> Result<Fill, NotReady> {
         self.ready(
             self.node_rect(level, x, z),
-            self.node_core(Access::Local, level, [x, y, z]),
+            self.node_core(Access::Local, level, [x, y, z], 0),
         )
+    }
+
+    /// [`EarthGenerator::classify_node`] for a world whose far view draws trees and snow: air is proven only
+    /// from [`MAX_TREE_UP`] blocks over the highest ground, so a node trees reach into is not pruned.
+    pub fn classify_node_above(
+        &self,
+        level: u32,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Result<Fill, NotReady> {
+        self.ready(
+            self.node_rect(level, x, z),
+            self.node_core(Access::Local, level, [x, y, z], MAX_TREE_UP),
+        )
+    }
+
+    /// [`EarthGenerator::classify_box_at`] with the margin of [`EarthGenerator::classify_node_above`].
+    pub fn classify_box_above(
+        &self,
+        min: [i32; 3],
+        max: [i32; 3],
+        step: i32,
+    ) -> Result<Fill, NotReady> {
+        let r = Rect {
+            x0: min[0],
+            z0: min[2],
+            x1: max[0],
+            z1: max[2],
+            zoom: self.zoom_for_step(step),
+        };
+        self.ready(r, self.box_core_up(Access::Local, min, max, step, MAX_TREE_UP))
     }
 }
 

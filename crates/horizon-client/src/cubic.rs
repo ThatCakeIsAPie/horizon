@@ -4470,6 +4470,89 @@ mod tests {
         assert!(level.generation().vegetation.is_none());
         let earth = level.generation().earth.as_ref().unwrap();
         assert!(!earth.settings.vegetation);
+        // Snow runs in the vegetation's population: without vegetation in force it is off in the settings in force.
+        let Some(i) = Fixture::new("earth-no-veg-snow") else {
+            return;
+        };
+        no_land.snow = true;
+        let level = i.earth_level_with(&no_land, Arc::new(MemoryFetcher::new(hills)), None, Some(i.data()));
+        assert!(!level.generation().earth.as_ref().unwrap().settings.snow);
+    }
+
+    /// The `minecraft:snow` and `minecraft:ice` blocks in the 3 x 3 cube columns around the origin at `lat`,
+    /// from the cube under the surface to two above it.
+    fn snow_blocks(f: &Fixture, level: &CubicLevel, lat: f64) -> (usize, usize) {
+        let surface = 63 + (hills(lat, 7.5) / 2.0).floor() as i32;
+        let (mut snow, mut ice) = (0, 0);
+        for cy in [surface >> 4, (surface >> 4) + 1, (surface >> 4) + 2] {
+            for cx in -1..=1 {
+                for cz in -1..=1 {
+                    let cube = level.make_cube(SectionPos::new(cx, cy, cz));
+                    for i in 0..4096 {
+                        let state = horizon_world::registry::BlockStateId(cube.section.get(i));
+                        match f.assets.registry.state(state).map(|s| s.name.as_str()) {
+                            Some("minecraft:snow") => snow += 1,
+                            Some("minecraft:ice") => ice += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        (snow, ice)
+    }
+
+    #[test]
+    fn an_earth_world_with_snow_covers_a_cold_forest_and_one_without_the_key_or_in_a_warm_place_has_none() {
+        use horizon_earth::testing::MemoryLandCover;
+        use horizon_earth::{LandCoverStore, WorldCoverFile};
+        let Some(f) = Fixture::new("earth-snow") else {
+            return;
+        };
+        // Tree cover at `lat` (70 degrees north is snowy taiga, 46 a forest), with `snow` as asked.
+        let make = |f: &Fixture, lat: f64, snow: bool| {
+            let mut settings = EarthSettings::at(lat, 7.5);
+            settings.metres_per_block = 2.0;
+            settings.sea_level_y = 63;
+            settings.land_cover = true;
+            settings.vegetation = true;
+            settings.snow = snow;
+            let mut land = MemoryLandCover::new();
+            for (dlat, dlon) in [(-0.7, -0.7), (-0.7, 0.7), (0.7, -0.7), (0.7, 0.7)] {
+                if let Some(file) = WorldCoverFile::containing(lat + dlat, 7.5 + dlon) {
+                    land = land.with_classes(file, 384, 96, 2, |_, _| 10);
+                }
+            }
+            let fetcher: Arc<dyn horizon_earth::LandCoverFetcher> = Arc::new(land);
+            let source = settings
+                .land_cover_source(
+                    Arc::new(LandCoverStore::new(f.dir.join(format!("land-{lat}-{snow}")), 64)),
+                    fetcher,
+                )
+                .unwrap();
+            f.earth_level_with(&settings, Arc::new(MemoryFetcher::new(hills)), Some(source), Some(f.data()))
+        };
+        // Snow on: the layer lies on the ground and the spruces, and the settings in force keep the key.
+        let level = make(&f, 70.0, true);
+        assert!(level.generation().earth.as_ref().unwrap().settings.snow);
+        let (snow, ice) = snow_blocks(&f, &level, 70.0);
+        assert!(snow > 500, "a cold forest under snow: {snow} snow blocks");
+        assert_eq!(ice, 0);
+        drop(level);
+        // The same forest in a world whose file has no `snow` key: no snow (the old look).
+        let Some(g) = Fixture::new("earth-no-snow") else {
+            return;
+        };
+        let level = make(&g, 70.0, false);
+        assert!(!level.generation().earth.as_ref().unwrap().settings.snow);
+        assert_eq!(snow_blocks(&g, &level, 70.0), (0, 0));
+        drop(level);
+        // A warm place with snow on is no different from one without it.
+        let Some(h) = Fixture::new("earth-warm-snow") else {
+            return;
+        };
+        let level = make(&h, 46.0, true);
+        assert_eq!(snow_blocks(&h, &level, 46.0), (0, 0));
     }
 
     #[test]

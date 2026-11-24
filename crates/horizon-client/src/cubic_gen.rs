@@ -217,13 +217,21 @@ impl Generation {
             // far-view cache key says so.
             let vegetation = match (settings.vegetation, data, generator.earth_vegetation_mask()) {
                 (true, Some(data), Some(mask)) => {
-                    Vegetation::new(data, seed).map(|v| Arc::new(v.with_mask(mask)))
+                    Vegetation::new(data, seed).map(|v| {
+                        let v = v.with_mask(mask);
+                        Arc::new(if settings.snow { v.with_snow() } else { v })
+                    })
                 }
                 _ => None,
             };
             if settings.vegetation && vegetation.is_none() {
                 log::info!("Horizon: this Earth world grows no plants (vegetation needs land cover)");
                 settings.vegetation = false;
+            }
+            // Snow runs in the vegetation's population: without it there is none, and the key says so.
+            if settings.snow && vegetation.is_none() {
+                log::info!("Horizon: this Earth world has no snow layer (snow needs vegetation)");
+                settings.snow = false;
             }
             // One biome, unless the generator reads land cover.
             let columns = generator

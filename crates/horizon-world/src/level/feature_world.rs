@@ -10,6 +10,7 @@ use crate::{
     worldgen::{
         anchor::WorldGenerationContext,
         biome::BiomeId,
+        biome_temperature::{BiomeTemperature, TemperatureModifier},
         feature::FeatureWorld,
         live::LiveFeatures,
         placement::{LayerBlock, PlacementContext, PlacementQueryError},
@@ -47,6 +48,24 @@ fn pos([x, y, z]: [i32; 3]) -> BlockPos {
 impl<L: LevelAccess + ?Sized> LevelFeatureWorld<'_, '_, L> {
     fn sea(&self) -> i32 {
         self.sim.level.sea_level()
+    }
+    /// A fresh temperature cache of `biome`; `None` when the biome cannot freeze (or snow) at `y`
+    /// whatever the column, which spares the work.
+    fn cold_biome(
+        &self,
+        biome: BiomeId,
+        y: i32,
+        snow: bool,
+    ) -> Result<Option<BiomeTemperature>, PlacementQueryError> {
+        let settings = self
+            .features
+            .biome_temperature(biome)
+            .ok_or(PlacementQueryError::Unavailable)?;
+        let warm = settings.modifier == TemperatureModifier::None
+            && settings.base_temperature >= 0.15_f32
+            && y <= self.sea().wrapping_add(17);
+        Ok((!warm && (!snow || settings.has_precipitation))
+            .then(|| BiomeTemperature::new(settings)))
     }
     fn in_tag(&self, state: BlockStateId, tag: &str) -> bool {
         let name = tag.trim_start_matches('#');
@@ -336,6 +355,33 @@ impl<L: LevelAccess + ?Sized> PlacementContext for LevelFeatureWorld<'_, '_, L> 
             .biome_name(pos(position))
             .and_then(|name| self.features.biome_id(name))
             .ok_or(PlacementQueryError::Unavailable)
+    }
+    fn biome_should_freeze(
+        &mut self,
+        biome: BiomeId,
+        position: [i32; 3],
+        require_edge: bool,
+    ) -> Result<bool, PlacementQueryError> {
+        let features = self.features;
+        let weather = features.weather().ok_or(PlacementQueryError::Unavailable)?;
+        match self.cold_biome(biome, position[1], false)? {
+            Some(mut temperature) => {
+                weather.should_freeze(self, &mut temperature, position, require_edge)
+            }
+            None => Ok(false),
+        }
+    }
+    fn biome_should_snow(
+        &mut self,
+        biome: BiomeId,
+        position: [i32; 3],
+    ) -> Result<bool, PlacementQueryError> {
+        let features = self.features;
+        let weather = features.weather().ok_or(PlacementQueryError::Unavailable)?;
+        match self.cold_biome(biome, position[1], true)? {
+            Some(mut temperature) => weather.should_snow(self, &mut temperature, position),
+            None => Ok(false),
+        }
     }
     fn block_state(&mut self, position: [i32; 3]) -> Result<BlockStateId, PlacementQueryError> {
         Ok(self.sim.state(pos(position)))

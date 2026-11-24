@@ -1192,3 +1192,5 @@ impl Terrain {
 mod bounds_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vegetation_snow_tests;

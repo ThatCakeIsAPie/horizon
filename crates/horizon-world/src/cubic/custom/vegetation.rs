@@ -27,10 +27,20 @@
 //! cover (`cubic::earth::vegetation`). The random is used exactly the same way with or without a mask, and
 //! without one (the default) nothing changes.
 //!
+//! # Snow
+//!
+//! [`Vegetation::with_snow`] adds the top layer step after the vegetal features: the biomes' own
+//! `freeze_top_layer` (snow on cold tops and leaves, ice on still water), run on the same region
+//! with a random of its own. The mask does not gate it; only the biome list does. The tops it finds are
+//! those of the whole region, so the population that sees a canopy's top snows it (the same layer from
+//! two populations is one layer), as long as the trees grew before that population's pass. Vanilla drops the
+//! temperature above sea level + 17; this pass hides that drop (the region's sea level is far above
+//! any block), so only a biome's own temperature decides. Earth's biomes already come from the real
+//! temperature at the real height. Without `with_snow` (the default) nothing changes.
+//!
 //! # Not done
 //!
-//! * Top layer modification (snow, ice) and the other decoration steps
-//!   (ores and lakes are CubicWorldGen's own, caves are carved at
+//! * The other decoration steps (ores and lakes are CubicWorldGen's own, caves are carved at
 //!   generation).
 //! * A feature that grows past the region (the tallest trees on a surface
 //!   high in the area) is cut at the region's top.
@@ -53,8 +63,13 @@ use crate::worldgen::live::LiveFeatures;
 
 /// The decoration step of vegetation (`GenerationStep.Decoration.VEGETAL_DECORATION`).
 const VEGETAL_STEP: usize = 9;
+/// The decoration step of the top layer (`GenerationStep.Decoration.TOP_LAYER_MODIFICATION`).
+const TOP_LAYER_STEP: usize = 10;
 /// The region is 2 cubes wide; the area a population decorates its middle.
 const REGION: i32 = 32;
+/// The sea level the snow pass shows the features: so high that vanilla's height drop of the
+/// temperature (above sea level + 17) never applies.
+const SNOW_SEA_LEVEL: i32 = i32::MAX / 4;
 
 /// Whether a named feature may grow at a block column, asked on top of the biome. Called from the
 /// threads that populate, possibly many times per cube, so it should be quick (it may block on data).
@@ -74,6 +89,10 @@ pub struct Vegetation {
     lists: Vec<OnceLock<Arc<[String]>>>,
     /// An extra say on where features grow; `None` for the plain Cubic generator.
     mask: Option<Arc<dyn VegetationMask>>,
+    /// Whether the top layer step runs after the vegetal one (Earth's `snow`).
+    snow: bool,
+    /// The top layer features of each biome id, built when first asked.
+    top_lists: Vec<OnceLock<Arc<[String]>>>,
 }
 
 impl Vegetation {
@@ -85,6 +104,9 @@ impl Vegetation {
         let lists = (0..data.biome_names().len())
             .map(|_| OnceLock::new())
             .collect();
+        let top_lists = (0..data.biome_names().len())
+            .map(|_| OnceLock::new())
+            .collect();
         Some(Self {
             data: data.clone(),
             features,
@@ -93,7 +115,15 @@ impl Vegetation {
             air,
             lists,
             mask: None,
+            snow: false,
+            top_lists,
         })
+    }
+
+    /// The same vegetation that also runs the top layer step (snow and ice) after the vegetal one.
+    pub fn with_snow(mut self) -> Self {
+        self.snow = true;
+        self
     }
 
     /// The same vegetation where a feature also needs `mask` to allow its column.
@@ -103,13 +133,19 @@ impl Vegetation {
     }
 
     fn list(&self, biome: BiomeId) -> Arc<[String]> {
-        match self.lists.get(biome.0 as usize) {
+        self.step_list(&self.lists, biome, VEGETAL_STEP)
+    }
+
+    /// The features of decoration step `step` of `biome`, kept in `cells`.
+    fn step_list(
+        &self,
+        cells: &[OnceLock<Arc<[String]>>],
+        biome: BiomeId,
+        step: usize,
+    ) -> Arc<[String]> {
+        match cells.get(biome.0 as usize) {
             Some(cell) => cell
-                .get_or_init(|| {
-                    self.features
-                        .biome_step_features(biome, VEGETAL_STEP)
-                        .into()
-                })
+                .get_or_init(|| self.features.biome_step_features(biome, step).into())
                 .clone(),
             None => Arc::from(Vec::new()),
         }
@@ -161,7 +197,7 @@ impl Vegetation {
                 }
             }
         }
-        if order.is_empty() {
+        if order.is_empty() && !self.snow {
             return;
         }
         let lists: Vec<Arc<[String]>> = ids.iter().map(|&id| self.list(id)).collect();
@@ -171,6 +207,7 @@ impl Vegetation {
             random: LegacyRandom::new(base),
             names,
             seed: self.seed,
+            sea_level: None,
         };
         let origin = [min[0] + 8, min[1] + 8, min[2] + 8];
         let surface = (min[1] + 8, min[1] + 24);
@@ -199,6 +236,66 @@ impl Vegetation {
                 surface,
             );
         }
+        if self.snow {
+            self.top_layer(&mut level, &ids, base, origin);
+        }
+    }
+
+    /// The top layer step of the area: each biome's features of it, from the first biome's order,
+    /// placed like the vegetal ones but without the mask (land cover has no say on snow).
+    fn top_layer(&self, level: &mut Region<'_>, ids: &[BiomeId], base: i64, origin: [i32; 3]) {
+        let min = level.min;
+        // Every column of the area takes its top from the whole region, not from the area's own band of
+        // heights: the layer is the same whichever population puts it, and a canopy above the band is
+        // snowed by the population whose band holds its top.
+        let surface = (min[1], min[1] + REGION);
+        let mut order: Vec<String> = Vec::new();
+        let mut seen: Vec<BiomeId> = Vec::new();
+        for qz in 2..6 {
+            for qx in 2..6 {
+                let id = ids[qz * 8 + qx];
+                if seen.contains(&id) {
+                    continue;
+                }
+                seen.push(id);
+                for name in self.step_list(&self.top_lists, id, TOP_LAYER_STEP).iter() {
+                    if !order.contains(name) {
+                        order.push(name.clone());
+                    }
+                }
+            }
+        }
+        if order.is_empty() {
+            return;
+        }
+        let lists: Vec<Arc<[String]>> = ids
+            .iter()
+            .map(|&id| self.step_list(&self.top_lists, id, TOP_LAYER_STEP))
+            .collect();
+        // No height drop of the temperature: see the module's Snow section.
+        level.sea_level = Some(SNOW_SEA_LEVEL);
+        for (i, name) in order.iter().enumerate() {
+            let mut feature_random =
+                LegacyRandom::new(base ^ (i as i64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D));
+            let gate = |p: [i32; 3]| -> bool {
+                let (qx, qz) = ((p[0] - min[0]) >> 2, (p[2] - min[2]) >> 2);
+                if !(0..8).contains(&qx) || !(0..8).contains(&qz) {
+                    return false;
+                }
+                lists[(qz * 8 + qx) as usize].contains(name)
+            };
+            place_biome_feature(
+                &self.behaviours,
+                &self.features,
+                level,
+                name,
+                origin,
+                &mut feature_random,
+                &gate,
+                surface,
+            );
+        }
+        level.sea_level = None;
     }
 }
 
@@ -228,6 +325,8 @@ struct Region<'a> {
     /// The biome name of each quart of the region (8 x 8).
     names: Vec<Arc<str>>,
     seed: i64,
+    /// A sea level of the region's own; `None` is the level's.
+    sea_level: Option<i32>,
 }
 
 impl Region<'_> {
@@ -280,5 +379,9 @@ impl LevelAccess for Region<'_> {
     }
     fn world_seed(&self) -> i64 {
         self.seed
+    }
+    fn sea_level(&self) -> i32 {
+        self.sea_level
+            .unwrap_or_else(|| crate::level::sea_level_of(self.level_key()))
     }
 }

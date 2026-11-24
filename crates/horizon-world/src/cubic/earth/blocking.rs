@@ -144,7 +144,7 @@ impl EarthGenerator {
     /// [`EarthGenerator::classify_node`], loading the tiles it needs. `Mixed` when cancelled.
     pub fn classify_node_blocking(&self, level: u32, x: i32, y: i32, z: i32) -> Fill {
         self.wait_for(self.node_rect(level, x, z), || {
-            self.node_core(Access::Fetch, level, [x, y, z])
+            self.node_core(Access::Fetch, level, [x, y, z], 0)
         })
         .unwrap_or(Fill::Mixed)
     }

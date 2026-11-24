@@ -263,6 +263,8 @@ impl Draft {
         settings.land_cover = self.land_on();
         // Plants and trees follow the land cover, so a new world grows them whenever it has it.
         settings.vegetation = settings.land_cover;
+        // Snow lies on the cold biomes the vegetation's population reaches, so it goes with it.
+        settings.snow = settings.land_cover;
         // The biomes follow the real climate whenever this game has a source for it.
         settings.climate = settings.land_cover && self.climate_host().is_some();
         let limit = horizon_earth::projection::MAX_LATITUDE;

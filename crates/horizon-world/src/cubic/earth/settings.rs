@@ -56,6 +56,12 @@ pub struct EarthSettings {
     /// and left out of the file while off, so an older world keeps its biomes, its text and its cache key.
     #[serde(default, skip_serializing_if = "is_false")]
     pub climate: bool,
+    /// Whether snow lies on cold ground and on trees, and still water freezes, where the biome is cold enough
+    /// (`docs/earth.md`, "Snow"), near and in the far view. It needs `vegetation` (it runs in the same
+    /// population); off by default, in `at` too (the client turns it on for new worlds), and left out of the
+    /// file while off, so an older world keeps its look and its cache key.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub snow: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -90,6 +96,7 @@ impl EarthSettings {
             land_cover: false,
             vegetation: false,
             climate: false,
+            snow: false,
         }
     }
 
@@ -221,8 +228,10 @@ impl EarthSettings {
     /// ([`horizon_earth::LAND_COVER_RULES`]) and of the land-cover surface and biome rules
     /// ([`super::surface::LAND_RULES`]), so a world made with land cover never shares a cache with one made
     /// without; with it off the text is what it was before land cover existed. With land cover and vegetation
-    /// both on it ends with the version of the vegetation rules ([`super::vegetation::VEGETATION_RULES`]);
-    /// vegetation without land cover does nothing and is not in the key. With land cover and climate both on it
+    /// both on it continues with the version of the vegetation rules ([`super::vegetation::VEGETATION_RULES`])
+    /// and of the far-view tree rules ([`super::vegetation::FAR_TREE_RULES`]), and with `snow` also on, the
+    /// version of the snow rules ([`super::vegetation::SNOW_RULES`]); vegetation without land cover does
+    /// nothing and is not in the key, nor is snow without vegetation. With land cover and climate both on it
     /// ends with the climate data rules ([`horizon_earth::CLIMATE_RULES`]) and the climate biome rules
     /// ([`super::biome::CLIMATE_BIOME_RULES`]).
     pub fn terrain_key(&self) -> String {
@@ -240,9 +249,13 @@ impl EarthSettings {
             ));
             if self.vegetation {
                 key.push_str(&format!(
-                    "#vegetation{}",
-                    super::vegetation::VEGETATION_RULES
+                    "#vegetation{}#fartrees{}",
+                    super::vegetation::VEGETATION_RULES,
+                    super::vegetation::FAR_TREE_RULES
                 ));
+                if self.snow {
+                    key.push_str(&format!("#snow{}", super::vegetation::SNOW_RULES));
+                }
             }
             if self.climate {
                 key.push_str(&format!(
@@ -299,6 +312,7 @@ mod tests {
             land_cover: true,
             vegetation: true,
             climate: true,
+            snow: true,
         };
         for text in [s.to_json_pretty(), s.to_json_compact()] {
             assert_eq!(EarthSettings::from_json(&text).unwrap(), s);
@@ -391,7 +405,11 @@ mod tests {
             s.vegetation = vegetation;
             s.terrain_key()
         };
-        let rules = format!("#vegetation{}", super::super::vegetation::VEGETATION_RULES);
+        let rules = format!(
+            "#vegetation{}#fartrees{}",
+            super::super::vegetation::VEGETATION_RULES,
+            super::super::vegetation::FAR_TREE_RULES
+        );
         // With land cover, vegetation adds its rules after the land-cover part.
         let with = key(true, true);
         assert!(with.ends_with(&rules), "{with}");
@@ -415,6 +433,78 @@ mod tests {
                 base.to_json_compact(),
                 super::super::surface::RULES,
                 horizon_earth::clean::CLEAN_RULES
+            )
+        );
+    }
+
+    #[test]
+    fn snow_is_off_when_absent_and_left_out_of_the_file_while_off() {
+        let old = EarthSettings::from_json(
+            r#"{"originLatitude": 46.0, "originLongitude": 7.5, "landCover": true}"#,
+        )
+        .unwrap();
+        assert!(!old.snow);
+        assert!(!old.to_json_compact().contains("snow"));
+        assert!(!EarthSettings::at(46.0, 7.5).snow);
+        let on = EarthSettings::from_json(
+            r#"{"originLatitude": 46.0, "originLongitude": 7.5, "snow": true}"#,
+        )
+        .unwrap();
+        assert!(on.snow);
+        assert!(on.to_json_compact().contains(r#""snow":true"#));
+    }
+
+    #[test]
+    fn the_terrain_key_carries_snow_only_with_land_cover_and_vegetation() {
+        let base = EarthSettings::at(46.0, 7.5);
+        let key = |land_cover, vegetation, snow| {
+            let mut s = base.clone();
+            s.land_cover = land_cover;
+            s.vegetation = vegetation;
+            s.snow = snow;
+            s.terrain_key()
+        };
+        let snow = format!("#snow{}", super::super::vegetation::SNOW_RULES);
+        let with = key(true, true, true);
+        assert!(with.ends_with(&snow), "{with}");
+        assert!(!key(true, true, false).contains("#snow"));
+        // It follows the vegetation part, and a snowless world's key has nothing of it.
+        let without = key(true, true, false);
+        assert!(with.contains(&format!(
+            "fartrees{}{snow}",
+            super::super::vegetation::FAR_TREE_RULES
+        )));
+        assert_ne!(with, without);
+        // Snow without vegetation or without land cover does nothing: only the file's own text differs.
+        for (land_cover, vegetation) in [(true, false), (false, true), (false, false)] {
+            let key = key(land_cover, vegetation, true);
+            assert!(
+                !key.contains("#snow") && !key.contains("#fartrees"),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_old_worlds_key_has_no_far_tree_or_snow_part_and_is_the_format_from_before() {
+        // A world file from before vegetation and snow: land cover only.
+        let old = EarthSettings::from_json(
+            r#"{"originLatitude": 46, "originLongitude": 7.5, "landCover": true}"#,
+        )
+        .unwrap();
+        let key = old.terrain_key();
+        assert!(
+            !key.contains("#vegetation") && !key.contains("#fartrees") && !key.contains("#snow")
+        );
+        assert_eq!(
+            key,
+            format!(
+                "{}#surface{}#clean{}#landcover{}.{}",
+                old.to_json_compact(),
+                super::super::surface::RULES,
+                horizon_earth::clean::CLEAN_RULES,
+                horizon_earth::LAND_COVER_RULES,
+                super::super::surface::LAND_RULES
             )
         );
     }
