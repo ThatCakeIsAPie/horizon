@@ -1,9 +1,10 @@
-//! A minimal TIFF reader for tiled land-cover rasters, as pure functions over byte slices.
+//! A minimal TIFF reader for tiled rasters, as pure functions over byte slices.
 //!
-//! It reads exactly what the ESA WorldCover files use and nothing else: classic TIFF (not BigTIFF) in either byte
-//! order, tiled, 8 bits, one sample per pixel, compressed with DEFLATE (a zlib stream) and no predictor, with a
-//! chain of image directories (the full resolution first, then smaller overviews). Anything else is an error that
-//! says what it is; nothing is guessed.
+//! It reads two families of file and nothing else. The first is what the ESA WorldCover files use: classic TIFF,
+//! 8 bits, one sample per pixel, DEFLATE (a zlib stream), no predictor. The second is what the CHELSA climate
+//! files use: BigTIFF (64-bit offsets), 16-bit unsigned samples and the horizontal predictor (Predictor 2).
+//! Both byte orders work, and both are tiled, with a chain of image directories (the full resolution first, then
+//! smaller overviews). Anything else is an error that says what it is; nothing is guessed.
 //!
 //! The reader never sees the whole file. [`parse_index`] works on a prefix, or on pieces of the file the caller
 //! holds, and when a directory or an array of tile offsets lies beyond them it says which byte range to fetch
@@ -19,19 +20,21 @@ pub const MAX_DIRECTORIES: usize = 32;
 pub const MAX_ENTRIES: usize = 256;
 /// Largest width or height of a level, in pixels.
 pub const MAX_DIMENSION: u32 = 1 << 20;
-/// Largest tile width or height, in pixels (a tile is at most 16 MiB of 8-bit pixels).
+/// Largest tile width or height, in pixels (a tile is at most 16 MiB of 8-bit pixels, 32 MiB of 16-bit ones).
 pub const MAX_TILE_SIDE: u32 = 4096;
 /// Most tiles one level may have.
 pub const MAX_TILES_PER_LEVEL: u64 = 1 << 16;
 /// Most tiles all the levels of a file may have together.
 pub const MAX_TOTAL_TILES: u64 = 1 << 18;
 /// How many bytes are asked for at once when a directory lies beyond the bytes held (its entry count is not yet
-/// known). A real directory of about twenty entries fits.
+/// known). A real directory of about twenty entries fits, in either format.
 pub const DIRECTORY_GUESS: u64 = 1024;
 /// The bytes a caller should fetch first: the whole index of a WorldCover file lies within its first 32 KiB.
 pub const PREFIX_LEN: u64 = 32 * 1024;
 
+/// Bytes of the header of a classic TIFF and of a BigTIFF.
 const HEADER_LEN: u64 = 8;
+const HEADER_LEN_BIG: u64 = 16;
 
 const TAG_WIDTH: u16 = 256;
 const TAG_HEIGHT: u16 = 257;
@@ -50,6 +53,7 @@ const TAG_SAMPLE_FORMAT: u16 = 339;
 const TYPE_BYTE: u16 = 1;
 const TYPE_SHORT: u16 = 3;
 const TYPE_LONG: u16 = 4;
+const TYPE_LONG8: u16 = 16;
 
 const COMPRESSION_DEFLATE: u32 = 8;
 const COMPRESSION_DEFLATE_OLD: u32 = 32946;
@@ -59,8 +63,6 @@ const COMPRESSION_DEFLATE_OLD: u32 = 32946;
 pub enum TiffError {
     /// The bytes do not begin like a TIFF.
     NotTiff,
-    /// A BigTIFF (64-bit offsets), which the reader does not support.
-    BigTiff,
     /// Something the file points at lies beyond the end of the file.
     Truncated,
     /// The structure is malformed (a loop, a bad count, a value that does not fit).
@@ -79,7 +81,6 @@ impl fmt::Display for TiffError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotTiff => f.write_str("not a TIFF file"),
-            Self::BigTiff => f.write_str("a BigTIFF file, which is not supported"),
             Self::Truncated => f.write_str("the TIFF file ends before something it points at"),
             Self::Malformed(why) => write!(f, "malformed TIFF: {why}"),
             Self::Unsupported(what) => write!(f, "unsupported TIFF: {what}"),
@@ -131,7 +132,7 @@ pub enum Parse {
     Need(ByteRange),
 }
 
-/// Byte order of a file.
+/// Byte order of a file. The samples of a 16-bit tile follow it too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ByteOrder {
     Little,
@@ -152,33 +153,52 @@ impl ByteOrder {
             Self::Big => u32::from_be_bytes(b),
         }
     }
+
+    fn u64(self, b: [u8; 8]) -> u64 {
+        match self {
+            Self::Little => u64::from_le_bytes(b),
+            Self::Big => u64::from_be_bytes(b),
+        }
+    }
 }
 
-/// One image directory of a file: its size, its tiling, and where its tiles are.
+/// One image directory of a file: its size, its tiling, its sample format and where its tiles are.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Level {
     pub width: u32,
     pub height: u32,
     pub tile_width: u32,
     pub tile_height: u32,
-    offsets: Vec<u32>,
-    byte_counts: Vec<u32>,
+    /// Bits in one sample: 8 or 16 (unsigned integers).
+    pub bits_per_sample: u16,
+    /// The TIFF predictor tag: 1 for none, 2 for horizontal differencing (undone by the decode functions).
+    pub predictor: u16,
+    /// The byte order of the file, which 16-bit tile data follows.
+    pub order: ByteOrder,
+    /// Bytes before the first possible tile or directory: 8 for a classic TIFF, 16 for a BigTIFF.
+    header_len: u64,
+    offsets: Vec<u64>,
+    byte_counts: Vec<u64>,
 }
 
 impl Level {
-    /// A level from its parts, unchecked (for tests of code that only looks at sizes).
+    /// An 8-bit, little-endian level from its parts, unchecked (for tests of code that only looks at sizes).
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn from_parts(
         (width, height): (u32, u32),
         (tile_width, tile_height): (u32, u32),
-        offsets: Vec<u32>,
-        byte_counts: Vec<u32>,
+        offsets: Vec<u64>,
+        byte_counts: Vec<u64>,
     ) -> Self {
         Self {
             width,
             height,
             tile_width,
             tile_height,
+            bits_per_sample: 8,
+            predictor: 1,
+            order: ByteOrder::Little,
+            header_len: HEADER_LEN,
             offsets,
             byte_counts,
         }
@@ -213,9 +233,14 @@ impl Level {
         self.tile_width as usize * self.tile_height as usize
     }
 
+    /// Bytes in one decoded tile: its pixels times the bytes of a sample.
+    pub fn tile_bytes(&self) -> usize {
+        self.tile_pixels() * usize::from(self.bits_per_sample / 8).max(1)
+    }
+
     /// The most compressed bytes a tile of this level may have: DEFLATE may expand incompressible data a little.
     pub fn max_tile_bytes(&self) -> u64 {
-        let raw = self.tile_pixels() as u64;
+        let raw = self.tile_bytes() as u64;
         raw + raw / 16 + 1024
     }
 
@@ -230,34 +255,77 @@ impl Level {
         if len == 0 {
             return Ok(None);
         }
-        if u64::from(len) > self.max_tile_bytes() {
+        if len > self.max_tile_bytes() {
             return Err(TiffError::TooLarge("a tile's compressed size"));
         }
-        if u64::from(offset) < HEADER_LEN {
+        if offset < self.header_len {
             return Err(TiffError::Malformed("a tile starts inside the header"));
         }
-        Ok(Some(ByteRange {
-            offset: u64::from(offset),
-            len: u64::from(len),
-        }))
+        Ok(Some(ByteRange { offset, len }))
     }
 
-    /// The pixels of one tile from its compressed bytes: `tile_width * tile_height` bytes, row by row. Output
-    /// is never larger than that, whatever the input claims.
-    pub fn decode_tile(&self, bytes: &[u8]) -> Result<Vec<u8>, TiffError> {
-        let want = self.tile_pixels();
+    /// Inflates a tile to its raw bytes. Output is never larger than a tile, whatever the input claims.
+    fn inflate(&self, bytes: &[u8]) -> Result<Vec<u8>, TiffError> {
+        let want = self.tile_bytes();
         if bytes.is_empty() {
             return Err(TiffError::BadTile("no bytes"));
         }
         if bytes.len() as u64 > self.max_tile_bytes() {
             return Err(TiffError::TooLarge("a tile's compressed size"));
         }
-        let pixels = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(bytes, want)
+        let raw = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(bytes, want)
             .map_err(|_| TiffError::BadTile("the DEFLATE data is damaged or larger than a tile"))?;
-        if pixels.len() != want {
+        if raw.len() != want {
             return Err(TiffError::BadTile(
                 "the tile decodes to the wrong number of pixels",
             ));
+        }
+        Ok(raw)
+    }
+
+    /// The pixels of one tile of an 8-bit level from its compressed bytes: `tile_width * tile_height` bytes, row
+    /// by row, with the predictor undone. Output is never larger than that, whatever the input claims. A
+    /// 16-bit level is refused: use [`Level::decode_tile_u16`].
+    pub fn decode_tile(&self, bytes: &[u8]) -> Result<Vec<u8>, TiffError> {
+        if self.bits_per_sample != 8 {
+            return Err(TiffError::Unsupported(
+                "16-bit samples where 8-bit are expected",
+            ));
+        }
+        let mut pixels = self.inflate(bytes)?;
+        if self.predictor == 2 {
+            for row in pixels.chunks_exact_mut(self.tile_width as usize) {
+                for i in 1..row.len() {
+                    row[i] = row[i].wrapping_add(row[i - 1]);
+                }
+            }
+        }
+        Ok(pixels)
+    }
+
+    /// The pixels of one tile of a 16-bit level from its compressed bytes: `tile_width * tile_height` values, row
+    /// by row, read in the file's byte order, with the predictor undone (each row a running sum that wraps at
+    /// 16 bits). Output is never larger than a tile, whatever the input claims. An 8-bit level is refused: use
+    /// [`Level::decode_tile`].
+    pub fn decode_tile_u16(&self, bytes: &[u8]) -> Result<Vec<u16>, TiffError> {
+        if self.bits_per_sample != 16 {
+            return Err(TiffError::Unsupported(
+                "8-bit samples where 16-bit are expected",
+            ));
+        }
+        let raw = self.inflate(bytes)?;
+        let mut pixels: Vec<u16> = raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| self.order.u16(*b))
+            .collect();
+        if self.predictor == 2 {
+            for row in pixels.chunks_exact_mut(self.tile_width as usize) {
+                for i in 1..row.len() {
+                    row[i] = row[i].wrapping_add(row[i - 1]);
+                }
+            }
         }
         Ok(pixels)
     }
@@ -308,13 +376,47 @@ impl<'a> Held<'a> {
     }
 }
 
-/// One 12-byte directory entry.
+/// How the file lays out its numbers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    order: ByteOrder,
+    /// BigTIFF: 64-bit offsets and counts, 20-byte entries.
+    big: bool,
+}
+
+impl Layout {
+    fn header_len(self) -> u64 {
+        if self.big { HEADER_LEN_BIG } else { HEADER_LEN }
+    }
+
+    /// Bytes an entry holds in itself instead of pointing elsewhere.
+    fn inline_len(self) -> u64 {
+        if self.big { 8 } else { 4 }
+    }
+
+    fn entry_len(self) -> u64 {
+        if self.big { 20 } else { 12 }
+    }
+
+    /// Bytes of the entry count before the entries, and of the next-directory offset after them.
+    fn count_len(self) -> u64 {
+        if self.big { 8 } else { 2 }
+    }
+
+    fn next_len(self) -> u64 {
+        if self.big { 8 } else { 4 }
+    }
+}
+
+/// One directory entry (12 bytes, or 20 in a BigTIFF).
 #[derive(Clone, Copy)]
 struct Entry {
     tag: u16,
     kind: u16,
-    count: u32,
-    field: [u8; 4],
+    count: u64,
+    /// The value, or the offset of the values: left-justified, 4 bytes used in a classic TIFF, 8 in a BigTIFF.
+    field: [u8; 8],
+    big: bool,
 }
 
 impl Entry {
@@ -323,11 +425,12 @@ impl Entry {
             TYPE_BYTE => Some(1),
             TYPE_SHORT => Some(2),
             TYPE_LONG => Some(4),
+            TYPE_LONG8 if self.big => Some(8),
             _ => None,
         }
     }
 
-    /// The single value of an entry holding one SHORT, LONG or BYTE.
+    /// The single value of an entry holding one number that fits 32 bits.
     fn scalar(&self, order: ByteOrder) -> Result<u32, TiffError> {
         if self.count != 1 {
             return Err(TiffError::Malformed(
@@ -338,7 +441,9 @@ impl Entry {
         match self.kind {
             TYPE_BYTE => Ok(u32::from(f[0])),
             TYPE_SHORT => Ok(u32::from(order.u16([f[0], f[1]]))),
-            TYPE_LONG => Ok(order.u32(f)),
+            TYPE_LONG => Ok(order.u32([f[0], f[1], f[2], f[3]])),
+            TYPE_LONG8 if self.big => u32::try_from(order.u64(f))
+                .map_err(|_| TiffError::Malformed("a size that does not fit 32 bits")),
             _ => Err(TiffError::Malformed(
                 "a number tag of a type that is not a number",
             )),
@@ -352,24 +457,29 @@ struct Raw {
     height: u32,
     tile_width: u32,
     tile_height: u32,
+    bits: u16,
+    predictor: u16,
     offsets: Entry,
     byte_counts: Entry,
 }
 
+fn read_array_of<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N], TiffError> {
+    at.checked_add(N)
+        .and_then(|end| bytes.get(at..end))
+        .and_then(|s| <[u8; N]>::try_from(s).ok())
+        .ok_or(TiffError::Truncated)
+}
+
+fn read_u64(bytes: &[u8], at: usize, order: ByteOrder) -> Result<u64, TiffError> {
+    Ok(order.u64(read_array_of(bytes, at)?))
+}
+
 fn read_u32(bytes: &[u8], at: usize, order: ByteOrder) -> Result<u32, TiffError> {
-    let b = bytes
-        .get(at..at + 4)
-        .and_then(|s| <[u8; 4]>::try_from(s).ok())
-        .ok_or(TiffError::Truncated)?;
-    Ok(order.u32(b))
+    Ok(order.u32(read_array_of(bytes, at)?))
 }
 
 fn read_u16(bytes: &[u8], at: usize, order: ByteOrder) -> Result<u16, TiffError> {
-    let b = bytes
-        .get(at..at + 2)
-        .and_then(|s| <[u8; 2]>::try_from(s).ok())
-        .ok_or(TiffError::Truncated)?;
-    Ok(order.u16(b))
+    Ok(order.u16(read_array_of(bytes, at)?))
 }
 
 /// Reads the directory of the file from the bytes held. The result is the whole index, or the range to fetch
@@ -390,12 +500,29 @@ pub fn parse_index(pieces: &[Piece<'_>], file_len: Option<u64>) -> Result<Parse,
         b"MM" => ByteOrder::Big,
         _ => return Err(TiffError::NotTiff),
     };
-    match read_u16(header, 2, order)? {
-        42 => {}
-        43 => return Err(TiffError::BigTiff),
+    let (layout, first) = match read_u16(header, 2, order)? {
+        42 => (
+            Layout { order, big: false },
+            u64::from(read_u32(header, 4, order)?),
+        ),
+        43 => {
+            let header = match held.get(0, HEADER_LEN_BIG, PREFIX_LEN)? {
+                Got::Bytes(b) => b,
+                Got::Need(range) => return Ok(Parse::Need(range)),
+            };
+            if read_u16(header, 4, order)? != 8 {
+                return Err(TiffError::Unsupported(
+                    "a BigTIFF whose offsets are not 8 bytes",
+                ));
+            }
+            if read_u16(header, 6, order)? != 0 {
+                return Err(TiffError::Malformed("a BigTIFF header's reserved field"));
+            }
+            (Layout { order, big: true }, read_u64(header, 8, order)?)
+        }
         _ => return Err(TiffError::NotTiff),
-    }
-    let mut next = u64::from(read_u32(header, 4, order)?);
+    };
+    let mut next = first;
     let mut visited: Vec<u64> = Vec::new();
     let mut levels: Vec<Level> = Vec::new();
     let mut total_tiles = 0u64;
@@ -403,14 +530,14 @@ pub fn parse_index(pieces: &[Piece<'_>], file_len: Option<u64>) -> Result<Parse,
         if levels.len() >= MAX_DIRECTORIES {
             return Err(TiffError::TooLarge("too many image directories"));
         }
-        if next < HEADER_LEN {
+        if next < layout.header_len() {
             return Err(TiffError::Malformed("a directory starts inside the header"));
         }
         if visited.contains(&next) {
             return Err(TiffError::Malformed("the directories form a loop"));
         }
         visited.push(next);
-        let (entries, after) = match read_directory(&held, next, order)? {
+        let (entries, after) = match read_directory(&held, next, layout)? {
             Directory::Done(entries, after) => (entries, after),
             Directory::Need(range) => return Ok(Parse::Need(range)),
         };
@@ -420,11 +547,11 @@ pub fn parse_index(pieces: &[Piece<'_>], file_len: Option<u64>) -> Result<Parse,
         if total_tiles > MAX_TOTAL_TILES {
             return Err(TiffError::TooLarge("too many tiles in the file"));
         }
-        let offsets = match read_array(&held, raw.offsets, tiles, order, false)? {
+        let offsets = match read_array(&held, raw.offsets, tiles, layout, false)? {
             Array::Done(values) => values,
             Array::Need(range) => return Ok(Parse::Need(range)),
         };
-        let byte_counts = match read_array(&held, raw.byte_counts, tiles, order, true)? {
+        let byte_counts = match read_array(&held, raw.byte_counts, tiles, layout, true)? {
             Array::Done(values) => values,
             Array::Need(range) => return Ok(Parse::Need(range)),
         };
@@ -440,6 +567,10 @@ pub fn parse_index(pieces: &[Piece<'_>], file_len: Option<u64>) -> Result<Parse,
             height: raw.height,
             tile_width: raw.tile_width,
             tile_height: raw.tile_height,
+            bits_per_sample: raw.bits,
+            predictor: raw.predictor,
+            order,
+            header_len: layout.header_len(),
             offsets,
             byte_counts,
         });
@@ -456,40 +587,60 @@ enum Directory {
     Need(ByteRange),
 }
 
-fn read_directory(held: &Held<'_>, at: u64, order: ByteOrder) -> Result<Directory, TiffError> {
-    let count_bytes = match held.get(at, 2, DIRECTORY_GUESS)? {
+fn read_directory(held: &Held<'_>, at: u64, layout: Layout) -> Result<Directory, TiffError> {
+    let order = layout.order;
+    let count_bytes = match held.get(at, layout.count_len(), DIRECTORY_GUESS)? {
         Got::Bytes(b) => b,
         Got::Need(range) => return Ok(Directory::Need(range)),
     };
-    let count = usize::from(read_u16(count_bytes, 0, order)?);
+    // A BigTIFF count is 64 bits: capped before it is used for anything.
+    let count = if layout.big {
+        read_u64(count_bytes, 0, order)?
+    } else {
+        u64::from(read_u16(count_bytes, 0, order)?)
+    };
     if count == 0 {
         return Err(TiffError::Malformed("an empty image directory"));
     }
-    if count > MAX_ENTRIES {
+    if count > MAX_ENTRIES as u64 {
         return Err(TiffError::TooLarge(
             "too many entries in an image directory",
         ));
     }
-    let size = 2 + 12 * count as u64 + 4;
+    let count = count as usize;
+    let (head, entry_len) = (layout.count_len() as usize, layout.entry_len() as usize);
+    let size = layout.count_len() + layout.entry_len() * count as u64 + layout.next_len();
     let body = match held.get(at, size, size)? {
         Got::Bytes(b) => b,
         Got::Need(range) => return Ok(Directory::Need(range)),
     };
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
-        let base = 2 + 12 * i;
-        let field = body
-            .get(base + 8..base + 12)
-            .and_then(|s| <[u8; 4]>::try_from(s).ok())
-            .ok_or(TiffError::Truncated)?;
+        let base = head + entry_len * i;
+        let (count, field_at, field_len) = if layout.big {
+            (read_u64(body, base + 4, order)?, base + 12, 8)
+        } else {
+            (u64::from(read_u32(body, base + 4, order)?), base + 8, 4)
+        };
+        let mut field = [0u8; 8];
+        field[..field_len].copy_from_slice(
+            body.get(field_at..field_at + field_len)
+                .ok_or(TiffError::Truncated)?,
+        );
         entries.push(Entry {
             tag: read_u16(body, base, order)?,
             kind: read_u16(body, base + 2, order)?,
-            count: read_u32(body, base + 4, order)?,
+            count,
             field,
+            big: layout.big,
         });
     }
-    let after = u64::from(read_u32(body, 2 + 12 * count, order)?);
+    let after_at = head + entry_len * count;
+    let after = if layout.big {
+        read_u64(body, after_at, order)?
+    } else {
+        u64::from(read_u32(body, after_at, order)?)
+    };
     Ok(Directory::Done(entries, after))
 }
 
@@ -498,6 +649,8 @@ fn interpret(entries: &[Entry], order: ByteOrder) -> Result<Raw, TiffError> {
     let (mut width, mut height, mut tile_width, mut tile_height) = (None, None, None, None);
     let (mut offsets, mut byte_counts) = (None, None);
     let mut compression = None;
+    // Samples are 8 bits and unpredicted unless the directory says otherwise.
+    let (mut bits, mut predictor) = (8u16, 1u16);
     let mut seen: Vec<u16> = Vec::with_capacity(entries.len());
     for e in entries {
         if seen.contains(&e.tag) {
@@ -513,9 +666,13 @@ fn interpret(entries: &[Entry], order: ByteOrder) -> Result<Raw, TiffError> {
             TAG_TILE_BYTE_COUNTS => byte_counts = Some(*e),
             TAG_COMPRESSION => compression = Some(e.scalar(order)?),
             TAG_BITS_PER_SAMPLE => {
-                if e.scalar(order)? != 8 {
-                    return Err(TiffError::Unsupported("anything but 8 bits per sample"));
-                }
+                bits = match e.scalar(order)? {
+                    8 => 8,
+                    16 => 16,
+                    _ => {
+                        return Err(TiffError::Unsupported("bits per sample other than 8 or 16"));
+                    }
+                };
             }
             TAG_SAMPLES_PER_PIXEL => {
                 if e.scalar(order)? != 1 {
@@ -530,9 +687,15 @@ fn interpret(entries: &[Entry], order: ByteOrder) -> Result<Raw, TiffError> {
                 }
             }
             TAG_PREDICTOR => {
-                if e.scalar(order)? != 1 {
-                    return Err(TiffError::Unsupported("a predictor"));
-                }
+                predictor = match e.scalar(order)? {
+                    1 => 1,
+                    2 => 2,
+                    _ => {
+                        return Err(TiffError::Unsupported(
+                            "a predictor other than none or horizontal differencing",
+                        ));
+                    }
+                };
             }
             TAG_SAMPLE_FORMAT => {
                 if e.scalar(order)? != 1 {
@@ -575,6 +738,8 @@ fn interpret(entries: &[Entry], order: ByteOrder) -> Result<Raw, TiffError> {
         height,
         tile_width,
         tile_height,
+        bits,
+        predictor,
         offsets: offsets.ok_or(missing.clone())?,
         byte_counts: byte_counts.ok_or(missing)?,
     })
@@ -592,7 +757,7 @@ fn tile_count(raw: &Raw) -> Result<u64, TiffError> {
 }
 
 enum Array {
-    Done(Vec<u32>),
+    Done(Vec<u64>),
     Need(ByteRange),
 }
 
@@ -602,34 +767,48 @@ fn read_array(
     held: &Held<'_>,
     entry: Entry,
     expected: u64,
-    order: ByteOrder,
+    layout: Layout,
     allow_short: bool,
 ) -> Result<Array, TiffError> {
+    let order = layout.order;
     let size = match entry.type_size() {
         Some(4) => 4,
+        Some(8) => 8,
         Some(2) if allow_short => 2,
         _ => return Err(TiffError::Malformed("a tile array of the wrong type")),
     };
-    if u64::from(entry.count) != expected {
+    if entry.count != expected {
         return Err(TiffError::Malformed(
             "a tile array whose count differs from the tile count",
         ));
     }
     let count = expected as usize;
-    if expected * size <= 4 {
+    let value = |bytes: &[u8], at: usize| -> Result<u64, TiffError> {
+        match size {
+            2 => Ok(u64::from(read_u16(bytes, at, order)?)),
+            4 => Ok(u64::from(read_u32(bytes, at, order)?)),
+            _ => read_u64(bytes, at, order),
+        }
+    };
+    if expected * size <= layout.inline_len() {
         // Held in the entry itself, left-justified.
         let mut values = Vec::with_capacity(count);
         for i in 0..count {
-            let at = i * size as usize;
-            values.push(match size {
-                2 => u32::from(read_u16(&entry.field, at, order)?),
-                _ => read_u32(&entry.field, at, order)?,
-            });
+            values.push(value(&entry.field, i * size as usize)?);
         }
         return Ok(Array::Done(values));
     }
-    let at = u64::from(order.u32(entry.field));
-    if at < HEADER_LEN {
+    let at = if layout.big {
+        order.u64(entry.field)
+    } else {
+        u64::from(order.u32([
+            entry.field[0],
+            entry.field[1],
+            entry.field[2],
+            entry.field[3],
+        ]))
+    };
+    if at < layout.header_len() {
         return Err(TiffError::Malformed(
             "a tile array starts inside the header",
         ));
@@ -640,11 +819,7 @@ fn read_array(
     };
     let mut values = Vec::with_capacity(count);
     for i in 0..count {
-        let at = i * size as usize;
-        values.push(match size {
-            2 => u32::from(read_u16(bytes, at, order)?),
-            _ => read_u32(bytes, at, order)?,
-        });
+        values.push(value(bytes, i * size as usize)?);
     }
     Ok(Array::Done(values))
 }
@@ -652,7 +827,9 @@ fn read_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{SyntheticTiff, TiffEntry, TiffSpec, encode_tiff, serve_range};
+    use crate::testing::{
+        SyntheticTiff, TiffEntry, TiffSpec, encode_tiff, encode_tiff_u16, serve_range,
+    };
 
     /// A pixel value that differs by level, column and row.
     fn pattern(level: usize, x: u32, y: u32) -> u8 {
@@ -1015,27 +1192,20 @@ mod tests {
                 Err(TiffError::NotTiff)
             );
         }
+        // BigTIFF magic: only the 8 bytes of a classic header are held, so more is asked for.
+        for bytes in [
+            &b"II\x2b\x00\x08\x00\x00\x00"[..],
+            b"MM\x00\x2b\x00\x08\x00\x00",
+        ] {
+            assert_eq!(
+                parse_index(&[Piece { offset: 0, bytes }], None),
+                Ok(Parse::Need(ByteRange {
+                    offset: 0,
+                    len: PREFIX_LEN
+                }))
+            );
+        }
         // The right letters and the wrong magic number.
-        assert_eq!(
-            parse_index(
-                &[Piece {
-                    offset: 0,
-                    bytes: b"II\x2b\x00\x08\x00\x00\x00"
-                }],
-                None
-            ),
-            Err(TiffError::BigTiff)
-        );
-        assert_eq!(
-            parse_index(
-                &[Piece {
-                    offset: 0,
-                    bytes: b"MM\x00\x2b\x00\x00\x00\x08"
-                }],
-                None
-            ),
-            Err(TiffError::BigTiff)
-        );
         assert_eq!(
             parse_index(
                 &[Piece {
@@ -1179,8 +1349,12 @@ mod tests {
             ("LZW", Box::new(|_, e| set(e, 259, 3, &[5]))),
             ("no compression", Box::new(|_, e| set(e, 259, 3, &[1]))),
             ("JPEG", Box::new(|_, e| set(e, 259, 3, &[7]))),
-            ("a predictor", Box::new(|_, e| set(e, 317, 3, &[2]))),
-            ("16 bits", Box::new(|_, e| set(e, 258, 3, &[16]))),
+            (
+                "a floating point predictor",
+                Box::new(|_, e| set(e, 317, 3, &[3])),
+            ),
+            ("32 bits", Box::new(|_, e| set(e, 258, 3, &[32]))),
+            ("12 bits", Box::new(|_, e| set(e, 258, 3, &[12]))),
             ("1 bit", Box::new(|_, e| set(e, 258, 3, &[1]))),
             ("three samples", Box::new(|_, e| set(e, 277, 3, &[3]))),
             ("planar", Box::new(|_, e| set(e, 284, 3, &[2]))),
@@ -1593,5 +1767,420 @@ mod tests {
         });
         let index = parse_all(&sample(&spec).bytes).unwrap();
         assert_eq!(index.levels[0].tile_range(2).unwrap().unwrap().len, 300);
+    }
+
+    // ---- BigTIFF, 16-bit samples and the horizontal predictor (CHELSA's files) ----
+
+    /// A 16-bit value that differs by level, column and row, wraps when differenced, and has some 65535 (the
+    /// nodata of CHELSA) in it.
+    fn pattern16(level: usize, x: u32, y: u32) -> u16 {
+        if (x + 2 * y).is_multiple_of(97) {
+            return 65535;
+        }
+        ((level as u32 * 977 + x * 4001 + y * 17) % 65536) as u16
+    }
+
+    fn chelsa_like(big_endian: bool) -> TiffSpec {
+        let spec = TiffSpec::new(600, 400, 256, 2)
+            .bigtiff()
+            .sixteen_bit()
+            .predictor(2);
+        if big_endian { spec.big_endian() } else { spec }
+    }
+
+    fn sample16(spec: &TiffSpec) -> SyntheticTiff {
+        encode_tiff_u16(spec, &pattern16)
+    }
+
+    /// A level with no tiles of the given sample format, to decode bytes made by hand.
+    fn format_level(bits: u16, predictor: u16, order: ByteOrder, width: u32, height: u32) -> Level {
+        Level {
+            bits_per_sample: bits,
+            predictor,
+            order,
+            header_len: HEADER_LEN_BIG,
+            ..Level::from_parts((width, height), (width, height), Vec::new(), Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_bigtiff_with_16_bit_samples_and_a_predictor_round_trips_in_both_byte_orders() {
+        for big in [false, true] {
+            let file = sample16(&chelsa_like(big));
+            let index = parse_all(&file.bytes).unwrap();
+            assert_eq!(
+                index.order,
+                if big {
+                    ByteOrder::Big
+                } else {
+                    ByteOrder::Little
+                }
+            );
+            let sizes: Vec<_> = index.levels.iter().map(|l| (l.width, l.height)).collect();
+            assert_eq!(sizes, [(600, 400), (300, 200), (150, 100)]);
+            for (lvl, level) in index.levels.iter().enumerate() {
+                assert_eq!((level.bits_per_sample, level.predictor), (16, 2));
+                assert_eq!(level.order, index.order);
+                assert_eq!(level.tile_bytes(), level.tile_pixels() * 2);
+                for row in 0..level.tiles_down() {
+                    for col in 0..level.tiles_across() {
+                        let at = level.tile_index(col, row).unwrap();
+                        let range = level.tile_range(at).unwrap().unwrap();
+                        let bytes = serve_range(&file.bytes, range);
+                        assert_eq!(bytes.len() as u64, range.len);
+                        let got = level.decode_tile_u16(bytes).unwrap();
+                        assert_eq!(got.len(), level.tile_pixels());
+                        for y in 0..level.tile_height {
+                            for x in 0..level.tile_width {
+                                let (px, py) =
+                                    (col * level.tile_width + x, row * level.tile_height + y);
+                                let want = if px < level.width && py < level.height {
+                                    pattern16(lvl, px, py)
+                                } else {
+                                    0
+                                };
+                                assert_eq!(
+                                    got[(y * level.tile_width + x) as usize],
+                                    want,
+                                    "big {big} level {lvl} tile ({col},{row}) pixel ({x},{y})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // Nodata is in the data, and the values did need to wrap.
+            assert!((0..400).any(|y| (0..600).any(|x| pattern16(0, x, y) == 65535)));
+        }
+    }
+
+    #[test]
+    fn a_classic_file_may_have_16_bit_samples_and_an_8_bit_one_a_predictor() {
+        let spec = TiffSpec::new(300, 200, 128, 1).sixteen_bit().predictor(2);
+        let index = parse_all(&sample16(&spec).bytes).unwrap();
+        assert_eq!(index.levels[0].bits_per_sample, 16);
+        assert_eq!(index.levels[0].header_len, HEADER_LEN);
+        let spec = TiffSpec::new(300, 200, 128, 1).predictor(2);
+        let file = sample(&spec);
+        let level = parse_all(&file.bytes).unwrap().levels.remove(0);
+        assert_eq!((level.bits_per_sample, level.predictor), (8, 2));
+        let range = level.tile_range(0).unwrap().unwrap();
+        let pixels = level.decode_tile(serve_range(&file.bytes, range)).unwrap();
+        expect_pixels(&level, 0, 0, 0, &pixels);
+    }
+
+    #[test]
+    fn the_horizontal_predictor_adds_each_sample_to_the_one_before_it_with_wrapping() {
+        // The row [10, 5, 65535] is stored as its differences: 10, 5 - 10 (wraps), 65535 - 5.
+        let stored: [u16; 6] = [10, 65531, 65530, 1, 0, 65535];
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let level = format_level(16, 2, order, 3, 2);
+            let raw: Vec<u8> = stored
+                .iter()
+                .flat_map(|v| match order {
+                    ByteOrder::Little => v.to_le_bytes(),
+                    ByteOrder::Big => v.to_be_bytes(),
+                })
+                .collect();
+            // Each row restarts: the second row is 1, 1 + 0, 1 + 0 + 65535 (wraps to 0).
+            assert_eq!(
+                level.decode_tile_u16(&deflate(&raw)).unwrap(),
+                [10, 5, 65535, 1, 1, 0]
+            );
+            // Without the predictor the same bytes are the values.
+            let plain = format_level(16, 1, order, 3, 2);
+            assert_eq!(plain.decode_tile_u16(&deflate(&raw)).unwrap(), stored);
+        }
+        // 8 bits wrap at 256: [250, 10, 3] is stored as 250, 16, 249.
+        let level = format_level(8, 2, ByteOrder::Little, 3, 1);
+        assert_eq!(
+            level.decode_tile(&deflate(&[250, 16, 249])).unwrap(),
+            [250, 10, 3]
+        );
+    }
+
+    #[test]
+    fn a_bigtiff_index_beyond_the_held_bytes_is_asked_for_then_done() {
+        for big in [false, true] {
+            let file = sample16(&chelsa_like(big));
+            let whole = parse_all(&file.bytes).unwrap();
+            // The header alone: the first directory is asked for, at the offset the header gives (after the
+            // ghost header, not at 16).
+            let header = Piece {
+                offset: 0,
+                bytes: &file.bytes[..16],
+            };
+            let Ok(Parse::Need(first)) = parse_index(&[header], None) else {
+                panic!("a header alone is not enough")
+            };
+            let ifd = {
+                let b: [u8; 8] = file.bytes[8..16].try_into().unwrap();
+                if big {
+                    u64::from_be_bytes(b)
+                } else {
+                    u64::from_le_bytes(b)
+                }
+            };
+            assert!(ifd > 16);
+            assert_eq!(
+                first,
+                ByteRange {
+                    offset: ifd,
+                    len: DIRECTORY_GUESS
+                }
+            );
+            // The first directory held, but not its 6 offsets of 8 bytes.
+            let n = 13u64;
+            let held = Piece {
+                offset: 0,
+                bytes: &file.bytes[..(ifd + 8 + 20 * n + 8) as usize],
+            };
+            let Ok(Parse::Need(array)) = parse_index(&[held], None) else {
+                panic!("the arrays are beyond the bytes held")
+            };
+            assert_eq!(array.len, 48);
+            // Adding the piece that was asked for moves on, and the whole index comes out the same.
+            let got = serve_range(&file.bytes, array);
+            let next = Piece {
+                offset: array.offset,
+                bytes: got,
+            };
+            assert!(!matches!(
+                parse_index(&[held, next], None),
+                Ok(Parse::Need(r)) if r == array
+            ));
+            for first in [
+                16,
+                17,
+                ifd as usize,
+                ifd as usize + 8,
+                300,
+                file.index_len - 1,
+            ] {
+                let (index, rounds) = parse_by_fetching(&file.bytes, first)
+                    .unwrap_or_else(|e| panic!("prefix {first}: {e}"));
+                assert_eq!(index, whole, "prefix {first}");
+                assert!(rounds > 0, "prefix {first}");
+            }
+            let (index, rounds) = parse_by_fetching(&file.bytes, file.index_len).unwrap();
+            assert_eq!((index, rounds), (whole, 0));
+            // A file known to end early is truncated, not endless.
+            let cut = &file.bytes[..file.index_len - 1];
+            assert_eq!(
+                parse_index(
+                    &[Piece {
+                        offset: 0,
+                        bytes: cut
+                    }],
+                    Some(cut.len() as u64)
+                ),
+                Err(TiffError::Truncated)
+            );
+        }
+    }
+
+    #[test]
+    fn sample_formats_the_reader_does_not_read_are_refused_by_name() {
+        let refused = |edit: fn(&mut Vec<TiffEntry>)| {
+            let spec = chelsa_like(false).editing_entries(move |_, e| edit(e));
+            parse_all(&sample16(&spec).bytes)
+        };
+        let name = |r: Result<TiffIndex, TiffError>| match r {
+            Err(TiffError::Unsupported(what)) => what,
+            other => panic!("expected an unsupported file, got {other:?}"),
+        };
+        assert!(name(refused(|e| set(e, 339, 3, &[3]))).contains("unsigned"));
+        assert!(name(refused(|e| set(e, 339, 3, &[2]))).contains("unsigned"));
+        assert!(name(refused(|e| set(e, 317, 3, &[3]))).contains("predictor"));
+        assert!(name(refused(|e| set(e, 258, 3, &[32]))).contains("bits"));
+        assert!(name(refused(|e| set(e, 258, 3, &[1]))).contains("bits"));
+        // The same file with the unsigned format and predictor 2 is read.
+        assert!(refused(|e| set(e, 339, 3, &[1])).is_ok());
+        // Each decode function names what it expects.
+        let sixteen = level_of(&sample16(&chelsa_like(false)));
+        let eight = level_of(&sample(&miniature()));
+        let on_16 = sixteen.decode_tile(&deflate(&vec![0u8; sixteen.tile_bytes()]));
+        assert!(
+            matches!(on_16, Err(TiffError::Unsupported(w)) if w.contains("16-bit")),
+            "{on_16:?}"
+        );
+        let on_8 = eight.decode_tile_u16(&deflate(&vec![0u8; eight.tile_bytes()]));
+        assert!(
+            matches!(on_8, Err(TiffError::Unsupported(w)) if w.contains("8-bit")),
+            "{on_8:?}"
+        );
+    }
+
+    #[test]
+    fn a_16_bit_tile_must_hold_exactly_its_bytes_and_a_bomb_is_refused() {
+        let level = level_of(&sample16(&chelsa_like(false)));
+        let want = level.tile_bytes();
+        assert_eq!(want, 256 * 256 * 2);
+        assert!(level.max_tile_bytes() > 2 * level.tile_pixels() as u64);
+        for len in [want - 2, want + 2, want - 1, 0] {
+            assert!(
+                matches!(
+                    level.decode_tile_u16(&deflate(&vec![9u8; len])),
+                    Err(TiffError::BadTile(_))
+                ),
+                "{len}"
+            );
+        }
+        assert!(level.decode_tile_u16(&deflate(&vec![0u8; want])).is_ok());
+        assert!(matches!(
+            level.decode_tile_u16(&deflate(&vec![0u8; 8 << 20])),
+            Err(TiffError::BadTile(_))
+        ));
+        assert!(matches!(
+            level.decode_tile_u16(&vec![0x55u8; level.max_tile_bytes() as usize + 1]),
+            Err(TiffError::TooLarge(_))
+        ));
+        assert!(matches!(
+            level.decode_tile_u16(&[]),
+            Err(TiffError::BadTile(_))
+        ));
+    }
+
+    fn patch64(bytes: &mut [u8], at: usize, v: u64) {
+        bytes[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// The position of the 20-byte entry with `tag` in the little-endian BigTIFF directory at `ifd`.
+    fn big_entry_at(bytes: &[u8], ifd: usize, tag: u16) -> usize {
+        let n = u64::from_le_bytes(bytes[ifd..ifd + 8].try_into().unwrap()) as usize;
+        (0..n)
+            .map(|i| ifd + 8 + 20 * i)
+            .find(|&at| u16::from_le_bytes([bytes[at], bytes[at + 1]]) == tag)
+            .expect("the tag is in the directory")
+    }
+
+    fn first_ifd(bytes: &[u8]) -> usize {
+        u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize
+    }
+
+    #[test]
+    fn malformed_bigtiffs_are_errors_not_panics() {
+        let file = sample16(&chelsa_like(false)).bytes;
+        let ifd = first_ifd(&file);
+        // A header with 4-byte offsets, or with a reserved field that is not 0.
+        let mut bad = file.clone();
+        bad[4] = 4;
+        assert!(matches!(parse_all(&bad), Err(TiffError::Unsupported(_))));
+        let mut bad = file.clone();
+        bad[6] = 1;
+        assert!(matches!(parse_all(&bad), Err(TiffError::Malformed(_))));
+        // A first directory inside the header, or far past the end.
+        for at in [0u64, 8, 15] {
+            let mut bad = file.clone();
+            patch64(&mut bad, 8, at);
+            assert!(
+                matches!(parse_all(&bad), Err(TiffError::Malformed(_))),
+                "{at}"
+            );
+        }
+        let mut bad = file.clone();
+        patch64(&mut bad, 8, u64::MAX - 3);
+        assert_eq!(parse_all(&bad), Err(TiffError::Truncated));
+        patch64(&mut bad, 8, 1 << 40);
+        assert_eq!(parse_all(&bad), Err(TiffError::Truncated));
+        let Ok(Parse::Need(range)) = parse_index(
+            &[Piece {
+                offset: 0,
+                bytes: &bad,
+            }],
+            None,
+        ) else {
+            panic!("a far directory is fetched")
+        };
+        assert_eq!(range.offset, 1 << 40);
+        // A huge 64-bit entry count is capped before it sizes anything; zero is empty.
+        for count in [u64::MAX, 1 << 40, u64::from(u32::MAX), 257] {
+            let mut bad = file.clone();
+            patch64(&mut bad, ifd, count);
+            assert!(
+                matches!(parse_all(&bad), Err(TiffError::TooLarge(_))),
+                "{count}"
+            );
+        }
+        let mut bad = file.clone();
+        patch64(&mut bad, ifd, 0);
+        assert!(matches!(parse_all(&bad), Err(TiffError::Malformed(_))));
+        // A tile array whose own count lies, points into the header, or points past the end.
+        let at = big_entry_at(&file, ifd, 324);
+        let mut bad = file.clone();
+        patch64(&mut bad, at + 4, u64::MAX);
+        assert!(matches!(parse_all(&bad), Err(TiffError::Malformed(_))));
+        let mut bad = file.clone();
+        patch64(&mut bad, at + 12, 9);
+        assert!(matches!(parse_all(&bad), Err(TiffError::Malformed(_))));
+        for beyond in [file.len() as u64 - 10, 1 << 40, u64::MAX - 20, u64::MAX] {
+            let mut bad = file.clone();
+            patch64(&mut bad, at + 12, beyond);
+            assert_eq!(parse_all(&bad), Err(TiffError::Truncated), "{beyond}");
+        }
+        // A tile offset past 4 GiB is a valid offset in a BigTIFF; a count past the tile cap is refused.
+        let array = u64::from_le_bytes(file[at + 12..at + 20].try_into().unwrap()) as usize;
+        let mut far = file.clone();
+        patch64(&mut far, array + 8, 1 << 40);
+        let level = parse_all(&far).unwrap().levels.remove(0);
+        assert_eq!(level.tile_range(1).unwrap().unwrap().offset, 1 << 40);
+        let counts_at = big_entry_at(&file, ifd, 325);
+        let counts =
+            u64::from_le_bytes(file[counts_at + 12..counts_at + 20].try_into().unwrap()) as usize;
+        let mut huge = file.clone();
+        patch64(&mut huge, counts + 8, u64::MAX);
+        let level = parse_all(&huge).unwrap().levels.remove(0);
+        assert!(matches!(level.tile_range(1), Err(TiffError::TooLarge(_))));
+        let mut inside = file.clone();
+        patch64(&mut inside, array + 8, 15);
+        let level = parse_all(&inside).unwrap().levels.remove(0);
+        assert!(matches!(level.tile_range(1), Err(TiffError::Malformed(_))));
+        // A size stored as LONG8 that does not fit 32 bits.
+        let width = big_entry_at(&file, ifd, 256);
+        let mut bad = file.clone();
+        bad[width + 2..width + 4].copy_from_slice(&16u16.to_le_bytes());
+        patch64(&mut bad, width + 12, 1 << 33);
+        assert!(matches!(parse_all(&bad), Err(TiffError::Malformed(_))));
+        // Directories that loop.
+        let n = u64::from_le_bytes(file[ifd..ifd + 8].try_into().unwrap()) as usize;
+        let mut bad = file.clone();
+        patch64(&mut bad, ifd + 8 + 20 * n, ifd as u64);
+        assert!(matches!(parse_all(&bad), Err(TiffError::Malformed(why)) if why.contains("loop")));
+        // A LONG8 entry in a classic file is not a number the reader knows.
+        let r =
+            parse_all(&sample(&miniature().editing_entries(|_, e| set(e, 256, 16, &[600]))).bytes);
+        assert!(matches!(r, Err(TiffError::Malformed(_))), "{r:?}");
+    }
+
+    #[test]
+    fn damaged_bigtiffs_never_panic() {
+        for big in [false, true] {
+            let file = sample16(&chelsa_like(big));
+            let index = &file.bytes[..file.index_len];
+            for at in 0..index.len() {
+                for flip in [0xffu8, 0x01, 0x80] {
+                    let mut damaged = index.to_vec();
+                    damaged[at] ^= flip;
+                    for len in [None, Some(damaged.len() as u64)] {
+                        let _ = parse_index(
+                            &[Piece {
+                                offset: 0,
+                                bytes: &damaged,
+                            }],
+                            len,
+                        );
+                    }
+                }
+            }
+            for end in 0..index.len() {
+                let _ = parse_index(
+                    &[Piece {
+                        offset: 0,
+                        bytes: &index[..end],
+                    }],
+                    Some(end as u64),
+                );
+            }
+        }
     }
 }

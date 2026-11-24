@@ -9,10 +9,19 @@
 //! ([`landfield`]); [`landsource`] adds the small trait a downloader implements to answer what the store lacks. It
 //! needs no network and no real data.
 //!
+//! Climate (CHELSA V2.1, 1981-2010, CC0) has that shape too: the two bioclimatic files for mean annual
+//! temperature (`bio01`) and annual precipitation (`bio12`) are world-wide 30 arc-second GeoTIFFs, read by byte
+//! ranges, never downloaded whole. [`climate`] has the addressing and the georeference, [`climatefield`] the cache
+//! and the field, [`climatesource`] the fetcher trait. A place gets the temperature in degrees Celsius and the
+//! precipitation in millimetres a year, the bilinear mix of the four nearest pixels, land and sea alike.
+//!
 //! Missing data is never invented: every query that needs a tile the store does not hold says so with `None`.
 #![forbid(unsafe_code)]
 
 pub mod clean;
+pub mod climate;
+pub mod climatefield;
+pub mod climatesource;
 pub mod height;
 pub mod landcover;
 pub mod landfield;
@@ -24,6 +33,9 @@ pub mod testing;
 pub mod tiff;
 pub mod tile;
 
+pub use climate::{CLIMATE_RULES, Climate, ClimateVar};
+pub use climatefield::{ClimateFetch, ClimateField, ClimateGrid, ClimateLookup, ClimateStore};
+pub use climatesource::{ClimateFetcher, ClimateSource};
 pub use height::ElevationField;
 pub use landcover::{LAND_COVER_RULES, LandClass, WorldCoverFile};
 pub use landfield::{Fetch, GeoBox, LandCoverField, LandCoverStore, Lookup, Wanted};

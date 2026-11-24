@@ -135,12 +135,34 @@ impl FileState {
                 bytes,
             })
             .collect();
-        parse_index(&pieces, self.file_len)
+        match parse_index(&pieces, self.file_len)? {
+            Parse::Done(index) => {
+                check_land_cover(&index)?;
+                Ok(Parse::Done(index))
+            }
+            need => Ok(need),
+        }
     }
 
     fn held_bytes(&self) -> usize {
         self.pieces.iter().map(|(_, b)| b.len()).sum()
     }
+}
+
+/// Land cover is 8-bit class codes with no predictor, as WorldCover has them. The TIFF reader also reads other
+/// sample formats (for climate files); a file of those is not land cover and is refused here.
+fn check_land_cover(index: &TiffIndex) -> Result<(), TiffError> {
+    for level in &index.levels {
+        if level.bits_per_sample != 8 {
+            return Err(TiffError::Unsupported(
+                "land cover with anything but 8 bits per sample",
+            ));
+        }
+        if level.predictor != 1 {
+            return Err(TiffError::Unsupported("land cover with a predictor"));
+        }
+    }
+    Ok(())
 }
 
 struct Memory {
@@ -807,7 +829,9 @@ impl LandCoverField {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{SyntheticTiff, TempDir, TiffSpec, encode_tiff, serve_range};
+    use crate::testing::{
+        SyntheticTiff, TempDir, TiffSpec, encode_tiff, encode_tiff_u16, serve_range,
+    };
 
     const CODES: [u8; 12] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100, 0];
 
@@ -1037,12 +1061,29 @@ mod tests {
             store.provide(&index, b"GIF89a, not a TIFF at all"),
             Err(ProvideError::Tiff(TiffError::NotTiff))
         );
-        let mut big_endian_nonsense = file.clone();
-        big_endian_nonsense[..4].copy_from_slice(b"II+\0");
-        assert_eq!(
-            store.provide(&index, &big_endian_nonsense),
-            Err(ProvideError::Tiff(TiffError::BigTiff))
+        // A BigTIFF with 16-bit samples and a predictor (a climate file) is not land cover.
+        let climate = encode_tiff_u16(
+            &TiffSpec::new(600, 600, 256, 2)
+                .bigtiff()
+                .sixteen_bit()
+                .predictor(2),
+            &|_, x, y| (x * 100 + y) as u16,
         );
+        assert!(matches!(
+            store.provide(&index, serve_range(&climate.bytes, index.range)),
+            Err(ProvideError::Tiff(TiffError::Unsupported(_)))
+        ));
+        // So is an 8-bit file with a predictor, or a 16-bit classic one.
+        for spec in [
+            TiffSpec::new(600, 600, 256, 2).predictor(2),
+            TiffSpec::new(600, 600, 256, 2).sixteen_bit(),
+        ] {
+            let other = encode_tiff(&spec, &code);
+            assert!(matches!(
+                store.provide(&index, serve_range(&other.bytes, index.range)),
+                Err(ProvideError::Tiff(TiffError::Unsupported(_)))
+            ));
+        }
         assert!(!store.file_dir(index.file).join("index-0.bin").exists());
         // The store still asks for the same prefix.
         assert_eq!(store.lookup(HERE.0, HERE.1, 100.0), Lookup::Need(index));
