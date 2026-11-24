@@ -63,6 +63,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 mod earth;
+mod refine;
 
 /// Node columns of vanilla far terrain kept per sampler.
 const KEPT_GRIDS: usize = 64;
@@ -107,6 +108,9 @@ pub struct CubicLodSampler {
     /// Custom Cubic's structures, found in the background and drawn into the
     /// nodes they reach (`cubic_far_structures`); shared by every fork.
     structures: Option<Arc<crate::cubic_far_structures::FarStructures>>,
+    /// An Earth world with far trees: its nodes are drawn coarse (without trees) first and made whole
+    /// behind the rest (`refine`, docs/earth.md "Far view"); shared by every fork.
+    refine: Option<Arc<refine::Refine>>,
 }
 
 /// The inputs of the far generator: parameters and the node columns.
@@ -294,6 +298,7 @@ impl CubicLodSampler {
                     id("minecraft:air"),
                 )
             });
+        let refine = earth::two_pass(&level).then(|| Arc::new(refine::Refine::default()));
         Self {
             wg: level.generation().clone(),
             level,
@@ -316,6 +321,7 @@ impl CubicLodSampler {
             far_setup,
             plains: level_plains,
             structures,
+            refine,
         }
     }
 
@@ -816,10 +822,13 @@ fn cover_columns(
 impl CubeSampler for CubicLodSampler {
     fn node(&mut self, key: CubeKey) -> Option<CubeNode> {
         let since = self.cache.as_ref().map_or(0, |c| c.cursor());
+        // Kept nodes are whole (`refine`: a coarse one is never kept).
         if let Some(node) = self.cache.as_ref().and_then(|c| c.get(key)) {
+            self.made_whole(key);
             return Some(node);
         }
         if let Some(node) = self.of_cached_children(key, since) {
+            self.made_whole(key);
             return Some(node);
         }
         if key.level <= 1
@@ -838,8 +847,8 @@ impl CubeSampler for CubicLodSampler {
         }
         let node = self.with_structures(node);
         // The generator is exact outside a Hybrid world's band (and
-        // everywhere in the others).
-        if key.level == 1 && !self.in_band(key) {
+        // everywhere in the others). A coarse node (refined later) is not kept.
+        if key.level == 1 && !self.in_band(key) && !self.is_coarse(key) {
             self.keep(&node, since);
         }
         Some(node)
@@ -987,10 +996,14 @@ impl CubeSampler for CubicLodSampler {
             far_setup: self.far_setup.clone(),
             plains: self.plains,
             structures: self.structures.clone(),
+            refine: self.refine.clone(),
         }))
     }
 
     fn late(&self) -> Option<Arc<dyn crate::lod::cube::LateContent>> {
+        if let Some(refine) = &self.refine {
+            return Some(refine.clone() as Arc<dyn crate::lod::cube::LateContent>);
+        }
         (self.structures.clone()).map(|s| s as Arc<dyn crate::lod::cube::LateContent>)
     }
 }

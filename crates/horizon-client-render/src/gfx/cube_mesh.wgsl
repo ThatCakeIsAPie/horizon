@@ -44,6 +44,27 @@ fn header(state: u32) -> u32 {
 fn is_opaque(state: u32) -> bool {
     return state != params.air && (header(state) & 2u) != 0u;
 }
+// The sky over a cell: 2 open, 1 through foliage (an opaque voxel that lets light
+// through, header bit 12: leaves, snow layers), 0 a roof. The next cell down's sky
+// after `state` (one cell's own sky is what lies over it).
+fn sky_below(sky: u32, state: u32) -> u32 {
+    if !is_opaque(state) {
+        return sky;
+    }
+    if (header(state) & 0x1000u) != 0u {
+        return min(sky, 1u);
+    }
+    return 0u;
+}
+// The sky of cell y in column `col` from the walk's masks (bits 0..15 open, 16..31
+// through foliage).
+fn sky_at(col: u32, y: u32) -> u32 {
+    let m = lit[col];
+    if ((m >> y) & 1u) != 0u {
+        return 2u;
+    }
+    return (m >> (16u + y)) & 1u;
+}
 fn fluid_of(state: u32) -> u32 {
     return (header(state) >> 2u) & 3u;
 }
@@ -80,7 +101,8 @@ fn step_of(dir: u32) -> vec3<i32> {
 }
 
 // The key of the face the voxel at p shows in direction dir, overlay o; 0: none.
-// bit 0 valid, bit 1 shaded, bits 2..18 state, bits 19..26 biome (tinted faces only).
+// bit 0 valid, bit 1 shaded, bits 2..18 state, bits 19..26 biome (tinted faces only),
+// bit 27 dim (its sky comes through foliage).
 fn cell_key(base: u32, slot: u32, dir: u32, o: u32, p: vec3<u32>) -> u32 {
     let own = state_at(slot, p.x, p.y, p.z);
     if own == params.air {
@@ -129,9 +151,9 @@ fn cell_key(base: u32, slot: u32, dir: u32, o: u32, p: vec3<u32>) -> u32 {
     // is in the sun when the air beside it sees the sky, not only its top voxel. A top
     // on the node's top takes its own column's light there: open unless the column is
     // covered above the node.
-    var front = (lit[col] >> 15u) & 1u;
+    var front = sky_at(col, 15u);
     if inside {
-        front = (lit[(u32(q.z) << 4u) | u32(q.x)] >> u32(q.y)) & 1u;
+        front = sky_at((u32(q.z) << 4u) | u32(q.x), u32(q.y));
     } else if dir == 0u {
         // The underside at the node's bottom: shaded, as under an overhang.
         front = 0u;
@@ -141,24 +163,22 @@ fn cell_key(base: u32, slot: u32, dir: u32, o: u32, p: vec3<u32>) -> u32 {
         // node by node). Open from the neighbour's top down to the cell in front where
         // the neighbour is known (what covers it above that node is not), else open:
         // a wall on a node's side mostly faces out, as a cliff's does.
-        front = 1u;
+        front = 2u;
         let neighbour = jobs[base + 4u + dir];
         if neighbour != NONE {
             let w = vec3<u32>(q & vec3<i32>(15));
-            for (var y = 15u; y > w.y; y--) {
-                if is_opaque(state_at(neighbour, w.x, y, w.z)) {
-                    front = 0u;
-                    break;
-                }
+            for (var y = 15u; y > w.y && front != 0u; y--) {
+                front = sky_below(front, state_at(neighbour, w.x, y, w.z));
             }
         }
     }
-    let shaded = 1u - front;
+    let shaded = select(0u, 1u, front == 0u);
+    let dim = select(0u, 1u, front == 1u);
     var biome = 0u;
     if ((fw >> 16u) & 7u) != 0u {
         biome = min(pool[slot * SLOT_WORDS + BIOMES + col] & 255u, 255u);
     }
-    return 1u | (shaded << 1u) | (own << 2u) | (biome << 19u);
+    return 1u | (shaded << 1u) | (own << 2u) | (biome << 19u) | (dim << 27u);
 }
 
 fn key_at(o: u32, a: u32, b: u32) -> u32 {
@@ -185,19 +205,19 @@ fn mesh_group(group: u32, lid: u32, emit: bool) {
     let has_cover = (jobs[base + 2u] & 1u) != 0u;
     let skipped = emit && offsets[job * 12u + dir * 2u] == NONE;
 
-    // Sky light of this thread's column: open from the top unless covered.
-    var open = true;
-    if has_cover {
-        open = ((jobs[base + 12u + (lid >> 5u)] >> (lid & 31u)) & 1u) == 0u;
+    // Sky light of this thread's column: open from the top unless covered; foliage
+    // (leaves, snow layers) dims it, a roof ends it.
+    var sky = 2u;
+    if has_cover && ((jobs[base + 12u + (lid >> 5u)] >> (lid & 31u)) & 1u) != 0u {
+        sky = 0u;
     }
     var mask = 0u;
     for (var y = 15; y >= 0; y--) {
-        if open {
-            mask |= 1u << u32(y);
-            if is_opaque(state_at(slot, lid & 15u, u32(y), lid >> 4u)) {
-                open = false;
-            }
+        if sky == 0u {
+            break;
         }
+        mask |= 1u << (u32(y) + select(16u, 0u, sky == 2u));
+        sky = sky_below(sky, state_at(slot, lid & 15u, u32(y), lid >> 4u));
     }
     lit[lid] = mask;
     if lid < 2u {
@@ -234,7 +254,7 @@ fn mesh_group(group: u32, lid: u32, emit: bool) {
                     if emit && !skipped {
                         let w0 = p.x | (p.y << 4u) | (p.z << 8u) | ((len - 1u) << 12u)
                             | ((h - 1u) << 16u) | (dir << 20u) | (((k >> 1u) & 1u) << 23u)
-                            | (o << 24u);
+                            | (o << 24u) | (((k >> 27u) & 1u) << 25u);
                         let w1 = state | (((k >> 19u) & 255u) << 17u);
                         quads[offsets[job * 12u + dir * 2u + translucent] + n] = vec2<u32>(w0, w1);
                     }

@@ -17,6 +17,7 @@
 //! generator to have the tile fetched ([`EarthGenerator::request_tiles`], taken by the prefetcher) and answers
 //! "later" (`None`); a node is never built, drawn or kept without its data.
 
+use super::refine::Pass;
 use super::*;
 use horizon_world::cubic::earth::far_trees::FarDecor;
 use horizon_world::cubic::earth::{EarthGenerator, Fill, NotReady};
@@ -49,6 +50,17 @@ fn log_stats() {
         n(&BUILT[2]),
         n(&LATER),
     );
+}
+
+/// Whether the far view of `level` is made in two passes, coarse first and whole later (an Earth world with
+/// far trees; `HORIZON_FAR_TWO_PASS=0` turns it off to compare).
+pub(super) fn two_pass(level: &CubicLevel) -> bool {
+    let g = level.generation();
+    g.kind == CubicKind::Earth
+        && g.earth
+            .as_ref()
+            .is_some_and(|p| p.settings.land_cover && p.settings.vegetation)
+        && crate::lod::cube::far_knob("HORIZON_FAR_TWO_PASS", 1) != 0
 }
 
 /// The class of node `key` from the elevation bounds alone (and, with trees, the height they reach): air and
@@ -246,14 +258,47 @@ impl CubicLodSampler {
     }
 
     /// Node `key` of an Earth world without its sky cover; `None` (later) while a tile it reads is missing.
+    /// With two passes ([`two_pass`]) a node is made coarse first, without its trees (as fast as the far view
+    /// was before them), and whole when [`super::refine::Refine`] hands it out behind the rest.
     pub(super) fn earth_plain(&mut self, key: CubeKey) -> Option<CubeNode> {
         let generator = self.wg.generator.clone();
         let earth = generator.earth_generator()?;
         let level = self.level.clone();
         let biome = |x: i32, z: i32| level.biome_id_at(x, z);
-        let made = node(earth, key, self.air, &biome, &|s| self.kind(s), self.far_decor());
+        let decor = self.far_decor();
+        let pass = match &self.refine {
+            Some(refine) if decor.trees => refine.pass(key),
+            _ => Pass::Whole,
+        };
+        let made_with = match pass {
+            Pass::Coarse => FarDecor {
+                trees: false,
+                ..decor
+            },
+            Pass::Whole => decor,
+        };
+        let made = node(earth, key, self.air, &biome, &|s| self.kind(s), made_with);
+        if decor.trees
+            && let Some(refine) = &self.refine
+        {
+            refine.made(key, pass == Pass::Whole, made.is_ok());
+        }
         log_stats();
         self.or_request(made)
+    }
+
+    /// Node `key` was read whole from the far cache.
+    pub(super) fn made_whole(&self, key: CubeKey) {
+        if let Some(refine) = &self.refine {
+            refine.made(key, true, true);
+        }
+    }
+
+    /// Whether node `key` was last made coarse (it is refined later, and not kept meanwhile).
+    pub(super) fn is_coarse(&self, key: CubeKey) -> bool {
+        self.is_earth()
+            && self.far_decor().trees
+            && self.refine.as_ref().is_some_and(|r| r.pass(key) == Pass::Coarse)
     }
 
     /// `node` (Earth's, of `key`) with its sky cover, or `None` (later) when the tiles it reads are missing. A

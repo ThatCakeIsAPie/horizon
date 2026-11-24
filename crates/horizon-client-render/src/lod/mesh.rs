@@ -874,39 +874,72 @@ pub(super) fn mesh_cube(
     context: &WorkerContext,
     out: &mut SectionMesh,
 ) {
+    let through = |state| lets_sky_through(context, state);
     match mesher.looks != 0 {
         false => {
             let material = |s: &Span, d, at| mesher.material(s, d, at, context);
-            mesh_voxels::<()>(node, air, sea_surface, material, out);
+            mesh_voxels::<()>(node, air, sea_surface, material, through, out);
         }
         true => {
             let material = |s: &Span, d, at| mesher.material(s, d, at, context);
-            mesh_voxels::<[u32; 2]>(node, air, sea_surface, material, out);
+            mesh_voxels::<[u32; 2]>(node, air, sea_surface, material, through, out);
         }
     }
 }
 
+/// Whether an opaque far voxel of `state` lets the sky through to what lies under it, dimmed:
+/// a block light passes (`light_permeable`: not a solid render, or no dampening), as leaves and
+/// snow layers. Far terrain has no light propagation, so without this a far tree's canopy was
+/// a roof and the ground under it was drawn at sky light 4, near black (Lyle, 2026-11-24).
+pub(crate) fn lets_sky_through(context: &WorkerContext, state: BlockStateId) -> bool {
+    context
+        .tables
+        .facts(state)
+        .is_some_and(|f| f.light_permeable)
+}
+
 /// A voxel in the sun: sky light 15.
 const SUNLIT: u16 = 240;
+/// A voxel whose sky comes through foliage (leaves, snow layers): sky light 13, about what the
+/// ground under near trees gets once light spreads in from the sides.
+const UNDER_FOLIAGE: u16 = 13 << 4;
 /// A voxel with a roof over it, in the node or above it: sky light 4. Far
 /// terrain has no light propagation, so this stands for the dark under an
 /// overhang (an island over the sea, a cliff) without lighting its inside.
 const SHADED: u16 = 4 << 4;
 
-/// Which voxels see the sky: no opaque voxel above them in the node, and the
-/// node's column not covered above it (`CubeNode::column_covered`).
-fn sky_lit(node: &CubeNode, mut opaque: impl FnMut(Voxel) -> bool) -> Box<[bool; VOLUME]> {
-    let mut lit = Box::new([true; VOLUME]);
+/// What a voxel does to the sky over what lies under it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Roof {
+    None,
+    /// Opaque, but light passes (leaves, snow layers): dims the sky.
+    Foliage,
+    Solid,
+}
+
+/// Each voxel's sky light: [`SUNLIT`] with nothing over it in the node and the node's column
+/// not covered above it (`CubeNode::column_covered`), [`UNDER_FOLIAGE`] with only foliage over
+/// it, else [`SHADED`].
+fn sky_lit(node: &CubeNode, mut roof: impl FnMut(Voxel) -> Roof) -> Box<[u16; VOLUME]> {
+    let mut lit = Box::new([SUNLIT; VOLUME]);
     if node.covered_mask().is_none() && node.as_uniform().is_some() {
         return lit;
     }
     for z in 0..CUBE_SIDE {
         for x in 0..CUBE_SIDE {
-            let mut open = !node.column_covered(x, z);
+            let mut sky = if node.column_covered(x, z) {
+                SHADED
+            } else {
+                SUNLIT
+            };
             for y in (0..CUBE_SIDE).rev() {
-                lit[CubeNode::index(x, y, z)] = open;
-                if open && opaque(node.get(x, y, z)) {
-                    open = false;
+                lit[CubeNode::index(x, y, z)] = sky;
+                if sky != SHADED {
+                    match roof(node.get(x, y, z)) {
+                        Roof::None => {}
+                        Roof::Foliage => sky = UNDER_FOLIAGE,
+                        Roof::Solid => sky = SHADED,
+                    }
                 }
             }
         }
@@ -919,6 +952,7 @@ fn mesh_voxels<L: Look>(
     air: BlockStateId,
     sea_surface: Option<i32>,
     mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
+    lets_sky_through: impl Fn(BlockStateId) -> bool,
     out: &mut SectionMesh,
 ) {
     if node.as_uniform().is_some_and(|v| v.state == air) {
@@ -943,15 +977,20 @@ fn mesh_voxels<L: Look>(
     let lit = sky_lit(node, |voxel| {
         // Air never roofs anything, whatever the material lookup says of it.
         if voxel.state == air {
-            return false;
+            return Roof::None;
         }
-        hiding
+        let opaque = hiding
             .entry(voxel.state.0)
             .or_insert_with(|| {
                 let m = material(&span(voxel, SUNLIT), Direction::Up, [0, 0]);
                 (m.opaque, m.fluid)
             })
-            .0
+            .0;
+        match (opaque, lets_sky_through(voxel.state)) {
+            (false, _) => Roof::None,
+            (true, true) => Roof::Foliage,
+            (true, false) => Roof::Solid,
+        }
     });
     let mut faces = Faces::new();
     const SIDES: [(Direction, [i32; 3]); 6] = [
@@ -969,14 +1008,7 @@ fn mesh_voxels<L: Look>(
                 if voxel.state == air {
                     continue;
                 }
-                let own = span(
-                    voxel,
-                    if lit[CubeNode::index(x, y, z)] {
-                        SUNLIT
-                    } else {
-                        SHADED
-                    },
-                );
+                let own = span(voxel, lit[CubeNode::index(x, y, z)]);
                 let at = [ox + x as i32 * scale as i32, oz + z as i32 * scale as i32];
                 for (direction, [dx, dy, dz]) in SIDES {
                     let (nx, ny, nz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
@@ -1055,16 +1087,16 @@ fn mesh_voxels<L: Look>(
                     // overhang. A wall there faces air this node does not hold
                     // (its own column says nothing of it: a cliff rising past
                     // the node has rock over it): in the sun, as a cliff's.
-                    let front_lit = if inside {
+                    let front = if inside {
                         lit[CubeNode::index(nx as usize, ny as usize, nz as usize)]
                     } else {
                         match direction {
-                            Direction::Down => false,
-                            Direction::Up => !node.column_covered(x, z),
-                            _ => true,
+                            Direction::Down => SHADED,
+                            Direction::Up if node.column_covered(x, z) => SHADED,
+                            _ => SUNLIT,
                         }
                     };
-                    let face = span(voxel, if front_lit { SUNLIT } else { SHADED });
+                    let face = span(voxel, front);
                     add_face(
                         &mut faces,
                         direction,
@@ -2555,6 +2587,9 @@ mod cube_tests {
     fn voxel(state: BlockStateId) -> Voxel {
         Voxel { state, biome: 0 }
     }
+    fn no_foliage(_: BlockStateId) -> bool {
+        false
+    }
     /// A node of `level` with the voxels `put` lists, the rest air.
     fn node(level: u8, put: &[([usize; 3], BlockStateId)]) -> CubeNode {
         CubeNode::from_fn(CubeKey::new(level, 0, 0, 0), |x, y, z| {
@@ -2567,7 +2602,7 @@ mod cube_tests {
     }
     fn mesh(node: &CubeNode) -> SectionMesh {
         let mut mesh = SectionMesh::default();
-        mesh_voxels(node, AIR, None, material, &mut mesh);
+        mesh_voxels(node, AIR, None, material, no_foliage, &mut mesh);
         mesh
     }
     fn quads(vertices: &[TerrainVertex]) -> Vec<[TerrainVertex; 4]> {
@@ -2725,7 +2760,7 @@ mod cube_tests {
             })
         });
         let mut mesh = SectionMesh::default();
-        mesh_voxels(&node, AIR, Some(64), material, &mut mesh);
+        mesh_voxels(&node, AIR, Some(64), material, no_foliage, &mut mesh);
         let water = quads(&mesh.translucent);
         assert!(!water.is_empty());
         let top = water
@@ -2744,7 +2779,7 @@ mod cube_tests {
             voxel(if y == 0 && x < 8 { WATER } else { AIR })
         });
         let mut mesh = SectionMesh::default();
-        mesh_voxels(&lake, AIR, Some(64), material, &mut mesh);
+        mesh_voxels(&lake, AIR, Some(64), material, no_foliage, &mut mesh);
         let top = quads(&mesh.translucent)
             .iter()
             .flat_map(|q| q.iter().map(|v| v.pos[1]))
@@ -2759,7 +2794,7 @@ mod cube_tests {
         // edge, where a fluid's faces are left out, but these are the sea's.
         let sea = CubeNode::from_fn(CubeKey::new(2, 0, 0, 0), |_, _, _| voxel(WATER));
         let mut mesh = SectionMesh::default();
-        mesh_voxels(&sea, AIR, Some(64), material, &mut mesh);
+        mesh_voxels(&sea, AIR, Some(64), material, no_foliage, &mut mesh);
         let water = quads(&mesh.translucent);
         assert!(!water.is_empty(), "the surface is drawn");
         assert!(
@@ -2770,7 +2805,7 @@ mod cube_tests {
         for (key, sea_surface) in [(CubeKey::new(2, 0, -1, 0), Some(64)), (CubeKey::new(2, 0, 0, 0), None)] {
             let deep = CubeNode::from_fn(key, |_, _, _| voxel(WATER));
             let mut mesh = SectionMesh::default();
-            mesh_voxels(&deep, AIR, sea_surface, material, &mut mesh);
+            mesh_voxels(&deep, AIR, sea_surface, material, no_foliage, &mut mesh);
             assert!(mesh.translucent.is_empty(), "{key:?}");
         }
     }
@@ -2820,6 +2855,47 @@ mod cube_tests {
         // The roof's own top is in the sun.
         let roof = lights_at(&mesh, 1, 9.0);
         assert!(!roof.is_empty() && roof.iter().all(|r| r.0 == 240));
+    }
+
+    #[test]
+    fn ground_under_foliage_is_dimmed_not_dark() {
+        // A floor, a canopy of leaves (opaque, but light passes) over its western half and a
+        // stone roof over its eastern quarter: under the leaves the floor takes sky light 13,
+        // as near ground under trees, not the overhang's 4 (the far trees' black shadows).
+        const LEAVES: BlockStateId = BlockStateId(4);
+        let node = CubeNode::from_fn(CubeKey::new(0, 0, 0, 0), |x, y, _| {
+            voxel(if y == 0 {
+                STONE
+            } else if (y == 6 || y == 7) && x < 8 {
+                LEAVES
+            } else if y == 10 && x >= 12 {
+                STONE
+            } else {
+                AIR
+            })
+        });
+        let mut mesh = SectionMesh::default();
+        mesh_voxels(&node, AIR, None, material, |s| s == LEAVES, &mut mesh);
+        let floor = lights_at(&mesh, 1, 1.0);
+        assert_eq!(floor.len(), 3, "{floor:?}");
+        for (light, lo, hi) in floor {
+            let expected = if hi[0] <= 8.0 {
+                UNDER_FOLIAGE
+            } else if lo[0] >= 12.0 {
+                SHADED
+            } else {
+                SUNLIT
+            };
+            assert_eq!(light, expected, "{lo:?} {hi:?}");
+        }
+        // The canopy's own top is in the sun, its underside under it is dimmed.
+        let top = lights_at(&mesh, 1, 8.0);
+        assert!(!top.is_empty() && top.iter().all(|r| r.0 == SUNLIT), "{top:?}");
+        // With leaves a roof (the rule before), the floor under them is the overhang's dark.
+        let mut mesh = SectionMesh::default();
+        mesh_voxels(&node, AIR, None, material, no_foliage, &mut mesh);
+        let floor = lights_at(&mesh, 1, 1.0);
+        assert!(floor.iter().any(|f| f.0 == SHADED && f.2[0] <= 8.0), "{floor:?}");
     }
 
     #[test]

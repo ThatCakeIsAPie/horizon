@@ -13,7 +13,8 @@
 //!                            (`horizon_assets::model::Direction` order)
 //!          bit  23     shaded   sky light 4 (a roof over it), else 15
 //!          bits 24     overlay  which of the block face's two textures
-//!          bits 25..31 spare
+//!          bit  25     dim      sky light 13 (its sky comes through foliage)
+//!          bits 26..31 spare
 //! word 1   bits 0..16  block state id
 //!          bits 17..24 biome id (0 for faces with no biome tint)
 //!          bits 25..31 spare
@@ -29,7 +30,8 @@
 //! # Material table
 //!
 //! A storage buffer of [`MATERIAL_STRIDE`] words per block state id: word 0 the
-//! header (bit 0 known, bit 1 opaque, bits 2..3 fluid, bits 4..11 HDR tier),
+//! header (bit 0 known, bit 1 opaque, bits 2..3 fluid, bits 4..11 HDR tier, bit 12
+//! lets the sky through: an opaque voxel light passes, as leaves and snow layers),
 //! then per face slot `dir * 2 + overlay` two words: `layer | tint << 16 |
 //! translucent << 19 | present << 20` and the constant tint colour. It is built
 //! from `lod::mesh::far_style`, the lookup the CPU mesher uses.
@@ -85,6 +87,8 @@ pub struct Quad {
     pub dir: u8,
     pub shaded: bool,
     pub overlay: u8,
+    /// Its sky comes through foliage (sky light 13).
+    pub dim: bool,
     pub state: u32,
     pub biome: u8,
 }
@@ -102,7 +106,8 @@ impl Quad {
                 | u32::from(self.h - 1) << 16
                 | u32::from(self.dir) << 20
                 | u32::from(self.shaded) << 23
-                | u32::from(self.overlay) << 24,
+                | u32::from(self.overlay) << 24
+                | u32::from(self.dim) << 25,
             self.state | u32::from(self.biome) << 17,
         ]
     }
@@ -117,6 +122,7 @@ impl Quad {
             dir: (a >> 20 & 7) as u8,
             shaded: a >> 23 & 1 == 1,
             overlay: (a >> 24 & 1) as u8,
+            dim: a >> 25 & 1 == 1,
             state: b & MAX_STATE,
             biome: (b >> 17 & 255) as u8,
         }
@@ -187,8 +193,13 @@ pub fn material_record(context: &WorkerContext, state: u32) -> [u32; MATERIAL_ST
     let id = BlockStateId(state);
     let styles: [Styles; 6] =
         std::array::from_fn(|d| mesh::far_style(context, id, Direction::ALL[d]));
-    encode_styles(&styles, context.tables.hdr_tier(id))
+    let mut record = encode_styles(&styles, context.tables.hdr_tier(id));
+    record[0] |= u32::from(mesh::lets_sky_through(context, id)) << SKY_THROUGH_BIT;
+    record
 }
+
+/// The header bit of a state that lets the sky through (`mesh::lets_sky_through`).
+pub(crate) const SKY_THROUGH_BIT: u32 = 12;
 
 /// Per biome id, four words: grass, foliage, dry foliage and water colours.
 /// Grass takes the colour at the origin: the swamp's noise variation across a
@@ -763,6 +774,7 @@ pub fn uniform_quads(
                 dir: dir as u8,
                 shaded: false,
                 overlay: overlay as u8,
+                dim: false,
                 state,
                 biome: if face.tint == Tint::None { 0 } else { biome },
             }
@@ -860,6 +872,7 @@ mod tests {
                     dir,
                     shaded: dir % 2 == 1,
                     overlay: dir % 2,
+                    dim: dir % 3 == 0,
                     state: MAX_STATE - u32::from(dir),
                     biome: 255 - dir,
                 };
@@ -876,10 +889,12 @@ mod tests {
             dir: 0,
             shaded: false,
             overlay: 0,
+            dim: false,
             state: 0,
             biome: 0,
         };
         assert_eq!(base.pack(), [0, 0]);
+        assert_eq!(Quad { dim: true, ..base }.pack()[0], 1 << 25);
         assert_eq!(Quad { dir: 5, ..base }.pack()[0], 5 << 20);
         assert_eq!(Quad { biome: 1, ..base }.pack()[1], 1 << 17);
     }

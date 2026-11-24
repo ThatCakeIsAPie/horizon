@@ -51,8 +51,9 @@
 //! biomes already follow the real temperature at the real height. At level 0 a snow layer lies on the air
 //! over the top block of a cold column (ground or a tree; not over snow blocks, ice or water), a grass block
 //! under it is snowy, and the top block of cold water is ice. At levels 2 and up the top voxel of a cold column
-//! is a snow block, the top water voxel ice, and the top voxel of a canopy is a snow block on one column in two
-//! (speckled white and green, like snowy spruce from afar).
+//! is a snow block, the top water voxel ice, and the top voxel of a canopy is a snow layer on one column in two
+//! (speckled white and green, like snowy spruce from afar). A layer, not a block: light passes it as it passes
+//! leaves, so the far view's sky light keeps the ground under the canopy lit (a snow block roofed it black).
 //!
 //! Trees reach up to [`MAX_TREE_UP`] blocks over the ground, so a node is called air only from there on
 //! ([`EarthGenerator::classify_node_above`]).
@@ -71,6 +72,9 @@ use crate::registry::BlockRegistry;
 
 /// Blocks over the ground the highest tree block (and the snow on it) can be: the tallest tree is 28 blocks.
 pub const MAX_TREE_UP: i32 = 32;
+/// The version of the far view's trees. It is in the terrain key while vegetation is on (`#fartrees<N>`), so far
+/// caches made by older rules are rebuilt. 2: a cold canopy's top is a snow layer, not a snow block.
+pub const FAR_TREE_RULES: u32 = 2;
 /// The widest canopy radius.
 pub const MAX_RADIUS: i32 = 3;
 /// A canopy cover at or over this makes a column leaves at the steps from [`SOLID_FROM_STEP`].
@@ -347,7 +351,7 @@ struct ColDecor {
     wet: bool,
     /// The lowest block of the column's top voxel.
     top_lo: i32,
-    /// A cold canopy's top voxel is a snow block, not leaves.
+    /// A cold canopy's top voxel is a snow layer, not leaves.
     white: bool,
 }
 
@@ -660,7 +664,9 @@ impl EarthGenerator {
             block = if c.wet {
                 b.far.ice
             } else if block == c.leaves && c.white {
-                b.snow_block
+                // A snow layer, not a block: light passes it as it passes the leaves, so the
+                // far view's sky light keeps the ground under the canopy lit.
+                b.far.snow
             } else if block == c.leaves {
                 block
             } else {
