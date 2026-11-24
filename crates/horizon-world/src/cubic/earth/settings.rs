@@ -56,6 +56,12 @@ pub struct EarthSettings {
     /// and left out of the file while off, so an older world keeps its biomes, its text and its cache key.
     #[serde(default, skip_serializing_if = "is_false")]
     pub climate: bool,
+    /// Cubic's ores, stone patches, deepslate and ore meteors
+    /// ([`crate::cubic::ores`]). Left out of an older world's file, which then
+    /// has none (its text and cache key unchanged); `at` leaves it out too
+    /// (the client gives new worlds [`crate::cubic::ores::OreGenSettings::earth_defaults`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ore_gen: Option<crate::cubic::ores::OreGenSettings>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -90,6 +96,7 @@ impl EarthSettings {
             land_cover: false,
             vegetation: false,
             climate: false,
+            ore_gen: None,
         }
     }
 
@@ -299,6 +306,7 @@ mod tests {
             land_cover: true,
             vegetation: true,
             climate: true,
+            ore_gen: None,
         };
         for text in [s.to_json_pretty(), s.to_json_compact()] {
             assert_eq!(EarthSettings::from_json(&text).unwrap(), s);

@@ -1635,6 +1635,13 @@ pub struct CustomGeneratorSettings {
     pub noise_sample_size_z: i32,
     pub cube_areas: Vec<CubeArea>,
     pub version: i32,
+    /// Horizon extension (`oreGen`): Cubic's two-tier ores and the ore
+    /// meteors ([`crate::cubic::ores`]). Left out (an older preset), the
+    /// `standardOres` and `periodicGaussianOres` generate as they always
+    /// did, with no background and no meteors. When present, those two lists
+    /// still generate first (as extra CWG ores); new presets leave them empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ore_gen: Option<crate::cubic::ores::OreGenSettings>,
 }
 
 /// `ConversionUtils.VANILLA_DEPTH_NOISE_FACTOR`: `1024 / 125 / 8`.
@@ -1708,6 +1715,7 @@ impl Default for CustomGeneratorSettings {
             noise_sample_size_z: 4,
             cube_areas: Vec::new(),
             version: LATEST_VERSION,
+            ore_gen: None,
         }
     }
 }

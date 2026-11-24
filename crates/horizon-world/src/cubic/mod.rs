@@ -13,6 +13,7 @@ use horizon_core::position::SectionPos;
 pub mod custom;
 pub mod earth;
 pub mod heights;
+pub mod ores;
 pub mod store;
 pub mod window;
 
