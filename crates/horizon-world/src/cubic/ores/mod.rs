@@ -7,6 +7,9 @@ pub mod defaults;
 pub mod meteors;
 pub mod settings;
 
+#[cfg(test)]
+mod meteor_tests;
+
 pub use settings::{
     Background, MeteorKind, MeteorSettings, ORE_GEN_VERSION, OreEntry, OreGenSettings, RangeMode,
     RichMode, RichZone, Shape,
