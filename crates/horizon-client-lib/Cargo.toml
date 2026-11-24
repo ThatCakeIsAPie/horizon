@@ -205,6 +205,10 @@ name = "model_states_bench"
 path = "../horizon-client/examples/model_states_bench.rs"
 
 [[example]]
+name = "ore_counts"
+path = "../horizon-client/examples/ore_counts.rs"
+
+[[example]]
 name = "old_world_fixture"
 path = "../horizon-client/examples/old_world_fixture.rs"
 
