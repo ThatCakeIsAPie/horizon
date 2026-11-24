@@ -119,6 +119,13 @@ pub trait Hooks: Sync {
         None
     }
 
+    /// The address of the climate files (CHELSA V2.1 bioclim) Earth worlds with climate on download from: the
+    /// folder (ending in `/`) the dataset's paths (`bio01/1981-2010/...`) hang from. Like the land cover
+    /// address, contacted only once the player approved its host. Without one the biomes ignore the climate.
+    fn earth_climate_address(&self) -> Option<&'static str> {
+        None
+    }
+
     /// What the player is doing, for a status shown outside the game (Discord's): called when it
     /// changes, not every frame. Splitscreen: the first player's only.
     fn activity(&self, _now: Activity) {}
@@ -331,6 +338,11 @@ pub mod engine {
     /// [`Hooks::earth_land_cover_address`]: the first hook that offers one.
     pub fn earth_land_cover_address() -> Option<&'static str> {
         all().iter().find_map(|h| h.earth_land_cover_address())
+    }
+
+    /// [`Hooks::earth_climate_address`]: the first hook that offers one.
+    pub fn earth_climate_address() -> Option<&'static str> {
+        all().iter().find_map(|h| h.earth_climate_address())
     }
 
     /// [`Hooks::shutdown`].

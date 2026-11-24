@@ -368,6 +368,9 @@ impl<T> Resident<T> {
         let bounds = std::mem::take(&mut self.bounds);
         let marked = std::mem::take(&mut self.marked);
         self.slots.clear();
+        // The headers and marks go with the columns: left behind, the walk would read a column per old header.
+        self.column_headers.clear();
+        self.column_marked_bits.clear();
         self.columns.clear();
         self.column_index.clear();
         let mut removed = Vec::new();
@@ -1408,5 +1411,7 @@ mod tests {
         assert_eq!(r.remove((4, 1, -3)), Some(2));
         // Left: 5 at (4, 4, -3) and 100 at (9, 2, 9).
         assert_eq!(r.len(), 2);
+        // One header per column after the moves: the walk reads a column for each.
+        assert_eq!(r.column_headers.len(), r.columns.len());
     }
 }

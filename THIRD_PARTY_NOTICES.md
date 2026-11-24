@@ -472,4 +472,18 @@ in Earth's settings ("Data credits..."):
 
 Citation: Zanaga, D. et al. (2022). ESA WorldCover 10 m 2021 v200. <https://doi.org/10.5281/zenodo.7254221>
 
+## Climate data for Earth worlds
+
+Earth worlds with climate on read **CHELSA V2.1** (Climatologies at high resolution for the earth's land surface
+areas), the 1981-2010 bioclim layers bio01 (mean annual air temperature) and bio12 (annual precipitation), released
+under CC0 1.0 (<https://creativecommons.org/publicdomain/zero/1.0/>, <https://chelsa-climate.org/license/>) and served
+as cloud-optimised GeoTIFFs from `os.unil.cloud.switch.ch`. Horizon does not ship the data: the game downloads the
+parts it needs, by byte range, on the player's say-so, from a server the player approved. CHELSA asks to be cited;
+the game shows this in Earth's settings ("Data credits..."):
+
+Citation: Karger, D.N., Conrad, O., Böhner, J., Kawohl, T., Kreft, H., Soria-Auza, R.W., Zimmermann, N.E., Linder,
+H.P., Kessler, M. (2017). Climatologies at high resolution for the earth's land surface areas. Scientific Data 4,
+170122. <https://doi.org/10.1038/sdata.2017.122>. Data: Karger, D.N. et al. (2021) CHELSA V2.1, EnviDat,
+<https://doi.org/10.16904/envidat.228.v2.1>
+
 Earth is inspired by the Terrarium mod by gegy; it shares no code with it.

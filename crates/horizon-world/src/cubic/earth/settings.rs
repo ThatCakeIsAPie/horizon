@@ -50,6 +50,12 @@ pub struct EarthSettings {
     /// file while off, so an older world keeps its text and its cache key.
     #[serde(default, skip_serializing_if = "is_false")]
     pub vegetation: bool,
+    /// Whether the biomes follow the real climate (CHELSA mean annual temperature and precipitation) where the
+    /// generator is given a source of it ([`crate::cubic::earth::EarthGenerator::with_climate`]). Like
+    /// `vegetation` it needs `landCover`; off by default, in `at` too (the client turns it on for new worlds),
+    /// and left out of the file while off, so an older world keeps its biomes, its text and its cache key.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub climate: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -83,6 +89,7 @@ impl EarthSettings {
             structures: false,
             land_cover: false,
             vegetation: false,
+            climate: false,
         }
     }
 
@@ -170,6 +177,26 @@ impl EarthSettings {
         )))
     }
 
+    /// The climate these settings describe over `store`, filled by `fetcher`: the same projection as the
+    /// elevation and the land cover.
+    pub fn climate_source(
+        &self,
+        store: std::sync::Arc<horizon_earth::ClimateStore>,
+        fetcher: std::sync::Arc<dyn horizon_earth::ClimateFetcher>,
+    ) -> Result<std::sync::Arc<horizon_earth::ClimateSource>, String> {
+        self.validate()?;
+        let projection = horizon_earth::Projection::local(
+            self.origin_latitude,
+            self.origin_longitude,
+            self.metres_per_block,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(std::sync::Arc::new(horizon_earth::ClimateSource::new(
+            horizon_earth::ClimateField::new(store, projection),
+            fetcher,
+        )))
+    }
+
     /// Parses and validates the JSON of a world's Earth settings. Unknown fields are ignored; a missing origin
     /// is an error.
     pub fn from_json(text: &str) -> Result<Self, String> {
@@ -195,7 +222,9 @@ impl EarthSettings {
     /// ([`super::surface::LAND_RULES`]), so a world made with land cover never shares a cache with one made
     /// without; with it off the text is what it was before land cover existed. With land cover and vegetation
     /// both on it ends with the version of the vegetation rules ([`super::vegetation::VEGETATION_RULES`]);
-    /// vegetation without land cover does nothing and is not in the key.
+    /// vegetation without land cover does nothing and is not in the key. With land cover and climate both on it
+    /// ends with the climate data rules ([`horizon_earth::CLIMATE_RULES`]) and the climate biome rules
+    /// ([`super::biome::CLIMATE_BIOME_RULES`]).
     pub fn terrain_key(&self) -> String {
         let mut key = format!(
             "{}#surface{}#clean{}",
@@ -213,6 +242,13 @@ impl EarthSettings {
                 key.push_str(&format!(
                     "#vegetation{}",
                     super::vegetation::VEGETATION_RULES
+                ));
+            }
+            if self.climate {
+                key.push_str(&format!(
+                    "#climate{}.{}",
+                    horizon_earth::CLIMATE_RULES,
+                    super::biome::CLIMATE_BIOME_RULES
                 ));
             }
         }
@@ -262,6 +298,7 @@ mod tests {
             structures: true,
             land_cover: true,
             vegetation: true,
+            climate: true,
         };
         for text in [s.to_json_pretty(), s.to_json_compact()] {
             assert_eq!(EarthSettings::from_json(&text).unwrap(), s);

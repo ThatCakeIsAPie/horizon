@@ -21,6 +21,8 @@ pub mod blocking;
 pub mod far;
 pub mod generator;
 #[cfg(test)]
+mod climate_tests;
+#[cfg(test)]
 mod land_tests;
 pub mod settings;
 pub mod surface;

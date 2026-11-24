@@ -403,13 +403,23 @@ fn every_vegetal_feature_of_an_earth_biome_lands_in_its_kind() {
     assert!(
         names(Tree)
             .iter()
-            .all(|n| n.starts_with("trees_") || n.starts_with("bamboo"))
+            .all(|n| n.starts_with("trees_")
+                || n.starts_with("bamboo")
+                || n == "birch_tall"
+                || n == "dark_forest_vegetation"),
+        "{:?}",
+        names(Tree)
     );
     assert!(names(Tree).contains("trees_plains") && names(Tree).contains("bamboo_light"));
     assert!(
         names(Water)
             .iter()
-            .all(|n| n.starts_with("seagrass") || n.starts_with("kelp"))
+            .all(|n| n.starts_with("seagrass")
+                || n.starts_with("kelp")
+                || n == "sea_pickle"
+                || n == "warm_ocean_vegetation"),
+        "{:?}",
+        names(Water)
     );
     assert!(names(Water).contains("seagrass_normal") && names(Water).contains("kelp_cold"));
     assert!(names(Dry).contains("patch_cactus_desert") && names(Dry).contains("patch_dead_bush"));

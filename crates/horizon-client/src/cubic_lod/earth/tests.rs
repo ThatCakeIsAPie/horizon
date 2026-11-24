@@ -359,6 +359,7 @@ mod sampler {
             downloads: true,
             dir: tiles_dir,
             land: None,
+            climate: None,
         };
         let generation = CubicGeneration {
             kind: crate::cubic_gen::CubicKind::Earth,

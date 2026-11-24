@@ -182,6 +182,10 @@ pub struct EarthGenerator {
     land_cover: bool,
     /// The land cover the generator was handed, kept only while the settings ask for it.
     land: Option<Arc<LandCoverSource>>,
+    /// Whether the settings ask for climate.
+    climate_on: bool,
+    /// The climate the generator was handed, kept only while the settings ask for it (and land cover is on).
+    climate: Option<Arc<horizon_earth::ClimateSource>>,
 }
 
 impl EarthGenerator {
@@ -206,6 +210,8 @@ impl EarthGenerator {
             requests: super::far::Requests::default(),
             land_cover: settings.land_cover,
             land: None,
+            climate_on: settings.land_cover && settings.climate,
+            climate: None,
         })
     }
 
@@ -217,6 +223,27 @@ impl EarthGenerator {
             self.land = Some(source);
         }
         self
+    }
+
+    /// The same generator reading the climate from `source` (built by [`EarthSettings::climate_source`]). It has
+    /// no effect unless the settings say both `landCover` and `climate`: without it the biomes are the land-cover
+    /// table by latitude ([`super::biome::Biome::of`]) exactly.
+    pub fn with_climate(mut self, source: Arc<horizon_earth::ClimateSource>) -> Self {
+        if self.climate_on {
+            self.climate = Some(source);
+        }
+        self
+    }
+
+    /// Whether the settings ask for climate (with land cover). With no source handed in, the biomes use the
+    /// climate fallback ([`super::biome::Biome::with_climate`] without a climate).
+    pub fn climate_wanted(&self) -> bool {
+        self.climate_on
+    }
+
+    /// The climate source in use, for whatever fetches in the background.
+    pub fn climate_source(&self) -> Option<&Arc<horizon_earth::ClimateSource>> {
+        self.climate.as_ref()
     }
 
     /// Whether columns follow land cover: the settings ask for it and a source was handed in.

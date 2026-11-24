@@ -86,6 +86,10 @@ approved (or with downloads off, or in a game with no land cover address) **runs
 (its terrain and its far-view cache are the elevation-only ones), says so in the log, and, for an unapproved host,
 once in chat; it never waits for land cover. Cached land cover is not used while it is off.
 
+**Climate has its own host too**: `os.unil.cloud.switch.ch` (CHELSA). The question names every host not yet approved
+(tiles, land cover, climate) and one Yes approves them all. A world with climate on whose host is not approved runs
+as if climate were off (biomes by latitude, see [Climate](#climate)), logs it and never waits.
+
 ## The data and its attribution
 
 Elevation comes from **Terrain Tiles**, a global dataset of bare-earth heights tiled for easy use, built by Mapzen
@@ -203,6 +207,7 @@ the name out while it is off) **and** a source handed to the generator (`EarthGe
 terrain, block for block (a test compares them). Where a column's
 class is known it replaces the elevation rule for the top of the column (`surface.rs`); no data keeps the old rule.
 The class is read at the zoom of the sampling step, so a far voxel uses a coarser overview level than a block.
+The biome column below is the one without climate; with `climate` on see [Climate](#climate).
 
 | Class | Top of the column (over stone) | Biome |
 |---|---|---|
@@ -279,9 +284,48 @@ a tree stands and the share thins its density. Lily pads count as plants, so the
   (`cubic_far_structures.rs`) hang off its structures, which Earth has none of, and would read Earth's tiles with
   blocking calls on the far view's idle thread, which would hang while a tile cannot be had.
 
+### Climate
+
+With `"climate": true` (new worlds get it whenever the game has a climate address and land cover is on; an old
+world's file leaves it out and keeps its biomes) the biomes follow the real climate instead of latitude bands. The
+land cover table above still decides the ground; the climate only picks the biome.
+
+- **The data.** CHELSA V2.1 (Karger et al. 2017, Scientific Data 4, 170122; data doi:10.16904/envidat.228.v2.1),
+  the 1981-2010 bioclim layers `bio01` (mean annual air temperature) and `bio12` (annual precipitation), 30 arc
+  seconds (about 1 km), land and sea, 84° N to 90° S. Licence CC0 1.0. Two cloud-optimised GeoTIFFs (BigTIFF,
+  16-bit, DEFLATE with predictor 2, 512 by 512 tiles, 7 overview levels) at
+  `https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/bioclim/` (`horizon_addresses::EARTH_CLIMATE`, or
+  `HORIZON_EARTH_CLIMATE_URL`). The game reads the first 64 KiB of each (the whole tile index) and then single tiles
+  by range request (`horizon-earth`: `climate.rs`, `climatefield.rs`, `climatesource.rs`; client:
+  `earth_climatenet.rs`). A world needs a few tiles in all.
+- **Why CHELSA.** Free for any use (CC0), global over land and sea at 1 km, and served as COGs that can be read piece
+  by piece like the land cover. WorldCover's elevation tiles hold no climate. WorldClim 2.1 is only offered as zip
+  archives (nothing to range-read) and RESOLVE Ecoregions 2017 is vector data (CC BY 4.0) that would need a tiling
+  step and a host of our own.
+- **Where it is kept.** `.horizon-cache/earth-climate/<hash of the address>/chelsa-v2.1-1981-2010-rules1/` in the game
+  folder.
+- **The mapping** (`biome.rs`, `Biome::with_climate`): vanilla's own `OverworldBiomeBuilder` tables. Mean annual
+  temperature gives the row (frozen under 0 °C, cold under 8, temperate under 18, warm; warm and dry is vanilla's
+  hot row), an aridity ratio `P / (20 (T + 7))` gives the humidity column (0 to 4). Vanilla's pick is used when it
+  fits the land class, else the class's own choice for that row: tree cover becomes forest, birch, dark or flower
+  forest, taiga, old growth taiga, jungle or savanna (a very wet temperate forest is old growth spruce taiga, a
+  frozen one snowy taiga); grass plains, sunflower plains, meadow (from 1,500 m), savanna or snowy plains; dry
+  shrubland desert; bare ground desert or badlands where dry, else stony peaks or windswept gravelly hills; the sea
+  warm, lukewarm, normal, cold or frozen ocean by temperature (deep under 200 m); rivers freeze below 0 °C. About a
+  third of 2 km cells take vanilla's variant (sunflower plains, old growth birch, bamboo jungle, sparse jungle, ice
+  spikes, old growth pine taiga). Snow and the snow line, wetlands and mangroves stay as in the table above.
+- **Fallback.** Where the climate has no data (no source, a refused host, a no-data pixel) land uses the table above
+  exactly, and seas and rivers take a temperature from latitude and height (`27 - 0.0074 lat²` °C, 6.5 °C colder a
+  kilometre up).
+- **The far view** waits for the climate as it does for land cover: a missing piece is "later" and recorded
+  (`EarthGenerator::take_climate_requests`) for the prefetcher.
+- **The cache key.** `terrain_key()` also ends with `#climate<data rules>.<biome rules>` while land cover and climate
+  are on.
+
 ### Still missing
 
 - Trees in the far view (they grow near the player only), buildings, roads, farmland.
+- Climate is the yearly mean only: no seasons, no snow that comes and goes.
 - Not checked against a real file by the tests (they use synthetic data only): the half-pixel convention (the reader
   treats a pixel as the area it covers), and whether overview levels keep class boundaries well (they are taken as
   the file gives them). See the real-data check in the pull request for how the rules look at the Grand Canyon.

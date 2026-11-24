@@ -58,6 +58,8 @@ pub(super) struct Context {
     pub(super) default_url: Option<String>,
     /// The land cover folder the game offers (`earth_landnet::address`), if any.
     pub(super) land_address: Option<String>,
+    /// The climate folder the game offers (`earth_climatenet::address`), if any.
+    pub(super) climate_address: Option<String>,
     /// The hosts this player approved.
     pub(super) approved: Approved,
 }
@@ -70,12 +72,14 @@ impl Context {
             return Self {
                 default_url,
                 land_address,
+                climate_address: None,
                 approved: Approved::for_player(),
             };
         }
         Self {
             default_url: horizon_hooks::engine::earth_tile_address().map(str::to_owned),
             land_address: crate::earth_landnet::address(),
+            climate_address: crate::earth_climatenet::address(),
             approved: Approved::for_player(),
         }
     }
@@ -189,6 +193,16 @@ impl Draft {
         crate::earth_landnet::host_for(&settings, self.ctx.land_address.as_deref())
     }
 
+    /// The climate server's host, when this game has an address for it that it may use (and land cover).
+    fn climate_host(&self) -> Option<String> {
+        self.land_host()?;
+        let mut settings = self.rest.clone();
+        settings.land_cover = true;
+        settings.climate = true;
+        settings.allow_downloads = true;
+        crate::earth_climatenet::host_for(&settings, self.ctx.climate_address.as_deref())
+    }
+
     /// Whether the world uses land cover: always, when this game has a source for it.
     fn land_on(&self) -> bool {
         self.land_host().is_some()
@@ -201,6 +215,11 @@ impl Draft {
             && !hosts.contains(&land)
         {
             hosts.push(land);
+        }
+        if let Some(climate) = self.climate_host()
+            && !hosts.contains(&climate)
+        {
+            hosts.push(climate);
         }
         hosts
     }
@@ -244,6 +263,8 @@ impl Draft {
         settings.land_cover = self.land_on();
         // Plants and trees follow the land cover, so a new world grows them whenever it has it.
         settings.vegetation = settings.land_cover;
+        // The biomes follow the real climate whenever this game has a source for it.
+        settings.climate = settings.land_cover && self.climate_host().is_some();
         let limit = horizon_earth::projection::MAX_LATITUDE;
         if settings.origin_latitude.abs() > limit {
             return Err(Problem::new(
@@ -519,6 +540,15 @@ fn credits_page(b: &mut Builder) {
     for line in wrap(&tr("horizon.cubic.earth.credits.land_licence"), LINE) {
         b.note(line);
     }
+    b.heading(tr("horizon.cubic.earth.credits.climate_source"));
+    for key in [
+        "horizon.cubic.earth.credits.climate_about",
+        "horizon.cubic.earth.credits.climate_cite",
+    ] {
+        for line in wrap(&tr(key), LINE) {
+            b.note(line);
+        }
+    }
     b.space(4.0);
     for line in wrap(&tr("horizon.cubic.earth.credits.idea"), LINE) {
         b.note(line);
@@ -550,6 +580,7 @@ impl Draft {
         Self::start(Context {
             default_url: default_url.map(str::to_owned),
             land_address: land_address.map(str::to_owned),
+            climate_address: None,
             approved,
         })
     }

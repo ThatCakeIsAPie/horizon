@@ -32,6 +32,7 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 pub struct Requests {
     pending: Mutex<HashSet<TileId>>,
     land: Mutex<HashSet<Fetch>>,
+    climate: Mutex<HashSet<horizon_earth::ClimateFetch>>,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -227,6 +228,45 @@ impl EarthGenerator {
             .drain()
             .collect();
         taken.sort_unstable_by_key(|f| (f.file, f.range.offset, f.range.len));
+        taken
+    }
+
+    /// Records climate fetches a read found missing, like [`Self::note_land`] (see
+    /// [`EarthGenerator::take_climate_requests`]).
+    pub(super) fn note_climate(&self, fetch: horizon_earth::ClimateFetch) {
+        let added = {
+            let mut pending = self
+                .requests
+                .climate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            pending.len() < MAX_PENDING && pending.insert(fetch)
+        };
+        if !added {
+            return;
+        }
+        let waker = self
+            .requests
+            .waker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(wake) = waker {
+            wake();
+        }
+    }
+
+    /// The climate fetches asked for since the last call, for [`horizon_earth::ClimateSource::satisfy`]; the
+    /// readers that said "later" ask again.
+    pub fn take_climate_requests(&self) -> Vec<horizon_earth::ClimateFetch> {
+        let mut taken: Vec<horizon_earth::ClimateFetch> = self
+            .requests
+            .climate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .collect();
+        taken.sort_unstable_by_key(|f| (f.var.name(), f.range.offset, f.range.len));
         taken
     }
 

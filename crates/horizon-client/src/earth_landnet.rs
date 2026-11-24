@@ -59,7 +59,7 @@ pub fn cache_root() -> PathBuf {
 }
 
 /// `base` as the folder address of the dataset: a usable `https://` (or local `http://`) address, ending in `/`.
-fn folder(base: &str) -> Result<String, String> {
+pub(crate) fn folder(base: &str) -> Result<String, String> {
     let base = base.trim();
     allowed(base).map_err(|why| why.to_string())?;
     host_of(base)?;
@@ -168,7 +168,7 @@ impl HttpLandCover {
         )
     }
 
-    fn over(
+    pub(crate) fn over(
         source: Result<String, String>,
         approved: Approved,
         connect: Duration,
@@ -193,19 +193,23 @@ impl HttpLandCover {
         self.source.as_ref().err().map(String::as_str)
     }
 
-    fn get(
-        &self,
-        base: &str,
-        file: WorldCoverFile,
-        range: ByteRange,
-    ) -> Result<Option<Vec<u8>>, FetchError> {
+    /// `range` of the file at `path` under the folder address, `Ok(None)` when it is not there. Refused when the
+    /// fetcher does not download.
+    pub(crate) fn get_path(&self, path: &str, range: ByteRange) -> Result<Option<Vec<u8>>, FetchError> {
+        match &self.source {
+            Ok(base) => self.get(base, path, range),
+            Err(why) => Err(FetchError::Refused(why.clone())),
+        }
+    }
+
+    fn get(&self, base: &str, path: &str, range: ByteRange) -> Result<Option<Vec<u8>>, FetchError> {
         if range.len == 0 || range.len > MAX_RANGE_BYTES as u64 {
             return Err(FetchError::Other(format!(
                 "a range of {} bytes is not one the game asks for",
                 range.len
             )));
         }
-        let url = format!("{base}{}", file.path());
+        let url = format!("{base}{path}");
         let last = range.offset.saturating_add(range.len - 1);
         let _permit = self.gate.enter();
         let reply = match self
@@ -247,10 +251,7 @@ impl HttpLandCover {
 
 impl LandCoverFetcher for HttpLandCover {
     fn fetch(&self, file: WorldCoverFile, range: ByteRange) -> Result<Option<Vec<u8>>, FetchError> {
-        match &self.source {
-            Ok(base) => self.get(base, file, range),
-            Err(why) => Err(FetchError::Refused(why.clone())),
-        }
+        self.get_path(&file.path(), range)
     }
 }
 

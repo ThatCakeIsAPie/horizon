@@ -2622,6 +2622,7 @@ mod tests {
                 downloads: true,
                 dir,
                 land,
+                climate: None,
             };
             let generation = CubicGeneration {
                 kind: CubicKind::Earth,

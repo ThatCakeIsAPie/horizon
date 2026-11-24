@@ -200,10 +200,16 @@ impl Generation {
                 log::info!("Horizon: this Earth world runs without land cover (landCover is ignored)");
                 settings.land_cover = false;
             }
-            let generator = CustomCubicGenerator::earth_with_land_cover(
+            // Likewise climate: without a source the biomes are the table by latitude, and the key says so.
+            if settings.climate && (!settings.land_cover || tiles.climate.is_none()) {
+                log::info!("Horizon: this Earth world runs without climate (climate is ignored)");
+                settings.climate = false;
+            }
+            let generator = CustomCubicGenerator::earth_with_sources(
                 &settings,
                 tiles.store.clone(),
                 tiles.land.clone(),
+                tiles.climate.clone(),
                 registry,
             )?
             .with_seed(seed);

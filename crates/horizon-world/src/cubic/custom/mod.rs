@@ -210,10 +210,26 @@ impl CustomCubicGenerator {
         land: Option<Arc<horizon_earth::LandCoverSource>>,
         registry: &BlockRegistry,
     ) -> Result<Self, String> {
+        Self::earth_with_sources(settings, store, land, None, registry)
+    }
+
+    /// [`Self::earth_with_land_cover`] also reading the climate from `climate` (see
+    /// [`earth::EarthGenerator::with_climate`]): it takes effect only when the settings say `landCover` and
+    /// `climate`.
+    pub fn earth_with_sources(
+        settings: &earth::EarthSettings,
+        store: Arc<horizon_earth::TileStore>,
+        land: Option<Arc<horizon_earth::LandCoverSource>>,
+        climate: Option<Arc<horizon_earth::ClimateSource>>,
+        registry: &BlockRegistry,
+    ) -> Result<Self, String> {
         let blocks = earth::EarthBlocks::from_registry(registry)?;
         let mut generator = earth::EarthGenerator::new(settings, store, blocks)?;
         if let Some(land) = land {
             generator = generator.with_land_cover(land);
+        }
+        if let Some(climate) = climate {
+            generator = generator.with_climate(climate);
         }
         Ok(Self {
             kind: Kind::Heightmap(Arc::new(generator)),

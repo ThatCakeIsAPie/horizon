@@ -113,3 +113,9 @@ pub const EARTH_TILES: &str =
 /// byte ranges of those files. Offering it downloads nothing: the host needs the player's approval
 /// like the tile server's, and the world must allow downloads.
 pub const EARTH_LAND_COVER: &str = "https://esa-worldcover.s3.eu-central-1.amazonaws.com/";
+
+/// The public climate files Earth worlds with climate on read (CHELSA V2.1 bioclim 1981-2010, CC0 1.0,
+/// Karger et al. 2017; docs/earth.md): the folder the dataset's paths
+/// (`bio01/1981-2010/CHELSA_bio01_1981-2010_V.2.1.tif`) hang from. The game asks for byte ranges of
+/// those files. Offering it downloads nothing: the host needs the player's approval like the others.
+pub const EARTH_CLIMATE: &str = "https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/bioclim/";

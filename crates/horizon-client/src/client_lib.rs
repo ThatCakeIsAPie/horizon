@@ -86,6 +86,7 @@ pub mod desktop;
 pub mod dialog;
 pub mod dialog_screen;
 pub mod earth_consent;
+pub mod earth_climatenet;
 pub mod earth_landnet;
 pub mod earth_net;
 pub mod earth_prefetch;

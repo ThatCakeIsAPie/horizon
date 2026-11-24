@@ -34,7 +34,7 @@ pub(super) struct LandRig {
     pub(super) store: Arc<TileStore>,
     pub(super) land: Arc<MemoryLandCover>,
     pub(super) source: Arc<LandCoverSource>,
-    blocks: EarthBlocks,
+    pub(super) blocks: EarthBlocks,
     pub(super) settings: EarthSettings,
     _dirs: (TempDir, TempDir),
 }

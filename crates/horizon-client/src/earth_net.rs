@@ -466,6 +466,9 @@ pub struct EarthTiles {
     /// The land cover the generator reads: only for a world that uses it, allows downloads and whose land cover
     /// host the player approved (`earth_landnet`); `None` makes the world run as if `landCover` were false.
     pub land: Option<Arc<horizon_earth::LandCoverSource>>,
+    /// The climate the biomes read (`earth_climatenet`), by the same rules; `None` makes the world run as if
+    /// `climate` were false.
+    pub climate: Option<Arc<horizon_earth::ClimateSource>>,
 }
 
 /// The tile store of a world with `settings`, caching under `root` (see [`cache_root`]), downloading from
@@ -474,6 +477,9 @@ pub fn open(settings: &EarthSettings, root: &Path) -> EarthTiles {
     let mut tiles = open_with(settings, root, &Approved::for_player());
     if settings.land_cover {
         tiles.land = crate::earth_landnet::open(settings, &crate::earth_landnet::cache_root()).source;
+    }
+    if settings.land_cover && settings.climate && tiles.land.is_some() {
+        tiles.climate = crate::earth_climatenet::open(settings, &crate::earth_climatenet::cache_root());
     }
     tiles
 }
@@ -501,6 +507,7 @@ pub fn open_with(settings: &EarthSettings, root: &Path, approved: &Approved) -> 
         downloads,
         dir,
         land: None,
+        climate: None,
     }
 }
 

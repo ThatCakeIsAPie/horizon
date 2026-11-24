@@ -229,6 +229,7 @@ fn run(shared: &Shared, generator: &Weak<CustomCubicGenerator>, gap: Duration) {
     let mut failing = false;
     let mut land_failures: HashMap<Fetch, Failure> = HashMap::new();
     let mut land_failing = false;
+    let mut climate_failing = false;
     loop {
         // Wait for a target (or for the idle time to pass, to retry what failed).
         let (target, epoch) = {
@@ -265,6 +266,23 @@ fn run(shared: &Shared, generator: &Weak<CustomCubicGenerator>, gap: Duration) {
         let mut land_todo: VecDeque<Fetch> = VecDeque::new();
         let mut land_rounds = 0;
         loop {
+            // Climate: a handful of pieces for the whole world (two indexes, a tile or two each); what the far
+            // view asked for is fetched first of all. A failure is logged once and asked again later.
+            if let Some(climate) = earth.climate_source() {
+                for fetch in earth.take_climate_requests() {
+                    if !climate.field().store().is_missing(&fetch) {
+                        continue;
+                    }
+                    match climate.satisfy(&fetch) {
+                        Ok(()) => climate_failing = false,
+                        Err(e) => {
+                            if !std::mem::replace(&mut climate_failing, true) {
+                                log::warn!("Horizon: Earth climate {:?} did not download: {e}", fetch.var);
+                            }
+                        }
+                    }
+                }
+            }
             // Land cover: what the far view asked for goes first, then the next round of what the area needs.
             if let Some(land) = earth.land_source() {
                 let now = Instant::now();

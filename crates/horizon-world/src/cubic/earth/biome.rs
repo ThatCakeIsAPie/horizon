@@ -19,11 +19,50 @@
 //! | wetland, mangrove | `swamp`, `mangrove_swamp` |
 //! | moss and lichen | `snowy_plains` (tundra) |
 //!
+//! ## With the real climate
+//!
+//! A world with `climate` on (and land cover) reads the CHELSA mean annual temperature `T` (degrees C) and
+//! annual precipitation `P` (mm) at the column ([`horizon_earth::ClimateSource`]), at the same 500 m. Land cover
+//! still decides the kind of ground; the climate picks the biome inside it with vanilla's own overworld tables
+//! (`OverworldBiomeBuilder`: a temperature row and a humidity column):
+//!
+//! - temperature row: frozen under 0 C, cold under 8, temperate under 18, warm from 18; hot (vanilla's desert
+//!   row) when warm and dry (humidity 0 or 1).
+//! - humidity column from a Koppen-style aridity ratio `r = P / (20 (T + 7))`: 0 under 0.5, 1 under 1, 2 under 2,
+//!   3 under 3.5, else 4.
+//!
+//! | Row | Middle (humidity 0 to 4) | Variant | Plateau (from 1,500 m) |
+//! |---|---|---|---|
+//! | frozen | snowy plains x3, snowy taiga, taiga | ice spikes, -, snowy taiga, -, - | snowy plains x3, snowy taiga x2 |
+//! | cold | plains, plains, forest, taiga, old growth spruce taiga | -, -, -, -, old growth pine taiga | meadow, meadow, forest, taiga, old growth spruce taiga |
+//! | temperate | flower forest, plains, forest, birch forest, dark forest | sunflower plains, -, -, old growth birch forest, - | meadow x4, dark forest |
+//! | warm | savanna, savanna, forest, jungle, jungle | -, -, plains, sparse jungle, bamboo jungle | savanna plateau x2, forest, forest, jungle |
+//! | hot | desert x5 | - | badlands x3, wooded badlands x2 |
+//!
+//! The variant is taken in about a third of 2 km cells (a fixed hash of the cell). The pick must fit the land
+//! class, else the class's own choice for the row is used:
+//!
+//! | Class | Fits | Otherwise |
+//! |---|---|---|
+//! | tree | the forests, taigas and jungles, wooded badlands; savanna when warm or hot; always snowy taiga when frozen | frozen snowy taiga, cold taiga, temperate forest, warm jungle (humidity 3+) or savanna, hot savanna; temperate with `r` of 6 or more: old growth spruce taiga (temperate rainforest) |
+//! | grass, no data on land | plains, sunflower plains, snowy plains, savanna, savanna plateau, meadow | frozen snowy plains, cold and temperate plains (meadow from 1,500 m), warm and hot savanna |
+//! | shrub | as grass, and desert | as grass, but desert when humidity is 0 and the row is temperate or warmer |
+//! | crop | plains, sunflower plains | frozen snowy plains, warm and hot savanna, else plains |
+//! | bare | - | desert when humidity is 0 or 1 and the row is not frozen (badlands from 1,000 m when temperate or warmer); else stony peaks from 2,000 m, windswept gravelly hills |
+//! | water at or under sea level, no data under it | - | by temperature: warm ocean from 24 C, lukewarm, ocean, cold, frozen ocean (the deep kinds under 200 m) |
+//! | water above sea level | - | river, frozen river when frozen |
+//! | wetland | - | swamp; snowy plains when frozen |
+//! | mangrove, moss and lichen, snow and ice / snow line | - | as without climate |
+//!
+//! Where the climate has no data (no file, a refused host, a "no data" pixel), land uses the table without
+//! climate above; seas and rivers take a temperature from latitude and height (`27 - 0.0074 lat^2` C, minus
+//! 6.5 C a kilometre above the sea).
+//!
 //! [`EarthBiomes`] gives this to the cubic generator as its biome source.
 
 use std::sync::Arc;
 
-use horizon_earth::{LandClass, LoadError, Lookup};
+use horizon_earth::{Climate, ClimateLookup, LandClass, LoadError, Lookup};
 
 use super::generator::{Access, EarthGenerator, Gap, NotReady, Rect};
 use super::surface::{LAND_SNOW_FLOOR_M, snow_line_m};
@@ -33,7 +72,16 @@ use crate::worldgen::biome::BiomeId;
 /// The ground resolution, in metres, the biome of a column is read at.
 pub const BIOME_SAMPLE_M: f64 = 500.0;
 
-/// The biomes of the table, `plains` first (it is what a cancelled read gives).
+/// The version of the climate biome rules above; in the terrain key while climate is on.
+pub const CLIMATE_BIOME_RULES: u32 = 1;
+
+/// The ground size, in metres, of the cells a vanilla variant biome is chosen in.
+const VARIANT_CELL_M: f64 = 2000.0;
+/// Cells out of 1,000 that take the variant.
+const VARIANT_SHARE: u64 = 333;
+
+/// The biomes of the table, `plains` first (it is what a cancelled read gives). New ones go at the end, so the
+/// ids of the old ones stay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Biome {
     Plains,
@@ -53,11 +101,33 @@ pub enum Biome {
     WindsweptGravellyHills,
     Swamp,
     MangroveSwamp,
+    SunflowerPlains,
+    FlowerForest,
+    BirchForest,
+    OldGrowthBirchForest,
+    DarkForest,
+    OldGrowthSpruceTaiga,
+    OldGrowthPineTaiga,
+    SparseJungle,
+    BambooJungle,
+    SavannaPlateau,
+    Badlands,
+    WoodedBadlands,
+    IceSpikes,
+    WarmOcean,
+    LukewarmOcean,
+    DeepLukewarmOcean,
+    DeepOcean,
+    ColdOcean,
+    DeepColdOcean,
+    FrozenOcean,
+    DeepFrozenOcean,
+    FrozenRiver,
 }
 
 impl Biome {
     /// Every biome, in id order.
-    pub const ALL: [Biome; 17] = [
+    pub const ALL: [Biome; 39] = [
         Self::Plains,
         Self::Ocean,
         Self::River,
@@ -75,6 +145,28 @@ impl Biome {
         Self::WindsweptGravellyHills,
         Self::Swamp,
         Self::MangroveSwamp,
+        Self::SunflowerPlains,
+        Self::FlowerForest,
+        Self::BirchForest,
+        Self::OldGrowthBirchForest,
+        Self::DarkForest,
+        Self::OldGrowthSpruceTaiga,
+        Self::OldGrowthPineTaiga,
+        Self::SparseJungle,
+        Self::BambooJungle,
+        Self::SavannaPlateau,
+        Self::Badlands,
+        Self::WoodedBadlands,
+        Self::IceSpikes,
+        Self::WarmOcean,
+        Self::LukewarmOcean,
+        Self::DeepLukewarmOcean,
+        Self::DeepOcean,
+        Self::ColdOcean,
+        Self::DeepColdOcean,
+        Self::FrozenOcean,
+        Self::DeepFrozenOcean,
+        Self::FrozenRiver,
     ];
 
     pub fn name(self) -> &'static str {
@@ -96,22 +188,50 @@ impl Biome {
             Self::WindsweptGravellyHills => "minecraft:windswept_gravelly_hills",
             Self::Swamp => "minecraft:swamp",
             Self::MangroveSwamp => "minecraft:mangrove_swamp",
+            Self::SunflowerPlains => "minecraft:sunflower_plains",
+            Self::FlowerForest => "minecraft:flower_forest",
+            Self::BirchForest => "minecraft:birch_forest",
+            Self::OldGrowthBirchForest => "minecraft:old_growth_birch_forest",
+            Self::DarkForest => "minecraft:dark_forest",
+            Self::OldGrowthSpruceTaiga => "minecraft:old_growth_spruce_taiga",
+            Self::OldGrowthPineTaiga => "minecraft:old_growth_pine_taiga",
+            Self::SparseJungle => "minecraft:sparse_jungle",
+            Self::BambooJungle => "minecraft:bamboo_jungle",
+            Self::SavannaPlateau => "minecraft:savanna_plateau",
+            Self::Badlands => "minecraft:badlands",
+            Self::WoodedBadlands => "minecraft:wooded_badlands",
+            Self::IceSpikes => "minecraft:ice_spikes",
+            Self::WarmOcean => "minecraft:warm_ocean",
+            Self::LukewarmOcean => "minecraft:lukewarm_ocean",
+            Self::DeepLukewarmOcean => "minecraft:deep_lukewarm_ocean",
+            Self::DeepOcean => "minecraft:deep_ocean",
+            Self::ColdOcean => "minecraft:cold_ocean",
+            Self::DeepColdOcean => "minecraft:deep_cold_ocean",
+            Self::FrozenOcean => "minecraft:frozen_ocean",
+            Self::DeepFrozenOcean => "minecraft:deep_frozen_ocean",
+            Self::FrozenRiver => "minecraft:frozen_river",
         }
     }
 
-    /// The biome of a column of `class` at real `elevation_m` and `latitude` degrees (see the table above).
-    pub fn of(class: LandClass, elevation_m: f64, latitude: f64) -> Self {
-        let lat = latitude.abs();
+    /// Whether a column of `class` at `elevation_m` and `latitude` is snow (the snow class or the snow line).
+    fn snowy(class: LandClass, elevation_m: f64, latitude: f64) -> Option<Self> {
         let snowy = class == LandClass::SnowIce
             || elevation_m >= snow_line_m(latitude).max(LAND_SNOW_FLOOR_M);
-        if snowy {
-            return if elevation_m >= 3000.0 {
+        snowy.then_some({
+            if elevation_m >= 3000.0 {
                 Self::FrozenPeaks
             } else if elevation_m >= 1500.0 {
                 Self::SnowySlopes
             } else {
                 Self::SnowyPlains
-            };
+            }
+        })
+    }
+    /// The biome of a column of `class` at real `elevation_m` and `latitude` degrees (see the table above).
+    pub fn of(class: LandClass, elevation_m: f64, latitude: f64) -> Self {
+        let lat = latitude.abs();
+        if let Some(snow) = Self::snowy(class, elevation_m, latitude) {
+            return snow;
         }
         match class {
             LandClass::Water => {
@@ -174,6 +294,243 @@ impl Biome {
             LandClass::MossLichen => Self::SnowyPlains,
         }
     }
+
+    /// The biome of a column of `class` at real `elevation_m` and `latitude` with the real `climate` there (the
+    /// tables in the module docs). `variant` says whether the column's 2 km cell takes vanilla's variant biome.
+    /// Without a climate, land is [`Biome::of`] exactly and water takes a temperature from latitude and height.
+    pub fn with_climate(
+        class: LandClass,
+        elevation_m: f64,
+        latitude: f64,
+        climate: Option<Climate>,
+        variant: bool,
+    ) -> Self {
+        let Some(climate) = climate else {
+            let t = fallback_temperature_c(elevation_m, latitude);
+            return match class {
+                LandClass::Water if elevation_m <= 0.0 => ocean(t, elevation_m),
+                LandClass::NoData if elevation_m < 0.0 => ocean(t, elevation_m),
+                LandClass::Water if Self::snowy(class, elevation_m, latitude).is_none() && t < 0.0 => {
+                    Self::FrozenRiver
+                }
+                _ => Self::of(class, elevation_m, latitude),
+            };
+        };
+        if let Some(snow) = Self::snowy(class, elevation_m, latitude) {
+            return snow;
+        }
+        let t = f64::from(climate.temperature_c);
+        let p = f64::from(climate.precipitation_mm).max(0.0);
+        let r = p / (20.0 * (t + 7.0).max(1.0));
+        let hum = humidity_index(r);
+        let row = temperature_row(t, hum);
+        let plateau = elevation_m >= 1500.0;
+        let pick = vanilla(row, hum, plateau, variant);
+        use Biome::*;
+        match class {
+            LandClass::Water if elevation_m <= 0.0 => ocean(t, elevation_m),
+            LandClass::NoData if elevation_m < 0.0 => ocean(t, elevation_m),
+            LandClass::Water => {
+                if row == Row::Frozen {
+                    FrozenRiver
+                } else {
+                    River
+                }
+            }
+            LandClass::Tree => {
+                if row == Row::Temperate && r >= 6.0 {
+                    return OldGrowthSpruceTaiga;
+                }
+                // Below 0 C the ground is under snow much of the year, and cold air makes almost any rain
+                // "humid", which in vanilla's row is plain taiga: a frozen forest is snowy taiga.
+                if row == Row::Frozen {
+                    return SnowyTaiga;
+                }
+                let fits = matches!(
+                    pick,
+                    Forest
+                        | FlowerForest
+                        | BirchForest
+                        | OldGrowthBirchForest
+                        | DarkForest
+                        | Taiga
+                        | OldGrowthSpruceTaiga
+                        | OldGrowthPineTaiga
+                        | SnowyTaiga
+                        | Jungle
+                        | SparseJungle
+                        | BambooJungle
+                        | WoodedBadlands
+                ) || (matches!(pick, Savanna | SavannaPlateau) && row >= Row::Warm);
+                if fits {
+                    pick
+                } else {
+                    match row {
+                        Row::Frozen => SnowyTaiga,
+                        Row::Cold => Taiga,
+                        Row::Temperate => Forest,
+                        Row::Warm if hum >= 3 => Jungle,
+                        Row::Warm | Row::Hot => Savanna,
+                    }
+                }
+            }
+            LandClass::Grass | LandClass::NoData | LandClass::Shrub => {
+                let open = matches!(
+                    pick,
+                    Plains | SunflowerPlains | SnowyPlains | Savanna | SavannaPlateau | Meadow
+                );
+                if class == LandClass::Shrub && hum == 0 && row >= Row::Temperate {
+                    Desert
+                } else if open {
+                    pick
+                } else {
+                    match row {
+                        Row::Frozen => SnowyPlains,
+                        Row::Cold | Row::Temperate if plateau => Meadow,
+                        Row::Cold | Row::Temperate => Plains,
+                        Row::Warm | Row::Hot => Savanna,
+                    }
+                }
+            }
+            LandClass::Crop => match row {
+                Row::Frozen => SnowyPlains,
+                Row::Warm | Row::Hot => Savanna,
+                _ if pick == SunflowerPlains => SunflowerPlains,
+                _ => Plains,
+            },
+            LandClass::BuiltUp => match row {
+                Row::Frozen => SnowyPlains,
+                _ => Plains,
+            },
+            LandClass::Bare => {
+                if hum <= 1 && row != Row::Frozen {
+                    if elevation_m >= 1000.0 && row >= Row::Temperate {
+                        Badlands
+                    } else {
+                        Desert
+                    }
+                } else if elevation_m >= 2000.0 {
+                    StonyPeaks
+                } else {
+                    WindsweptGravellyHills
+                }
+            }
+            LandClass::Wetland => {
+                if row == Row::Frozen {
+                    SnowyPlains
+                } else {
+                    Swamp
+                }
+            }
+            LandClass::Mangrove => MangroveSwamp,
+            LandClass::MossLichen | LandClass::SnowIce => SnowyPlains,
+        }
+    }
+}
+
+/// A rough mean annual temperature where the climate has no data: about 27 C at the equator and -20 C at 80
+/// degrees, 6.5 C colder a kilometre up.
+pub fn fallback_temperature_c(elevation_m: f64, latitude: f64) -> f64 {
+    27.0 - 0.0074 * latitude * latitude - 6.5 * elevation_m.max(0.0) / 1000.0
+}
+
+/// The sea at mean air temperature `t`, deep under 200 m.
+fn ocean(t: f64, elevation_m: f64) -> Biome {
+    let deep = elevation_m < -200.0;
+    match (t, deep) {
+        (t, _) if t >= 24.0 => Biome::WarmOcean,
+        (t, false) if t >= 18.0 => Biome::LukewarmOcean,
+        (t, true) if t >= 18.0 => Biome::DeepLukewarmOcean,
+        (t, false) if t >= 8.0 => Biome::Ocean,
+        (t, true) if t >= 8.0 => Biome::DeepOcean,
+        (t, false) if t >= 0.0 => Biome::ColdOcean,
+        (t, true) if t >= 0.0 => Biome::DeepColdOcean,
+        (_, false) => Biome::FrozenOcean,
+        (_, true) => Biome::DeepFrozenOcean,
+    }
+}
+
+/// Vanilla's temperature rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Row {
+    Frozen,
+    Cold,
+    Temperate,
+    Warm,
+    Hot,
+}
+
+fn humidity_index(r: f64) -> usize {
+    if r < 0.5 {
+        0
+    } else if r < 1.0 {
+        1
+    } else if r < 2.0 {
+        2
+    } else if r < 3.5 {
+        3
+    } else {
+        4
+    }
+}
+
+fn temperature_row(t: f64, hum: usize) -> Row {
+    if t < 0.0 {
+        Row::Frozen
+    } else if t < 8.0 {
+        Row::Cold
+    } else if t < 18.0 {
+        Row::Temperate
+    } else if hum <= 1 {
+        Row::Hot
+    } else {
+        Row::Warm
+    }
+}
+
+/// Vanilla's middle (or plateau) biome for a row and humidity, or its variant when `variant` and there is one.
+fn vanilla(row: Row, hum: usize, plateau: bool, variant: bool) -> Biome {
+    use Biome::*;
+    const MIDDLE: [[Biome; 5]; 5] = [
+        [SnowyPlains, SnowyPlains, SnowyPlains, SnowyTaiga, Taiga],
+        [Plains, Plains, Forest, Taiga, OldGrowthSpruceTaiga],
+        [FlowerForest, Plains, Forest, BirchForest, DarkForest],
+        [Savanna, Savanna, Forest, Jungle, Jungle],
+        [Desert, Desert, Desert, Desert, Desert],
+    ];
+    const VARIANT: [[Option<Biome>; 5]; 5] = [
+        [Some(IceSpikes), None, Some(SnowyTaiga), None, None],
+        [None, None, None, None, Some(OldGrowthPineTaiga)],
+        [Some(SunflowerPlains), None, None, Some(OldGrowthBirchForest), None],
+        [None, None, Some(Plains), Some(SparseJungle), Some(BambooJungle)],
+        [None, None, None, None, None],
+    ];
+    const PLATEAU: [[Biome; 5]; 5] = [
+        [SnowyPlains, SnowyPlains, SnowyPlains, SnowyTaiga, SnowyTaiga],
+        [Meadow, Meadow, Forest, Taiga, OldGrowthSpruceTaiga],
+        [Meadow, Meadow, Meadow, Meadow, DarkForest],
+        [SavannaPlateau, SavannaPlateau, Forest, Forest, Jungle],
+        [Badlands, Badlands, Badlands, WoodedBadlands, WoodedBadlands],
+    ];
+    let (t, h) = (row as usize, hum.min(4));
+    if plateau {
+        return PLATEAU[t][h];
+    }
+    match VARIANT[t][h] {
+        Some(v) if variant => v,
+        _ => MIDDLE[t][h],
+    }
+}
+
+/// Whether the cell of about 2 km (a fixed step of latitude and longitude, so it is the same at every scale)
+/// holding `lat`, `lon` takes the variant biome: a fixed hash of the cell.
+pub fn variant_cell(lat: f64, lon: f64) -> bool {
+    let step = VARIANT_CELL_M / 111_320.0;
+    let (cx, cz) = ((lon / step).floor() as i64, (lat / step).floor() as i64);
+    let mut h = (cx as u64).rotate_left(32) ^ (cz as u64) ^ 0x5DEE_CE66_D1CE_4E5B;
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (h ^ (h >> 31)) % 1000 < VARIANT_SHARE
 }
 
 impl EarthGenerator {
@@ -185,7 +542,7 @@ impl EarthGenerator {
         };
         let (x, z) = (f64::from(qx) * 4.0 + 2.0, f64::from(qz) * 4.0 + 2.0);
         let zoom = self.field.zoom_for(BIOME_SAMPLE_M);
-        // Both are asked for before either failure is reported, so one pass names everything a column lacks.
+        // All are asked for before any failure is reported, so one pass names everything a column lacks.
         let class = match a {
             Access::Local => match land.field().class_at(x, z, BIOME_SAMPLE_M) {
                 Lookup::Class(class) => Ok(class),
@@ -199,6 +556,22 @@ impl EarthGenerator {
                 .class_at_blocking(x, z, BIOME_SAMPLE_M)
                 .map_err(|e| Gap::Load(LoadError::Fetch(e))),
         };
+        let climate = match self.climate_source() {
+            None => Ok(None),
+            Some(source) => match a {
+                Access::Local => match source.field().climate_at(x, z, BIOME_SAMPLE_M) {
+                    ClimateLookup::Climate(c) => Ok(Some(c)),
+                    ClimateLookup::NoData => Ok(None),
+                    ClimateLookup::Need(fetch) => {
+                        self.note_climate(fetch);
+                        Err(Gap::Land)
+                    }
+                },
+                Access::Fetch => source
+                    .climate_at_blocking(x, z, BIOME_SAMPLE_M)
+                    .map_err(|e| Gap::Load(LoadError::Fetch(e))),
+            },
+        };
         let height = match a {
             Access::Local => self.field.height_m(x, z, zoom),
             Access::Fetch => self
@@ -207,9 +580,19 @@ impl EarthGenerator {
                 .map_err(Gap::Load)?,
         };
         let class = class?;
+        let climate = climate?;
         let elevation = f64::from(height.ok_or(Gap::Missing)?);
-        let latitude = self.field.projection().to_lat_lon(x, z).lat;
-        Ok(Biome::of(class, elevation, latitude))
+        let at = self.field.projection().to_lat_lon(x, z);
+        if !self.climate_wanted() {
+            return Ok(Biome::of(class, elevation, at.lat));
+        }
+        Ok(Biome::with_climate(
+            class,
+            elevation,
+            at.lat,
+            climate,
+            variant_cell(at.lat, at.lon),
+        ))
     }
 
     /// [`EarthGenerator::biome_core`], loading what it lacks. `plains` when cancelled.

@@ -194,7 +194,8 @@ pub fn pending_land_host_of(
     (!approved.contains(&host)).then_some(host)
 }
 
-/// Every host a world with `settings` wants to download from: the tile server's, then the land cover server's
+/// Every host a world with `settings` wants to download from: the tile server's, then the land cover server's,
+/// then the climate server's
 /// (when the world uses land cover and the game has an address for it). Hosts the game would not use are left
 /// out.
 pub fn wanted_hosts(
@@ -210,6 +211,14 @@ pub fn wanted_hosts(
         hosts.push(host);
     }
     if let Some(host) = crate::earth_landnet::host_for(settings, land_address)
+        && !hosts.contains(&host)
+    {
+        hosts.push(host);
+    }
+    // The climate server only matters to a world that has land cover.
+    if land_address.is_some()
+        && let Some(host) =
+            crate::earth_climatenet::host_for(settings, crate::earth_climatenet::address().as_deref())
         && !hosts.contains(&host)
     {
         hosts.push(host);
