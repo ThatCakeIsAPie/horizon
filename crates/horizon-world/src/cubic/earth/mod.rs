@@ -38,6 +38,8 @@ pub mod vegetation;
 #[cfg(test)]
 mod vegetation_tests;
 pub mod water;
+#[cfg(test)]
+mod water_tests;
 
 pub use biome::{Biome, EarthBiomes};
 pub use far_trees::{FarBlocks, FarDecor, MAX_TREE_UP};
