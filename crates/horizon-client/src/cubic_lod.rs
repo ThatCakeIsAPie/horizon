@@ -275,6 +275,7 @@ impl CubicLodSampler {
             Box::new(GpuCubeSampler::cpu(f.params.clone(), f.columns.clone()))
                 as Box<dyn CubeSampler>
         });
+        // Earth has no structures, so its trees are near-only for now (docs/earth.md, "Plants and trees").
         let structures = (level.generation().structures.clone())
             .filter(|_| level.generation().kind == CubicKind::Custom)
             .map(|s| {

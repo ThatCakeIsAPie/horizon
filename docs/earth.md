@@ -34,9 +34,10 @@ type into it, Escape lets go of it, and Done and Cancel are in the footer.
 The Presets overlay shows the same settings as JSON, with four that have no box: `seaLevelY` (the block height of
 sea level, 0 by default), `verticalExaggeration` (1), `maxZoom` (the finest tile zoom, 15) and `structures`.
 Everything is saved in the world's `cubicgen.json`. There are no switches for downloads or land cover: a new Earth
-world is always saved with `allowDownloads: true` and, when the game has a land cover source, `landCover: true`.
-A world made before this keeps what its file says (a world with no `landCover` stays elevation-only, because
-switching its terrain mid-world would leave seams).
+world is always saved with `allowDownloads: true` and, when the game has a land cover source, `landCover: true` and
+`vegetation: true` (plants and trees, see [Plants and trees](#plants-and-trees)). A world made before this keeps
+what its file says (a world with no `landCover` stays elevation-only, and one with no `vegetation` grows nothing,
+because switching its terrain mid-world would leave seams).
 
 ## Where tiles are kept
 
@@ -243,9 +244,44 @@ Choices worth knowing:
 - **The cache key.** `terrain_key()` ends with `#landcover<data rules>.<surface rules>` while land cover is on, and
   is exactly what it was while off, so worlds made either way never share a far-view cache.
 
+### Plants and trees
+
+With `"vegetation": true` and land cover on, an Earth world grows 26.3's own vegetation: the vegetal-step features of
+each biome (trees, grass, ferns, flowers, bushes, cacti, dead bushes, kelp and seagrass in water, swamp and mangrove
+trees), run by the same code as Custom Cubic (`custom/vegetation.rs`) in each cube's population. Earth's population
+does nothing else: no ores, lakes or springs. Without land cover the world has one biome and grows nothing, and the
+settings in force say `vegetation` is off (`cubic_gen.rs`).
+
+The biomes are read at 500 m, too coarse to place a forest's edge, so the density follows the 10 m land class of
+the exact column (`earth/vegetation.rs`, `EarthVegetationMask`). Each feature is sorted by its name into a kind:
+**Tree** (`trees_*`, `bamboo_*`, `birch_tall`, `dark_forest_vegetation`, `mushroom_island_vegetation`,
+`pale_garden_vegetation`, `fallen_*`), **Water** (seagrass, kelp, sea pickles, `warm_ocean_vegetation`, coral),
+**Dry** (cactus, dead bush, dry grass) and **Plant** (everything else: grass, ferns, flowers, bushes, berries, sugar
+cane, pumpkins, mushrooms, lily pads, leaf litter...).
+
+| Class | What grows |
+|---|---|
+| tree cover | everything the biome has (the forest's density is the biome's own) |
+| shrubland | plants and dry plants; trees on a fixed 20 % of the columns |
+| grassland | plants; trees on a fixed 2 % of the columns |
+| cropland, moss and lichen | plants only |
+| bare | dry plants only (cactus and dead bush in a desert, as vanilla) |
+| built-up, snow and ice | nothing |
+| water | water plants only |
+| wetland, mangroves | everything (the `swamp` and `mangrove_swamp` features) |
+| no data, or no file | everything the biome has |
+
+The share of columns that may hold a tree is a fixed hash of the column, so the vanilla feature still decides where
+a tree stands and the share thins its density. Lily pads count as plants, so they float on swamps but not on lakes.
+
+- **The cache key.** `terrain_key()` also ends with `#vegetation<rules>` while land cover and vegetation are on, so
+  old far-view caches are rebuilt. The far view does not draw Earth's trees yet: Custom Cubic's far trees
+  (`cubic_far_structures.rs`) hang off its structures, which Earth has none of, and would read Earth's tiles with
+  blocking calls on the far view's idle thread, which would hang while a tile cannot be had.
+
 ### Still missing
 
-- **Trees**, buildings, roads, farmland: the map only changes the ground and the biome.
+- Trees in the far view (they grow near the player only), buildings, roads, farmland.
 - Not checked against a real file by the tests (they use synthetic data only): the half-pixel convention (the reader
   treats a pixel as the area it covers), and whether overview levels keep class boundaries well (they are taken as
   the file gives them). See the real-data check in the pull request for how the rules look at the Grand Canyon.

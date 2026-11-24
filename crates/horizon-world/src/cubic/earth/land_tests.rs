@@ -28,14 +28,14 @@ fn mosaic(lat: f64, lon: f64) -> u8 {
 
 /// An Earth generator with land cover over synthetic elevation and a miniature WorldCover, and the same world
 /// without land cover over the same tiles.
-struct LandRig {
-    generator: EarthGenerator,
+pub(super) struct LandRig {
+    pub(super) generator: EarthGenerator,
     plain: EarthGenerator,
-    store: Arc<TileStore>,
-    land: Arc<MemoryLandCover>,
-    source: Arc<LandCoverSource>,
+    pub(super) store: Arc<TileStore>,
+    pub(super) land: Arc<MemoryLandCover>,
+    pub(super) source: Arc<LandCoverSource>,
     blocks: EarthBlocks,
-    settings: EarthSettings,
+    pub(super) settings: EarthSettings,
     _dirs: (TempDir, TempDir),
 }
 
@@ -101,7 +101,7 @@ impl LandRig {
     }
 
     /// A rig of one class over level ground of `metres` at `(lat0, LON0)`.
-    fn level(lat0: f64, metres: f64, class: u8) -> Self {
+    pub(super) fn level(lat0: f64, metres: f64, class: u8) -> Self {
         Self::new(
             EarthSettings::at(lat0, LON0),
             move |_, _| metres,

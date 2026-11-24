@@ -11,10 +11,13 @@
 //!   Cube populations whose 2 x 2 x 2 region touches the vanilla range are
 //!   skipped (vanilla decorated that range itself): [`needs_population`].
 //! * **Flat**: CubicWorldGen's flat generator, nothing to populate.
-//! * **Earth**: terrain from real elevation tiles (`horizon-earth`), one
-//!   biome (plains), nothing to populate and no vegetation or structures
-//!   yet. Its tiles come from the world's cache and, when the world allows
-//!   it, its tile server (`earth_net`).
+//! * **Earth**: terrain from real elevation tiles (`horizon-earth`), no
+//!   structures. With land cover on it has biomes from the map and, when its
+//!   settings say `vegetation`, a population that only grows 26.3's plants
+//!   and trees where the land cover allows them (no ores or lakes); without
+//!   either, one biome (plains) and nothing to populate. Its tiles come from
+//!   the world's cache and, when the world allows it, its tile server
+//!   (`earth_net`).
 //!
 //! # Population state
 //!
@@ -94,7 +97,8 @@ impl CubicGeneration {
 }
 
 /// Whether the population of cube `p` runs in a world of `kind`: always in
-/// Custom, never in Flat or Earth, and in Hybrid when neither `p` nor the cube above
+/// Custom, never in Flat or Earth (an Earth world with vegetation populates:
+/// [`Generation::needs_population`]), and in Hybrid when neither `p` nor the cube above
 /// it (its region) is in vanilla's range.
 pub fn needs_population(kind: CubicKind, p: SectionPos) -> bool {
     match kind {
@@ -180,9 +184,9 @@ impl Generation {
             });
         }
         if choice.kind == CubicKind::Earth {
-            // The settings name the place and the tiles; nothing else is
-            // read from the generator data: one biome, no vegetation and
-            // no structures (yet).
+            // The settings name the place and the tiles. The generator data
+            // gives only the vegetation (with land cover and `vegetation` on);
+            // no structures.
             let mut settings = EarthSettings::from_json(&text)?;
             let tiles = tiles.unwrap_or_else(|| {
                 Arc::new(crate::earth_net::open(
@@ -201,7 +205,20 @@ impl Generation {
                 tiles.store.clone(),
                 tiles.land.clone(),
                 registry,
-            )?;
+            )?
+            .with_seed(seed);
+            // Plants and trees need the map's biomes and classes: a world without land cover grows nothing, and its
+            // far-view cache key says so.
+            let vegetation = match (settings.vegetation, data, generator.earth_vegetation_mask()) {
+                (true, Some(data), Some(mask)) => {
+                    Vegetation::new(data, seed).map(|v| Arc::new(v.with_mask(mask)))
+                }
+                _ => None,
+            };
+            if settings.vegetation && vegetation.is_none() {
+                log::info!("Horizon: this Earth world grows no plants (vegetation needs land cover)");
+                settings.vegetation = false;
+            }
             // One biome, unless the generator reads land cover.
             let columns = generator
                 .earth_biomes()
@@ -212,7 +229,7 @@ impl Generation {
                 settings: None,
                 columns,
                 climate: None,
-                vegetation: None,
+                vegetation,
                 structures: None,
                 earth: Some(EarthParts { settings, tiles }),
                 seed,
@@ -282,6 +299,15 @@ impl Generation {
             earth: None,
             seed,
         })
+    }
+
+    /// Whether the population of cube `p` runs: [`needs_population`] for the
+    /// world's kind, and in an Earth world whenever it has vegetation.
+    pub fn needs_population(&self, p: SectionPos) -> bool {
+        match self.kind {
+            CubicKind::Earth => self.vegetation.is_some(),
+            kind => needs_population(kind, p),
+        }
     }
 
     /// The biomes of cube column (`cx`, `cz`) as a section's biome container

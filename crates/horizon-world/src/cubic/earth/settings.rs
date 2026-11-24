@@ -44,6 +44,12 @@ pub struct EarthSettings {
     /// while it is off, so a world made without land cover keeps the text (and the cache key) it always had.
     #[serde(default, skip_serializing_if = "is_false")]
     pub land_cover: bool,
+    /// Whether the world grows vanilla vegetation (trees, grass, flowers, ...) with its density following land
+    /// cover ([`super::vegetation`]). It does nothing without `landCover` (and a source of it), so the key only
+    /// carries it then. Off by default, in `at` too (the client turns it on for new worlds), and left out of the
+    /// file while off, so an older world keeps its text and its cache key.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vegetation: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -76,6 +82,7 @@ impl EarthSettings {
             allow_downloads: false,
             structures: false,
             land_cover: false,
+            vegetation: false,
         }
     }
 
@@ -186,7 +193,9 @@ impl EarthSettings {
     /// older rule are not shown. With land cover on it also carries the version of the land-cover data rules
     /// ([`horizon_earth::LAND_COVER_RULES`]) and of the land-cover surface and biome rules
     /// ([`super::surface::LAND_RULES`]), so a world made with land cover never shares a cache with one made
-    /// without; with it off the text is what it was before land cover existed.
+    /// without; with it off the text is what it was before land cover existed. With land cover and vegetation
+    /// both on it ends with the version of the vegetation rules ([`super::vegetation::VEGETATION_RULES`]);
+    /// vegetation without land cover does nothing and is not in the key.
     pub fn terrain_key(&self) -> String {
         let mut key = format!(
             "{}#surface{}#clean{}",
@@ -200,6 +209,12 @@ impl EarthSettings {
                 horizon_earth::LAND_COVER_RULES,
                 super::surface::LAND_RULES
             ));
+            if self.vegetation {
+                key.push_str(&format!(
+                    "#vegetation{}",
+                    super::vegetation::VEGETATION_RULES
+                ));
+            }
         }
         key
     }
@@ -246,6 +261,7 @@ mod tests {
             allow_downloads: true,
             structures: true,
             land_cover: true,
+            vegetation: true,
         };
         for text in [s.to_json_pretty(), s.to_json_compact()] {
             assert_eq!(EarthSettings::from_json(&text).unwrap(), s);
@@ -262,6 +278,7 @@ mod tests {
             "allowDownloads",
             "structures",
             "landCover",
+            "vegetation",
         ] {
             assert!(value.get(key).is_some(), "missing {key}");
         }
@@ -305,6 +322,60 @@ mod tests {
             format!(
                 "{}#surface{}#clean{}",
                 off.to_json_compact(),
+                super::super::surface::RULES,
+                horizon_earth::clean::CLEAN_RULES
+            )
+        );
+    }
+
+    #[test]
+    fn vegetation_is_off_when_absent_and_left_out_of_the_file_while_off() {
+        let old = EarthSettings::from_json(
+            r#"{"originLatitude": 46.0, "originLongitude": 7.5, "landCover": true}"#,
+        )
+        .unwrap();
+        assert!(!old.vegetation);
+        assert!(!old.to_json_compact().contains("vegetation"));
+        assert!(!EarthSettings::at(46.0, 7.5).vegetation);
+        let on = EarthSettings::from_json(
+            r#"{"originLatitude": 46.0, "originLongitude": 7.5, "vegetation": true}"#,
+        )
+        .unwrap();
+        assert!(on.vegetation);
+        assert!(on.to_json_compact().contains(r#""vegetation":true"#));
+    }
+
+    #[test]
+    fn the_terrain_key_carries_vegetation_only_with_land_cover() {
+        let base = EarthSettings::at(46.0, 7.5);
+        let key = |land_cover, vegetation| {
+            let mut s = base.clone();
+            s.land_cover = land_cover;
+            s.vegetation = vegetation;
+            s.terrain_key()
+        };
+        let rules = format!("#vegetation{}", super::super::vegetation::VEGETATION_RULES);
+        // With land cover, vegetation adds its rules after the land-cover part.
+        let with = key(true, true);
+        assert!(with.ends_with(&rules), "{with}");
+        let land = format!(
+            "#landcover{}.{}",
+            horizon_earth::LAND_COVER_RULES,
+            super::super::surface::LAND_RULES
+        );
+        assert!(key(true, false).ends_with(&land));
+        assert!(with.ends_with(&format!("{land}{rules}")), "{with}");
+        assert!(!key(true, false).contains("#vegetation"));
+        assert_ne!(with, key(true, false));
+        // Without land cover vegetation does nothing, so only the file's own text differs.
+        let plain = key(false, false);
+        let veg_only = key(false, true);
+        assert!(!veg_only.contains("#vegetation"), "{veg_only}");
+        assert_eq!(
+            plain,
+            format!(
+                "{}#surface{}#clean{}",
+                base.to_json_compact(),
                 super::super::surface::RULES,
                 horizon_earth::clean::CLEAN_RULES
             )

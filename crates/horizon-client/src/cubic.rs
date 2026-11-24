@@ -34,7 +34,7 @@ use crate::biome::Biomes;
 use crate::chunk::{Chunk, ColumnLayout, LevelShape, Section, block_strategy};
 use crate::cubic_gen::{
     CubicGeneration, CubicKind, Generation, Held, PARTIAL, POPULATED, PopRegion, Population,
-    STRUCTURES, needs_population, root_flags, set_root_flags,
+    STRUCTURES, root_flags, set_root_flags,
 };
 use crate::save::{ChunkExtras, Persistent, SaveTables, decode_with, encode_with};
 use crate::streaming::{ChunkGenerator, Proto};
@@ -1100,7 +1100,7 @@ impl CubicLevel {
     fn ensure_populated_around(&self, pos: SectionPos) {
         for d in 0..8 {
             let p = SectionPos::new(pos.x - (d & 1), pos.y - (d >> 1 & 1), pos.z - (d >> 2 & 1));
-            if needs_population(self.wg.kind, p)
+            if self.wg.needs_population(p)
                 && horizon_world::cubic::has_cube_y(p.y)
                 && !self.is_populated(p)
             {
@@ -1137,6 +1137,11 @@ impl CubicLevel {
         )
         .with_structures(self.wg.structures.clone());
         self.wg.generator.populate(p, &mut region);
+        // Nothing made after the generator was cancelled (an Earth level
+        // shutting down: air terrain, plants missing) is saved.
+        if self.generation_cancelled() {
+            return;
+        }
         let (placed_block_entities, placed_entities) = region.take_placed();
         let dirty = region.dirty();
         let mut blocks = region.into_blocks();
@@ -2535,19 +2540,8 @@ mod tests {
         /// `level_with`, generating with 26.3's generator data (its biomes,
         /// vegetation and structures), loaded once per process.
         fn level_with_data(&self, kind: CubicKind, settings_json: String) -> Arc<CubicLevel> {
-            static DATA: std::sync::OnceLock<Arc<horizon_world::worldgen::generator::GeneratorData>> =
-                std::sync::OnceLock::new();
             let registry = self.assets.registry;
-            let data = DATA.get_or_init(|| {
-                let root = std::path::PathBuf::from(
-                    std::env::var_os("HORIZON_TEST_RESOURCES").expect("resources"),
-                );
-                horizon_world::worldgen::generator::GeneratorData::load(
-                    &root.join("worldgen"),
-                    registry,
-                )
-                .expect("worldgen data")
-            });
+            let data = self.data();
             let window = LevelShape::cubic_window(LevelShape::OVERWORLD, -192, 512);
             let generation = CubicGeneration {
                 kind,
@@ -2566,6 +2560,23 @@ mod tests {
             level.set_tables(self.tables.clone());
             level
         }
+        /// 26.3's generator data, loaded once per process.
+        fn data(&self) -> &'static Arc<horizon_world::worldgen::generator::GeneratorData> {
+            static DATA: std::sync::OnceLock<Arc<horizon_world::worldgen::generator::GeneratorData>> =
+                std::sync::OnceLock::new();
+            let registry = self.assets.registry;
+            DATA.get_or_init(|| {
+                let root = std::path::PathBuf::from(
+                    std::env::var_os("HORIZON_TEST_RESOURCES").expect("resources"),
+                );
+                horizon_world::worldgen::generator::GeneratorData::load(
+                    &root.join("worldgen"),
+                    registry,
+                )
+                .expect("worldgen data")
+            })
+        }
+
         /// A level whose generator takes `settings_json` (a world's
         /// cubicgen.json; empty: the defaults).
         fn level_with(&self, kind: CubicKind, settings_json: String) -> Arc<CubicLevel> {
@@ -2594,12 +2605,23 @@ mod tests {
             settings: &horizon_world::cubic::earth::EarthSettings,
             fetcher: Arc<horizon_earth::testing::MemoryFetcher>,
         ) -> Arc<CubicLevel> {
+            self.earth_level_with(settings, fetcher, None, None)
+        }
+        /// [`Self::earth_level`] reading land cover from `land` and 26.3's
+        /// generator data (biomes and vegetation) from `data`.
+        fn earth_level_with(
+            &self,
+            settings: &horizon_world::cubic::earth::EarthSettings,
+            fetcher: Arc<horizon_earth::testing::MemoryFetcher>,
+            land: Option<Arc<horizon_earth::LandCoverSource>>,
+            data: Option<&Arc<horizon_world::worldgen::generator::GeneratorData>>,
+        ) -> Arc<CubicLevel> {
             let dir = self.dir.join("tiles");
             let tiles = crate::earth_net::EarthTiles {
                 store: Arc::new(horizon_earth::TileStore::new(&dir, fetcher, 64)),
                 downloads: true,
                 dir,
-                land: None,
+                land,
             };
             let generation = CubicGeneration {
                 kind: CubicKind::Earth,
@@ -2609,7 +2631,7 @@ mod tests {
                 &generation,
                 1,
                 self.assets.registry,
-                None,
+                data,
                 Some(Arc::new(tiles)),
             )
             .expect("generation");
@@ -4353,14 +4375,100 @@ mod tests {
             EarthSettings::from_json(&generation.settings_json).unwrap(),
             settings
         );
-        assert!(!needs_population(
+        assert!(!crate::cubic_gen::needs_population(
             CubicKind::Earth,
             SectionPos::new(0, 5, 0)
         ));
-        assert!(!needs_population(
+        assert!(!crate::cubic_gen::needs_population(
             CubicKind::Earth,
             SectionPos::new(9, -90, 4)
         ));
+    }
+
+    /// Logs and leaves above the ground in the 3 x 3 cube columns around the
+    /// origin, at the surface's cube and the one above it.
+    fn tree_blocks(f: &Fixture, level: &CubicLevel) -> usize {
+        let surface = origin_surface();
+        let tree = |name: &str| name.ends_with("_log") || name.ends_with("_leaves");
+        let mut count = 0;
+        for cx in -1..=1 {
+            for cz in -1..=1 {
+                for cy in [surface >> 4, (surface >> 4) + 1] {
+                    let cube = level.make_cube(SectionPos::new(cx, cy, cz));
+                    for i in 0..4096 {
+                        let state = horizon_world::registry::BlockStateId(cube.section.get(i));
+                        if (f.assets.registry.state(state)).is_some_and(|s| tree(&s.name)) {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn an_earth_world_with_vegetation_grows_trees_on_tree_cover_and_one_without_the_key_grows_none() {
+        use horizon_earth::testing::MemoryLandCover;
+        use horizon_earth::{LandCoverStore, WorldCoverFile};
+        let Some(f) = Fixture::new("earth-trees") else {
+            return;
+        };
+        let land_of = |settings: &EarthSettings, code: u8| {
+            let mut land = MemoryLandCover::new();
+            for (dlat, dlon) in [(-0.7, -0.7), (-0.7, 0.7), (0.7, -0.7), (0.7, 0.7)] {
+                if let Some(file) = WorldCoverFile::containing(46.0 + dlat, 7.5 + dlon) {
+                    land = land.with_classes(file, 384, 96, 2, move |_, _| code);
+                }
+            }
+            let fetcher: Arc<dyn horizon_earth::LandCoverFetcher> = Arc::new(land);
+            settings
+                .land_cover_source(
+                    Arc::new(LandCoverStore::new(f.dir.join(format!("land-{code}")), 64)),
+                    fetcher,
+                )
+                .unwrap()
+        };
+        // Tree cover (ESA class 10) with vegetation on: the population runs and grows trees.
+        let mut settings = earth_settings();
+        settings.land_cover = true;
+        settings.vegetation = true;
+        let level = f.earth_level_with(
+            &settings,
+            Arc::new(MemoryFetcher::new(hills)),
+            Some(land_of(&settings, 10)),
+            Some(f.data()),
+        );
+        assert!(level.generation().vegetation.is_some());
+        assert!(level.generation().needs_population(SectionPos::new(0, 5, 0)));
+        let forest = tree_blocks(&f, &level);
+        assert!(forest > 50, "a forest grows trees: {forest} log and leaf blocks");
+        drop(level);
+        // The same forest in a world whose file has no `vegetation` key: nothing to populate.
+        let Some(g) = Fixture::new("earth-no-trees") else {
+            return;
+        };
+        let mut old = earth_settings();
+        old.land_cover = true;
+        let level = g.earth_level_with(
+            &old,
+            Arc::new(MemoryFetcher::new(hills)),
+            Some(land_of(&old, 10)),
+            Some(g.data()),
+        );
+        assert!(level.generation().vegetation.is_none());
+        assert!(!level.generation().needs_population(SectionPos::new(0, 5, 0)));
+        assert_eq!(tree_blocks(&g, &level), 0);
+        // Vegetation without land cover grows nothing, and the settings in force say so (the far-view key).
+        let Some(h) = Fixture::new("earth-no-land") else {
+            return;
+        };
+        let mut no_land = earth_settings();
+        no_land.vegetation = true;
+        let level = h.earth_level_with(&no_land, Arc::new(MemoryFetcher::new(hills)), None, Some(h.data()));
+        assert!(level.generation().vegetation.is_none());
+        let earth = level.generation().earth.as_ref().unwrap();
+        assert!(!earth.settings.vegetation);
     }
 
     #[test]

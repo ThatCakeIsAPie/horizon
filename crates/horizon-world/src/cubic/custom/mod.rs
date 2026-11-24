@@ -18,7 +18,10 @@
 //! * [`CustomCubicGenerator::populate`] adds ores, lakes and springs, and
 //!   calls [`CubeWorld::decorate_surface`] for the integrator's vegetation.
 //!   It writes into the 2 x 2 x 2 cubes from the populated cube up (CWG's
-//!   +8 offset), see [`populate`].
+//!   +8 offset), see [`populate`]. Earth populates only that hook (no ores,
+//!   lakes or springs), with the random from the seed given to
+//!   [`CustomCubicGenerator::with_seed`]; the integrator masks its vegetation
+//!   by land cover with [`CustomCubicGenerator::earth_vegetation_mask`].
 //! * [`CustomCubicGenerator::block_at`] is density plus replacers without
 //!   carvers or population, for the far terrain; `resolution_blocks > 1`
 //!   skips noise octaves finer than that. [`CustomCubicGenerator::surface_y`]
@@ -84,6 +87,7 @@ use biomes::{BiomeBlend, BiomeResolver, SURFACE_BLOCKS};
 use bounds::{Analyzer, Query};
 use density::{Lattice, TerrainNoise, cell_at};
 use replacers::{BlockCtx, Replacers, resolve_block};
+use rng::coords_seed_random;
 use settings::{BlockStateDesc, IntAabb, ReplacerConfig};
 
 struct Terrain {
@@ -109,6 +113,8 @@ enum Kind {
 pub struct CustomCubicGenerator {
     kind: Kind,
     areas: Vec<(IntAabb, CustomCubicGenerator)>,
+    /// The world seed of an Earth world's population random (see [`Self::with_seed`]); unused by the others.
+    earth_seed: i64,
 }
 
 impl CustomCubicGenerator {
@@ -168,6 +174,7 @@ impl CustomCubicGenerator {
                 biome_scale: settings.biome_scale(),
             })),
             areas,
+            earth_seed: 0,
         })
     }
 
@@ -179,6 +186,7 @@ impl CustomCubicGenerator {
         Ok(Self {
             kind: Kind::Flat(flat::FlatGenerator::new(settings, registry)?),
             areas: Vec::new(),
+            earth_seed: 0,
         })
     }
 
@@ -210,7 +218,28 @@ impl CustomCubicGenerator {
         Ok(Self {
             kind: Kind::Heightmap(Arc::new(generator)),
             areas: Vec::new(),
+            earth_seed: 0,
         })
+    }
+
+    /// The same generator with `seed` as the world seed of an Earth world's population: the random of each
+    /// cube's vegetation is `coords_seed_random(seed, cube)`, as for Cubic. Only an Earth generator uses it;
+    /// it defaults to 0.
+    pub fn with_seed(mut self, seed: i64) -> Self {
+        self.earth_seed = seed;
+        self
+    }
+
+    /// The vegetation mask of an Earth world whose generator reads land cover: features grow by the class of
+    /// each column ([`earth::vegetation`]). `None` without land cover and for the other kinds, which grow
+    /// vegetation unmasked.
+    pub fn earth_vegetation_mask(&self) -> Option<Arc<dyn vegetation::VegetationMask>> {
+        match &self.kind {
+            Kind::Heightmap(e) if e.land_cover_active() => {
+                Some(Arc::new(earth::EarthVegetationMask::new(e.clone())))
+            }
+            _ => None,
+        }
     }
 
     /// The biome source of an Earth world whose generator reads land cover; `None` when it does not (every column
@@ -360,8 +389,14 @@ impl CustomCubicGenerator {
         if let Some(g) = self.area(cube) {
             return g.populate(cube, world);
         }
-        if let Kind::Terrain(t) = &self.kind {
-            t.populator.populate(cube, world, &t.blend);
+        match &self.kind {
+            Kind::Terrain(t) => t.populator.populate(cube, world, &t.blend),
+            // Earth has only vegetation: no ores, lakes or springs.
+            Kind::Heightmap(_) => world.decorate_surface(
+                cube,
+                &mut coords_seed_random(self.earth_seed, cube.x, cube.y, cube.z),
+            ),
+            Kind::Flat(_) => {}
         }
     }
 

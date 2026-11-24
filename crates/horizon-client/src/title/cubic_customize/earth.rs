@@ -242,6 +242,8 @@ impl Draft {
         settings.tile_url = self.url.trim().to_owned();
         settings.allow_downloads = self.host().is_some();
         settings.land_cover = self.land_on();
+        // Plants and trees follow the land cover, so a new world grows them whenever it has it.
+        settings.vegetation = settings.land_cover;
         let limit = horizon_earth::projection::MAX_LATITUDE;
         if settings.origin_latitude.abs() > limit {
             return Err(Problem::new(

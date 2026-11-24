@@ -20,6 +20,13 @@
 //!    surface block inside the area, so every surface belongs to exactly one
 //!    population (no tree is placed twice).
 //!
+//! # Mask
+//!
+//! [`Vegetation::with_mask`] adds a [`VegetationMask`]: a feature's biome gate then also asks the mask
+//! whether the named feature may grow at the column. Earth uses it to thin or forbid features by land
+//! cover (`cubic::earth::vegetation`). The random is used exactly the same way with or without a mask, and
+//! without one (the default) nothing changes.
+//!
 //! # Not done
 //!
 //! * Top layer modification (snow, ice) and the other decoration steps
@@ -49,6 +56,13 @@ const VEGETAL_STEP: usize = 9;
 /// The region is 2 cubes wide; the area a population decorates its middle.
 const REGION: i32 = 32;
 
+/// Whether a named feature may grow at a block column, asked on top of the biome. Called from the
+/// threads that populate, possibly many times per cube, so it should be quick (it may block on data).
+pub trait VegetationMask: Send + Sync {
+    /// `feature` is the placed feature's name without the `minecraft:` namespace (`trees_plains`).
+    fn allows(&self, x: i32, z: i32, feature: &str) -> bool;
+}
+
 /// The vegetation of one generator.
 pub struct Vegetation {
     data: Arc<GeneratorData>,
@@ -58,6 +72,8 @@ pub struct Vegetation {
     air: u32,
     /// The vegetal features of each biome id, built when first asked.
     lists: Vec<OnceLock<Arc<[String]>>>,
+    /// An extra say on where features grow; `None` for the plain Cubic generator.
+    mask: Option<Arc<dyn VegetationMask>>,
 }
 
 impl Vegetation {
@@ -76,7 +92,14 @@ impl Vegetation {
             seed,
             air,
             lists,
+            mask: None,
         })
+    }
+
+    /// The same vegetation where a feature also needs `mask` to allow its column.
+    pub fn with_mask(mut self, mask: Arc<dyn VegetationMask>) -> Self {
+        self.mask = Some(mask);
+        self
     }
 
     fn list(&self, biome: BiomeId) -> Arc<[String]> {
@@ -151,7 +174,9 @@ impl Vegetation {
         };
         let origin = [min[0] + 8, min[1] + 8, min[2] + 8];
         let surface = (min[1] + 8, min[1] + 24);
+        let mask = self.mask.as_deref();
         for (i, name) in order.iter().enumerate() {
+            let bare = name.strip_prefix("minecraft:").unwrap_or(name);
             let mut feature_random = LegacyRandom::new(
                 base ^ (i as i64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as i64),
             );
@@ -161,6 +186,7 @@ impl Vegetation {
                     return false;
                 }
                 lists[(qz * 8 + qx) as usize].contains(name)
+                    && mask.is_none_or(|m| m.allows(p[0], p[2], bare))
             };
             place_biome_feature(
                 &self.behaviours,

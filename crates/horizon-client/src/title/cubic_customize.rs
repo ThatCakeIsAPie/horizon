@@ -3886,9 +3886,10 @@ mod tests {
         );
         // Downloads and land cover are on, with no switch to turn them off.
         let settings = earth_settings(&s).unwrap();
-        assert!(settings.allow_downloads && settings.land_cover);
+        assert!(settings.allow_downloads && settings.land_cover && settings.vegetation);
         let json = s.json();
         assert!(json.contains("\"landCover\": true") && json.contains("\"allowDownloads\": true"));
+        assert!(json.contains("\"vegetation\": true"), "{json}");
         let labels: Vec<String> = page(&s)
             .widgets
             .iter()
@@ -3933,9 +3934,12 @@ mod tests {
         old.load_json(r#"{"originLatitude":1,"originLongitude":2,"landCover":false}"#)
             .unwrap();
         assert!(earth_settings(&old).unwrap().land_cover);
-        // A game with no source has none to use.
+        assert!(earth_settings(&old).unwrap().vegetation);
+        // A game with no source has none to use, and so no plants or trees.
         let none = earth_with(crate::earth_consent::Approved::of(&[]), Some(OFFER));
         assert!(!earth_settings(&none).unwrap().land_cover);
+        assert!(!earth_settings(&none).unwrap().vegetation);
+        assert!(!none.json().contains("vegetation"));
     }
 
     #[test]

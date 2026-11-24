@@ -9,6 +9,9 @@
 //! With the `landCover` setting and a source of land cover handed to the generator, the top of a column and its
 //! biome follow the map ([`biome`], [`surface`]); without either the terrain is exactly the elevation-only one.
 //!
+//! With land cover and the `vegetation` setting, vanilla trees, grass and flowers grow, their density following
+//! the class of each column ([`vegetation`]).
+//!
 //! Missing tiles are never guessed: the generator's plain queries give [`NotReady`] naming the tiles to fetch,
 //! and its `*_blocking` forms ([`blocking`]) fetch and wait. The far view reads whole nodes in one batch without
 //! waiting ([`far`]).
@@ -21,10 +24,14 @@ pub mod generator;
 mod land_tests;
 pub mod settings;
 pub mod surface;
+pub mod vegetation;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vegetation_tests;
 
 pub use biome::{Biome, EarthBiomes};
 pub use generator::{BIOME, EarthBlocks, EarthGenerator, Fill, NotReady};
 pub use settings::EarthSettings;
 pub use surface::SurfaceKind;
+pub use vegetation::{EarthVegetationMask, FeatureKind, VEGETATION_RULES};
