@@ -117,6 +117,8 @@ pub struct CustomCubicGenerator {
     areas: Vec<(IntAabb, CustomCubicGenerator)>,
     /// The world seed of an Earth world's population random (see [`Self::with_seed`]); unused by the others.
     earth_seed: i64,
+    /// An Earth world's ores, deepslate and ore meteors ([`Self::with_earth_ores`]).
+    earth_ores: Option<Box<earth::ores::EarthOres>>,
 }
 
 impl CustomCubicGenerator {
@@ -178,6 +180,7 @@ impl CustomCubicGenerator {
             })),
             areas,
             earth_seed: 0,
+            earth_ores: None,
         })
     }
 
@@ -190,6 +193,7 @@ impl CustomCubicGenerator {
             kind: Kind::Flat(flat::FlatGenerator::new(settings, registry)?),
             areas: Vec::new(),
             earth_seed: 0,
+            earth_ores: None,
         })
     }
 
@@ -238,6 +242,7 @@ impl CustomCubicGenerator {
             kind: Kind::Heightmap(Arc::new(generator)),
             areas: Vec::new(),
             earth_seed: 0,
+            earth_ores: None,
         })
     }
 
@@ -247,6 +252,21 @@ impl CustomCubicGenerator {
     pub fn with_seed(mut self, seed: i64) -> Self {
         self.earth_seed = seed;
         self
+    }
+
+    /// The same Earth generator with ores: deepslate under the ground, stone patches and ores by depth, and ore
+    /// meteors ([`earth::ores`]), for an Earth world whose settings have `oreGen`. Build `ores` with the same
+    /// world seed as [`Self::with_seed`]. No effect on the other kinds.
+    pub fn with_earth_ores(mut self, ores: earth::ores::EarthOres) -> Self {
+        if matches!(self.kind, Kind::Heightmap(_)) {
+            self.earth_ores = Some(Box::new(ores));
+        }
+        self
+    }
+
+    /// Whether population places Earth ores ([`Self::with_earth_ores`]).
+    pub fn has_earth_ores(&self) -> bool {
+        self.earth_ores.is_some()
     }
 
     /// The vegetation mask of an Earth world whose generator reads land cover: features grow by the class of
@@ -412,11 +432,20 @@ impl CustomCubicGenerator {
             Kind::Terrain(t) => t
                 .populator
                 .populate(cube, world, &t.blend, &|x, z| t.ground(x, z)),
-            // Earth has only vegetation: no ores, lakes or springs.
-            Kind::Heightmap(_) => world.decorate_surface(
-                cube,
-                &mut coords_seed_random(self.earth_seed, cube.x, cube.y, cube.z),
-            ),
+            // Earth: no lakes or springs; ores (when on) before the vegetation, meteors after it.
+            Kind::Heightmap(e) => {
+                let ground = earth::ores::EarthGround::new(e);
+                if let Some(ores) = &self.earth_ores {
+                    ores.place_ores(e, cube, world, &ground);
+                }
+                world.decorate_surface(
+                    cube,
+                    &mut coords_seed_random(self.earth_seed, cube.x, cube.y, cube.z),
+                );
+                if let Some(ores) = &self.earth_ores {
+                    ores.place_meteors(cube, world, &ground);
+                }
+            }
             Kind::Flat(_) => {}
         }
     }

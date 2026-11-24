@@ -46,6 +46,7 @@ use horizon_world::cubic::custom::{
 };
 use horizon_core::nbt::{NamedTag, Tag};
 use horizon_world::cubic::earth::EarthSettings;
+use horizon_world::cubic::earth::ores::EarthOres;
 use horizon_world::registry::BlockRegistry;
 use horizon_world::worldgen::generator::GeneratorData;
 use std::collections::{HashMap, VecDeque};
@@ -205,7 +206,7 @@ impl Generation {
                 log::info!("Horizon: this Earth world runs without climate (climate is ignored)");
                 settings.climate = false;
             }
-            let generator = CustomCubicGenerator::earth_with_sources(
+            let mut generator = CustomCubicGenerator::earth_with_sources(
                 &settings,
                 tiles.store.clone(),
                 tiles.land.clone(),
@@ -213,6 +214,10 @@ impl Generation {
                 registry,
             )?
             .with_seed(seed);
+            // Ores, stone patches and deepslate by depth (settings with `oreGen`; older worlds have none).
+            if let Some(ore_gen) = &settings.ore_gen {
+                generator = generator.with_earth_ores(EarthOres::new(seed, ore_gen, registry)?);
+            }
             // Plants and trees need the map's biomes and classes: a world without land cover grows nothing, and its
             // far-view cache key says so.
             let vegetation = match (settings.vegetation, data, generator.earth_vegetation_mask()) {
@@ -308,10 +313,10 @@ impl Generation {
     }
 
     /// Whether the population of cube `p` runs: [`needs_population`] for the
-    /// world's kind, and in an Earth world whenever it has vegetation.
+    /// world's kind, and in an Earth world whenever it has vegetation or ores.
     pub fn needs_population(&self, p: SectionPos) -> bool {
         match self.kind {
-            CubicKind::Earth => self.vegetation.is_some(),
+            CubicKind::Earth => self.vegetation.is_some() || self.generator.has_earth_ores(),
             kind => needs_population(kind, p),
         }
     }
@@ -779,6 +784,52 @@ pub struct PopulationStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An Earth world over synthetic tiles (no downloads), with `ore_gen`.
+    fn earth_generation(
+        ore_gen: Option<horizon_world::cubic::ores::OreGenSettings>,
+    ) -> (Generation, horizon_earth::testing::TempDir) {
+        let dir = horizon_earth::testing::TempDir::new();
+        let mut settings = EarthSettings::at(46.0, 7.5);
+        settings.land_cover = false;
+        settings.climate = false;
+        settings.vegetation = false;
+        settings.ore_gen = ore_gen;
+        let tiles = Arc::new(crate::earth_net::EarthTiles {
+            store: Arc::new(horizon_earth::TileStore::new(
+                dir.path(),
+                Arc::new(horizon_earth::testing::MemoryFetcher::new(|_, _| 400.0)),
+                16,
+            )),
+            downloads: false,
+            dir: dir.path().to_path_buf(),
+            land: None,
+            climate: None,
+        });
+        let choice = CubicGeneration {
+            kind: CubicKind::Earth,
+            settings_json: settings.to_json_pretty(),
+        };
+        let registry = horizon_world::cubic::custom::testing::registry_of(
+            &horizon_world::cubic::custom::testing::default_block_names(),
+        );
+        let generation = Generation::with_tiles(&choice, 1, registry, None, Some(tiles)).unwrap();
+        (generation, dir)
+    }
+
+    #[test]
+    fn an_earth_world_with_ores_populates_without_vegetation() {
+        let p = SectionPos::new(0, -3, 0);
+        let (with_ores, _dir) = earth_generation(Some(
+            horizon_world::cubic::ores::OreGenSettings::earth_defaults(),
+        ));
+        assert!(with_ores.vegetation.is_none() && with_ores.needs_population(p));
+        let (old, _dir) = earth_generation(None);
+        assert!(
+            !old.needs_population(p),
+            "an old Earth world without plants still skips population"
+        );
+    }
 
     #[test]
     fn hybrid_skips_the_populations_that_touch_vanillas_range() {

@@ -155,7 +155,8 @@ impl OreGenSettings {
         o.ores.retain_mut(|e| {
             let r = &mut e.rich;
             let (min, max) = (SEA - r.max, SEA - r.min);
-            if max < 0.0 {
+            // A band that ends at (or above) the ground has nothing under it.
+            if max <= 0.0 {
                 return false;
             }
             r.mode = RichMode::BelowGround;

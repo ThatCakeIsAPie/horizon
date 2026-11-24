@@ -20,6 +20,9 @@ pub mod biome;
 pub mod blocking;
 pub mod far;
 pub mod generator;
+pub mod ores;
+#[cfg(test)]
+mod ores_tests;
 #[cfg(test)]
 mod climate_tests;
 #[cfg(test)]

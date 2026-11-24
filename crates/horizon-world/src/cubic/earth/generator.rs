@@ -392,6 +392,15 @@ impl EarthGenerator {
         )
     }
 
+    /// The latitude and longitude (degrees) of the centre of block `(x, z)`.
+    pub fn lat_lon_at(&self, x: i32, z: i32) -> (f64, f64) {
+        let p = self
+            .field
+            .projection()
+            .to_lat_lon(f64::from(x) + 0.5, f64::from(z) + 0.5);
+        (p.lat, p.lon)
+    }
+
     /// The latitude of the centre of block `(x, z)`.
     pub(super) fn latitude_at(&self, x: i32, z: i32) -> f64 {
         self.field

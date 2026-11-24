@@ -227,7 +227,14 @@ fn earth_bands_are_depths_under_the_ground() {
     // dropped; iron's other flat band (Y -64..72) stays, cut at depth 0.
     assert_eq!(of(&o, "coal").len(), 1);
     assert_eq!(of(&o, "iron").len(), 2);
-    assert!(o.ores.iter().all(|e| e.rich.max >= 0.0));
+    assert!(o.ores.iter().all(|e| e.rich.max > 0.0));
+    // Granite, diorite and andesite's upper band (Y 64..128) ends at the ground: dropped too.
+    let granite = o
+        .ores
+        .iter()
+        .filter(|e| e.blockstate.name == "minecraft:granite")
+        .count();
+    assert_eq!(granite, 1);
     // Stone patches come along, below ground.
     for patch in ["dirt", "gravel", "granite", "diorite", "andesite", "tuff"] {
         assert!(
