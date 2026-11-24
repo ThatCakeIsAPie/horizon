@@ -18,3 +18,5 @@ pub use settings::{
 mod defaults_tests;
 #[cfg(test)]
 mod engine_tests;
+#[cfg(test)]
+mod meteor_tests;
