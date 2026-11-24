@@ -31,6 +31,9 @@ use super::biomes::BiomeBlend;
 use super::replacers::resolve_block;
 use super::rng::{JRandom, coords_seed_random, cos_f32, hash_pos, sin_f32};
 use super::settings::*;
+use crate::cubic::ores::engine::{OreCtx, OreEngine};
+use crate::cubic::ores::meteors::Meteors;
+use crate::cubic::ores::{RichMode, Shape};
 use crate::registry::BlockRegistry;
 use crate::worldgen::biome::BiomeId;
 
@@ -63,7 +66,7 @@ pub trait CubeWorld {
 
 /// A compiled `GenerationCondition`.
 #[derive(Debug)]
-enum Cond {
+pub(crate) enum Cond {
     Any(Vec<Cond>),
     All(Vec<Cond>),
     NoneOf(Vec<Cond>),
@@ -74,7 +77,7 @@ enum Cond {
 }
 
 impl Cond {
-    fn compile(c: &GenerationCondition, reg: &BlockRegistry) -> Result<Self, String> {
+    pub(crate) fn compile(c: &GenerationCondition, reg: &BlockRegistry) -> Result<Self, String> {
         let list = |v: &[GenerationCondition]| {
             v.iter()
                 .map(|c| Self::compile(c, reg))
@@ -97,7 +100,13 @@ impl Cond {
         })
     }
 
-    fn eval(&self, rand: &mut JRandom, world: &dyn CubeWorld, seed: i64, p: [i32; 3]) -> bool {
+    pub(crate) fn eval(
+        &self,
+        rand: &mut JRandom,
+        world: &dyn CubeWorld,
+        seed: i64,
+        p: [i32; 3],
+    ) -> bool {
         match self {
             Self::Any(v) => v.iter().any(|c| c.eval(rand, world, seed, p)),
             Self::All(v) => v.iter().all(|c| c.eval(rand, world, seed, p)),
@@ -117,13 +126,84 @@ fn pos_rand(seed: i64, salt: i32, p: [i32; 3], chance: f64) -> bool {
     (r as f64) < chance * f64::from(1_u32 << 24)
 }
 
+/// What a vein is made of and where it may go: shared by the legacy ore lists
+/// here and the two-tier engine ([`crate::cubic::ores::engine`]).
+pub(crate) struct VeinSpec {
+    pub block: u32,
+    /// The block in deepslate and tuff (`deepslate_<name>` of a plain ore).
+    pub deep_block: Option<u32>,
+    /// Which blocks it may replace; `None` = stone and deep sets.
+    pub place: Option<Cond>,
+    pub generate: Option<Cond>,
+    /// Blocks per vein.
+    pub size: i32,
+}
+
+impl VeinSpec {
+    pub(crate) fn compile(
+        reg: &BlockRegistry,
+        blockstate: &BlockStateDesc,
+        place: &Option<GenerationCondition>,
+        generate: &Option<GenerationCondition>,
+        size: i32,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            block: resolve_block(reg, blockstate)?,
+            deep_block: deep_variant(reg, blockstate),
+            place: place.as_ref().map(|c| Cond::compile(c, reg)).transpose()?,
+            generate: generate
+                .as_ref()
+                .map(|c| Cond::compile(c, reg))
+                .transpose()?,
+            size,
+        })
+    }
+}
+
+/// `deepslate_<name>` of a property-less `minecraft:<name>_ore`.
+pub(crate) fn deep_variant(reg: &BlockRegistry, d: &BlockStateDesc) -> Option<u32> {
+    if !d.properties.is_empty() {
+        return None;
+    }
+    let short = d.name.strip_prefix("minecraft:")?;
+    if !short.ends_with("_ore") {
+        return None;
+    }
+    reg.default_state(&format!("minecraft:deepslate_{short}"))
+        .map(|i| i.0)
+}
+
+/// The blocks a vein replaces by default, and the world seed its conditions
+/// use.
+pub(crate) struct VeinEnv {
+    pub seed: i64,
+    /// Small sets of block states: a slice scan beats hashing them.
+    pub stone_set: Vec<u32>,
+    pub deep_set: Vec<u32>,
+}
+
+impl VeinEnv {
+    pub(crate) fn new(seed: i64, reg: &BlockRegistry) -> Result<Self, String> {
+        let set = |names: &[&str]| -> Result<Vec<u32>, String> {
+            let mut v: Vec<u32> = names
+                .iter()
+                .map(|n| resolve_block(reg, &BlockStateDesc::new(n)))
+                .collect::<Result<_, _>>()?;
+            v.sort_unstable();
+            v.dedup();
+            Ok(v)
+        };
+        Ok(Self {
+            seed,
+            stone_set: set(&["stone", "granite", "diorite", "andesite"])?,
+            deep_set: set(&["deepslate", "tuff"])?,
+        })
+    }
+}
+
 struct Ore {
-    block: u32,
-    deep_block: Option<u32>,
+    vein: VeinSpec,
     biomes: Option<HashSet<String>>,
-    place: Option<Cond>,
-    generate: Option<Cond>,
-    size: i32,
     tries: i32,
     probability: f64,
     min_h: f64,
@@ -149,9 +229,11 @@ pub struct Populator {
     variation: f64,
     ores: Vec<Ore>,
     lakes: Vec<Lake>,
+    env: VeinEnv,
+    /// The two-tier ore entries (`oreGen`), placed after the legacy lists.
+    engine: Option<OreEngine>,
+    meteors: Option<Meteors>,
     /// Small sets of block states: a slice scan beats hashing them.
-    stone_set: Vec<u32>,
-    deep_set: Vec<u32>,
     spring_stone: Vec<u32>,
     air: u32,
     water: u32,
@@ -162,7 +244,7 @@ pub struct Populator {
     springs: bool,
 }
 
-fn round_i32(v: f64) -> i32 {
+pub(crate) fn round_i32(v: f64) -> i32 {
     (v + 0.5)
         .floor()
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
@@ -181,17 +263,6 @@ impl Populator {
             v.dedup();
             Ok(v)
         };
-        let deep_variant = |d: &BlockStateDesc| -> Option<u32> {
-            if !d.properties.is_empty() {
-                return None;
-            }
-            let short = d.name.strip_prefix("minecraft:")?;
-            if !short.ends_with("_ore") {
-                return None;
-            }
-            reg.default_state(&format!("minecraft:deepslate_{short}"))
-                .map(|i| i.0)
-        };
         let biome_set = |b: &Option<Vec<BiomeDesc>>| {
             b.as_ref()
                 .map(|v| v.iter().map(|b| b.0.clone()).collect::<HashSet<_>>())
@@ -200,22 +271,15 @@ impl Populator {
         for (i, o) in s.standard_ores.iter().enumerate() {
             let err = |e: String| format!("standardOres[{i}]: {e}");
             ores.push(Ore {
-                block: resolve_block(reg, &o.blockstate).map_err(err)?,
-                deep_block: deep_variant(&o.blockstate),
+                vein: VeinSpec::compile(
+                    reg,
+                    &o.blockstate,
+                    &o.place_block_when,
+                    &o.generate_when,
+                    o.spawn_size,
+                )
+                .map_err(err)?,
                 biomes: biome_set(&o.biomes),
-                place: o
-                    .place_block_when
-                    .as_ref()
-                    .map(|c| Cond::compile(c, reg))
-                    .transpose()
-                    .map_err(err)?,
-                generate: o
-                    .generate_when
-                    .as_ref()
-                    .map(|c| Cond::compile(c, reg))
-                    .transpose()
-                    .map_err(err)?,
-                size: o.spawn_size,
                 tries: o.spawn_tries,
                 probability: o.spawn_probability,
                 min_h: o.min_height,
@@ -226,22 +290,15 @@ impl Populator {
         for (i, o) in s.periodic_gaussian_ores.iter().enumerate() {
             let err = |e: String| format!("periodicGaussianOres[{i}]: {e}");
             ores.push(Ore {
-                block: resolve_block(reg, &o.blockstate).map_err(err)?,
-                deep_block: deep_variant(&o.blockstate),
+                vein: VeinSpec::compile(
+                    reg,
+                    &o.blockstate,
+                    &o.place_block_when,
+                    &o.generate_when,
+                    o.spawn_size,
+                )
+                .map_err(err)?,
                 biomes: biome_set(&o.biomes),
-                place: o
-                    .place_block_when
-                    .as_ref()
-                    .map(|c| Cond::compile(c, reg))
-                    .transpose()
-                    .map_err(err)?,
-                generate: o
-                    .generate_when
-                    .as_ref()
-                    .map(|c| Cond::compile(c, reg))
-                    .transpose()
-                    .map_err(err)?,
-                size: o.spawn_size,
                 tries: o.spawn_tries,
                 probability: o.spawn_probability,
                 min_h: o.min_height,
@@ -268,14 +325,22 @@ impl Populator {
                     .map_err(|e| format!("lakes[{i}]: {e}"))?,
             });
         }
+        let (engine, meteors) = match &s.ore_gen {
+            Some(g) => (
+                Some(OreEngine::new(seed, g, reg)?),
+                Some(Meteors::new(seed, &g.meteors, reg)?),
+            ),
+            None => (None, None),
+        };
         Ok(Self {
             seed,
             base: s.expected_base_height,
             variation: s.expected_height_variation,
             ores,
             lakes,
-            stone_set: set(&["stone", "granite", "diorite", "andesite"])?,
-            deep_set: set(&["deepslate", "tuff"])?,
+            env: VeinEnv::new(seed, reg)?,
+            engine,
+            meteors,
             spring_stone: set(&[
                 "stone",
                 "deepslate",
@@ -290,13 +355,29 @@ impl Populator {
             stone: id("stone")?,
             dirt: id("dirt")?,
             grass: id("grass_block")?,
-            springs: !s.caves.is_empty() || !s.standard_ores.is_empty() || !s.lakes.is_empty(),
+            springs: !s.caves.is_empty()
+                || !s.standard_ores.is_empty()
+                || !s.lakes.is_empty()
+                || s.ore_gen.as_ref().is_some_and(|g| {
+                    g.ores.iter().any(|o| {
+                        o.rich.mode == RichMode::StaticHeight && o.rich.shape == Shape::Flat
+                    })
+                }),
         })
     }
 
     /// Populates `cube`; `biome_at(x, z)` gives the namespaced biome name of a
     /// block column.
-    pub fn populate(&self, cube: SectionPos, world: &mut dyn CubeWorld, blend: &BiomeBlend) {
+    ///
+    /// `ground(x, z)` is the generator's estimate of the Y of a column's top
+    /// solid block; it is only called by below-ground ores and meteors.
+    pub fn populate(
+        &self,
+        cube: SectionPos,
+        world: &mut dyn CubeWorld,
+        blend: &BiomeBlend,
+        ground: &dyn Fn(i32, i32) -> i32,
+    ) {
         let mut rand = coords_seed_random(self.seed, cube.x, cube.y, cube.z);
         let min = [cube.x * 16, cube.y * 16, cube.z * 16];
         let biome = blend.biome_name_at(min[0] + 8, min[2] + 8);
@@ -310,7 +391,18 @@ impl Populator {
             }
             self.ore(ore, &mut rand, world, &win);
         }
+        if let Some(engine) = &self.engine {
+            let ctx = OreCtx {
+                biome: &biome,
+                ground,
+                lat_lon: None,
+            };
+            engine.place(cube, world, &mut rand, &ctx);
+        }
         world.decorate_surface(cube, &mut rand);
+        if let Some(m) = self.meteors.as_ref().filter(|m| m.is_active()) {
+            m.place(cube, world, ground);
+        }
         if self.springs {
             self.spring(&mut rand, world, &win, true);
             self.spring(&mut rand, world, &win, false);
@@ -337,7 +429,7 @@ impl Populator {
                     }
                     let x = win.min[0] + rand.int(16) + 8;
                     let z = win.min[2] + rand.int(16) + 8;
-                    self.try_vein(o, rand, world, win, [x, y, z]);
+                    try_vein(&self.env, &o.vein, rand, world, win, [x, y, z]);
                 }
             }
             Some((mean, sd, spacing)) => {
@@ -356,105 +448,7 @@ impl Populator {
                     }
                     let x = win.min[0] + rand.int(16) + 8;
                     let z = win.min[2] + rand.int(16) + 8;
-                    self.try_vein(o, rand, world, win, [x, y, z]);
-                }
-            }
-        }
-    }
-
-    fn try_vein(
-        &self,
-        o: &Ore,
-        rand: &mut JRandom,
-        world: &mut dyn CubeWorld,
-        win: &Window,
-        p: [i32; 3],
-    ) {
-        if let Some(g) = &o.generate
-            && !g.eval(rand, world, self.seed, p)
-        {
-            return;
-        }
-        self.vein(o, rand, world, win, p);
-    }
-
-    /// CWG's `CustomVeinGenerator` (a 1.12 `WorldGenMinable` clone).
-    fn vein(
-        &self,
-        o: &Ore,
-        rand: &mut JRandom,
-        world: &mut dyn CubeWorld,
-        win: &Window,
-        p: [i32; 3],
-    ) {
-        let steps = o.size;
-        let angle = rand.float() * std::f32::consts::PI;
-        let reach = |t: f32| f64::from(t * steps as f32 / 8.0);
-        let (x1, x2) = (
-            f64::from(p[0]) + reach(sin_f32(angle)),
-            f64::from(p[0]) - reach(sin_f32(angle)),
-        );
-        let (z1, z2) = (
-            f64::from(p[2]) + reach(cos_f32(angle)),
-            f64::from(p[2]) - reach(cos_f32(angle)),
-        );
-        let y1 = f64::from(p[1] + rand.int(3) - 2);
-        let y2 = f64::from(p[1] + rand.int(3) - 2);
-        for i in 0..steps {
-            let progress = i as f32 / steps as f32;
-            let t = f64::from(progress);
-            let (cx, cy, cz) = (x1 + t * (x2 - x1), y1 + t * (y2 - y1), z1 + t * (z2 - z1));
-            let size_factor = rand.double() * f64::from(steps) / 16.0;
-            let diameter =
-                f64::from(sin_f32(std::f32::consts::PI * progress) + 1.0) * size_factor + 1.0;
-            self.ellipsoid(o, rand, world, win, [cx, cy, cz], diameter);
-        }
-    }
-
-    fn ellipsoid(
-        &self,
-        o: &Ore,
-        rand: &mut JRandom,
-        world: &mut dyn CubeWorld,
-        win: &Window,
-        c: [f64; 3],
-        d: f64,
-    ) {
-        let h = d / 2.0;
-        let f = |v: f64| v.floor() as i32;
-        for x in f(c[0] - h)..=f(c[0] + h) {
-            let dx = (f64::from(x) + 0.5 - c[0]) / h;
-            if dx * dx > 1.0 {
-                continue;
-            }
-            for y in f(c[1] - h)..=f(c[1] + h) {
-                let dy = (f64::from(y) + 0.5 - c[1]) / h;
-                if dx * dx + dy * dy > 1.0 {
-                    continue;
-                }
-                for z in f(c[2] - h)..=f(c[2] + h) {
-                    let dz = (f64::from(z) + 0.5 - c[2]) / h;
-                    if dx * dx + dy * dy + dz * dz > 1.0 {
-                        continue;
-                    }
-                    let p = [x, y, z];
-                    if !win.contains(p) {
-                        continue;
-                    }
-                    let cur = world.block(p);
-                    let deep = self.deep_set.contains(&cur);
-                    let allowed = match &o.place {
-                        Some(cond) => cond.eval(rand, &*world, self.seed, p),
-                        None => self.stone_set.contains(&cur) || deep,
-                    };
-                    if allowed {
-                        let block = if deep {
-                            o.deep_block.unwrap_or(o.block)
-                        } else {
-                            o.block
-                        };
-                        world.set_block(p, block);
-                    }
+                    try_vein(&self.env, &o.vein, rand, world, win, [x, y, z]);
                 }
             }
         }
@@ -668,13 +662,112 @@ impl Populator {
 }
 
 /// The 2 x 2 x 2 cubes a cube may write.
-struct Window {
-    min: [i32; 3],
+pub(crate) struct Window {
+    pub min: [i32; 3],
 }
 
 impl Window {
-    fn contains(&self, p: [i32; 3]) -> bool {
+    pub(crate) fn contains(&self, p: [i32; 3]) -> bool {
         (0..3).all(|i| p[i] >= self.min[i] && p[i] < self.min[i] + 32)
+    }
+}
+
+/// A vein at `p`, after its `generateWhen` condition.
+pub(crate) fn try_vein(
+    env: &VeinEnv,
+    v: &VeinSpec,
+    rand: &mut JRandom,
+    world: &mut dyn CubeWorld,
+    win: &Window,
+    p: [i32; 3],
+) {
+    if let Some(g) = &v.generate
+        && !g.eval(rand, world, env.seed, p)
+    {
+        return;
+    }
+    vein(env, v, rand, world, win, p);
+}
+
+/// CWG's `CustomVeinGenerator` (a 1.12 `WorldGenMinable` clone).
+fn vein(
+    env: &VeinEnv,
+    v: &VeinSpec,
+    rand: &mut JRandom,
+    world: &mut dyn CubeWorld,
+    win: &Window,
+    p: [i32; 3],
+) {
+    let steps = v.size;
+    let angle = rand.float() * std::f32::consts::PI;
+    let reach = |t: f32| f64::from(t * steps as f32 / 8.0);
+    let (x1, x2) = (
+        f64::from(p[0]) + reach(sin_f32(angle)),
+        f64::from(p[0]) - reach(sin_f32(angle)),
+    );
+    let (z1, z2) = (
+        f64::from(p[2]) + reach(cos_f32(angle)),
+        f64::from(p[2]) - reach(cos_f32(angle)),
+    );
+    let y1 = f64::from(p[1] + rand.int(3) - 2);
+    let y2 = f64::from(p[1] + rand.int(3) - 2);
+    for i in 0..steps {
+        let progress = i as f32 / steps as f32;
+        let t = f64::from(progress);
+        let (cx, cy, cz) = (x1 + t * (x2 - x1), y1 + t * (y2 - y1), z1 + t * (z2 - z1));
+        let size_factor = rand.double() * f64::from(steps) / 16.0;
+        let diameter =
+            f64::from(sin_f32(std::f32::consts::PI * progress) + 1.0) * size_factor + 1.0;
+        ellipsoid(env, v, rand, world, win, [cx, cy, cz], diameter);
+    }
+}
+
+fn ellipsoid(
+    env: &VeinEnv,
+    v: &VeinSpec,
+    rand: &mut JRandom,
+    world: &mut dyn CubeWorld,
+    win: &Window,
+    c: [f64; 3],
+    d: f64,
+) {
+    let h = d / 2.0;
+    let f = |v: f64| v.floor() as i32;
+    for x in f(c[0] - h)..=f(c[0] + h) {
+        let dx = (f64::from(x) + 0.5 - c[0]) / h;
+        if dx * dx > 1.0 {
+            continue;
+        }
+        for y in f(c[1] - h)..=f(c[1] + h) {
+            let dy = (f64::from(y) + 0.5 - c[1]) / h;
+            if dx * dx + dy * dy > 1.0 {
+                continue;
+            }
+            for z in f(c[2] - h)..=f(c[2] + h) {
+                let dz = (f64::from(z) + 0.5 - c[2]) / h;
+                if dx * dx + dy * dy + dz * dz > 1.0 {
+                    continue;
+                }
+                let p = [x, y, z];
+                if !win.contains(p) {
+                    continue;
+                }
+                let cur = world.block(p);
+                let deep = env.deep_set.contains(&cur);
+                let allowed = match &v.place {
+                    Some(cond) => cond.eval(rand, &*world, env.seed, p),
+                    None => env.stone_set.contains(&cur) || deep,
+                };
+                if allowed {
+                    let block = if deep {
+                        v.deep_block.unwrap_or(v.block)
+                    } else {
+                        v.block
+                    };
+                    world.set_block(p, block);
+                }
+            }
+        }
     }
 }
 

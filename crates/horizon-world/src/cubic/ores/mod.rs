@@ -4,10 +4,15 @@
 //! ([`meteors`]). See docs/cubic-ores.md.
 
 pub mod defaults;
+pub mod engine;
 pub mod meteors;
 pub mod settings;
 
+pub use engine::{OreCtx, OreEngine, RichnessFn};
 pub use settings::{
     Background, MeteorKind, MeteorSettings, ORE_GEN_VERSION, OreEntry, OreGenSettings, RangeMode,
     RichMode, RichZone, Shape,
 };
+
+#[cfg(test)]
+mod engine_tests;

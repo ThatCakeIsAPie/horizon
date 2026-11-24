@@ -356,8 +356,10 @@ impl OreGenSettings {
                 background: Background::default(),
             });
         }
-        let mut meteors = MeteorSettings::default();
-        meteors.enabled = false;
+        let meteors = MeteorSettings {
+            enabled: false,
+            ..MeteorSettings::default()
+        };
         Self {
             ores,
             meteors,

@@ -98,6 +98,8 @@ struct Terrain {
     replacers: Replacers,
     carvers: carvers::Carvers,
     populator: populate::Populator,
+    /// [`Terrain::ground`]'s chunk columns of [`Terrain::chunk_tops`].
+    ground_cache: std::sync::Mutex<std::collections::HashMap<(i32, i32), Box<[i32; 256]>>>,
     sea_level: i32,
     biome_scale: f64,
 }
@@ -170,6 +172,7 @@ impl CustomCubicGenerator {
                 replacers: Replacers::new(seed, &settings.replacers, registry)?,
                 carvers: carvers::Carvers::new(seed, settings, registry)?,
                 populator: populate::Populator::new(seed, settings, registry)?,
+                ground_cache: Default::default(),
                 sea_level,
                 biome_scale: settings.biome_scale(),
             })),
@@ -406,7 +409,9 @@ impl CustomCubicGenerator {
             return g.populate(cube, world);
         }
         match &self.kind {
-            Kind::Terrain(t) => t.populator.populate(cube, world, &t.blend),
+            Kind::Terrain(t) => t
+                .populator
+                .populate(cube, world, &t.blend, &|x, z| t.ground(x, z)),
             // Earth has only vegetation: no ores, lakes or springs.
             Kind::Heightmap(_) => world.decorate_surface(
                 cube,
@@ -1138,6 +1143,34 @@ impl Terrain {
             }
         }
         tops
+    }
+
+    /// The local ground estimate population hands to below-ground ores and
+    /// meteors: the Y of the column's topmost solid block of the terrain
+    /// ([`Self::chunk_tops`], carvers ignored; [`NO_TOP`] when none). Computed
+    /// per chunk column on first use and kept in a small cache (cleared when
+    /// it grows past 1,024 columns), so a world without below-ground ores
+    /// never pays for it.
+    fn ground(&self, x: i32, z: i32) -> i32 {
+        const MAX_COLUMNS: usize = 1024;
+        let key = (x >> 4, z >> 4);
+        let i = ((z & 15) << 4 | (x & 15)) as usize;
+        let lock = || {
+            self.ground_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some(tops) = lock().get(&key) {
+            return tops[i];
+        }
+        let tops = self.chunk_tops(key.0, key.1);
+        let y = tops[i];
+        let mut cache = lock();
+        if cache.len() >= MAX_COLUMNS {
+            cache.clear();
+        }
+        cache.insert(key, tops);
+        y
     }
 
     fn surface_y(&self, x: i32, z: i32, from_y: i32) -> Option<i32> {
