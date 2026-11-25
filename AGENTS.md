@@ -51,6 +51,12 @@ Feature → files → harness for the most-changed areas: [docs/architecture.md]
 - **Controllers reach what registers.** Draw controls with a registering helper (`ui::button`, `settings_shell::foot_button`); `graphics_style::button` and `screen_draw::button` only paint, and registering one part of a screen ends its crosshair, so register all of it.
 - **Render passes keep HDR's light.** A pass that reads, filters or redraws the world's picture (upscaling,
   anti-aliasing, sharpening, frame generation, post effects, captures) follows [docs/hdr-passes.md](docs/hdr-passes.md).
+- **Far view: coarse first, refine later** (Cubic and Earth). The distance is never empty: draw a cheap coarse
+  version first (ground and colour), then refine each far node (trees, detail) on the same low-priority background
+  builder, nearest and in view first (`LateContent`), swapping it in place with no blank frame, and keep only
+  refined nodes in the far cache so a revisit is refined at once. Do as much as possible on the GPU. Far light has
+  no propagation: anything opaque that lets light through (leaves, snow layers) dims the sky under it, never roofs
+  it black. See [docs/earth.md](docs/earth.md#far-view).
 
 ## Don't lose time
 
