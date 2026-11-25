@@ -860,7 +860,13 @@ fn overlay(node: CubeNode, sketches: &[Arc<Sketch>], air: u32) -> (CubeNode, boo
         return (node, false);
     }
     let covered = node.covered_mask().cloned().map(Box::new);
-    (CubeNode::from_dense(key, dense).with_covered(covered), true)
+    let tops = node.fluid_tops().cloned().map(Box::new);
+    (
+        CubeNode::from_dense(key, dense)
+            .with_covered(covered)
+            .with_fluid_tops(tops),
+        true,
+    )
 }
 
 #[cfg(test)]

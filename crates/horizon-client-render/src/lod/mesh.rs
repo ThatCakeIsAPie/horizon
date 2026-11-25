@@ -1052,11 +1052,16 @@ fn mesh_voxels<L: Look>(
                         // water the next node goes on with: drawn, they show
                         // through it as a grid. Except its top on a node whose
                         // top is the sea's surface: there the sea ends.
+                        // Nor on a column whose fluid ends in this node
+                        // (`CubeNode::fluid_top`): a lake, river or sea whose
+                        // top lies on the node's top, which no node above
+                        // draws.
                         let (_, own_fluid) = *hiding.entry(voxel.state.0).or_insert_with(|| {
                             let m = material(&own, Direction::Up, at);
                             (m.opaque, m.fluid)
                         });
-                        if own_fluid != 0 && !(matches!(direction, Direction::Up) && sea_top) {
+                        let ends = sea_top || node.fluid_top(x, z).is_some();
+                        if own_fluid != 0 && !(matches!(direction, Direction::Up) && ends) {
                             continue;
                         }
                     }
@@ -1075,7 +1080,8 @@ fn mesh_voxels<L: Look>(
                         v1: (b + 1) as f32 * scale,
                     };
                     let mut plane = plane as f32 * scale;
-                    if let Some(surface) = surface
+                    // The column's own fluid surface first, else the sea's.
+                    if let Some(surface) = node.fluid_top(x, z).or(surface)
                         && (y as f32 * scale) < surface
                         && ((y + 1) as f32 * scale) > surface
                     {
@@ -2855,6 +2861,71 @@ mod cube_tests {
             mesh_voxels(&deep, AIR, sea_surface, material, no_foliage, &mut mesh);
             assert!(mesh.translucent.is_empty(), "{key:?}");
         }
+    }
+
+    #[test]
+    fn water_ending_in_its_node_draws_its_surface_with_the_water_material() {
+        use crate::lod::cube::{FLUID_TOP_SCALE, NO_FLUID_TOP};
+        // An Earth sea or tidal river: level 2 (4-block voxels), the node at
+        // y -64..0 whose top is the water's (sea level 0, top block -1), a
+        // sand bed in its lower half. The water's top lies on the node's edge,
+        // where a fluid's faces are left out as going on in the node above:
+        // unless the node says its water ends there, only the bed was drawn.
+        let key = CubeKey::new(2, 0, -1, 0);
+        let sea = CubeNode::from_fn(key, |_, y, _| voxel(if y < 8 { STONE } else { WATER }));
+        let tops = |at: u16| {
+            let mut tops = Box::new([NO_FLUID_TOP; 256]);
+            tops.iter_mut().for_each(|h| *h = at);
+            Some(tops)
+        };
+        let water_tops = |node: &CubeNode| -> Vec<[TerrainVertex; 4]> {
+            quads(&mesh(node).translucent)
+                .into_iter()
+                .filter(|q| normal(q).y > 0.0)
+                .collect()
+        };
+        assert!(water_tops(&sea).is_empty(), "a sea going on above: no top");
+        let ends = sea.clone().with_fluid_tops(tops(FLUID_TOP_SCALE));
+        let top = water_tops(&ends);
+        assert!(!top.is_empty(), "the surface is drawn");
+        for q in &top {
+            assert!(q.iter().all(|v| v.pos[1] == 64.0), "on the node's top");
+            assert!(
+                q.iter().all(|v| v.layer == WATER.0 as u16),
+                "with the water's material"
+            );
+        }
+        // Covering the node, the bed under it is no longer what shows.
+        let (lo, hi) = top.iter().fold(
+            ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]),
+            |(lo, hi), q| {
+                let (a, b) = extent(q);
+                (
+                    [lo[0].min(a[0]), lo[1].min(a[2])],
+                    [hi[0].max(b[0]), hi[1].max(b[2])],
+                )
+            },
+        );
+        assert_eq!((lo, hi), ([0.0, 0.0], [64.0, 64.0]));
+        // A river whose surface lies inside a coarse voxel (2 of its 4 blocks
+        // under water, 58 blocks over the bottom) is drawn at its own level,
+        // its walls too.
+        let river = CubeNode::from_fn(key, |x, y, _| {
+            voxel(match (x, y) {
+                (_, 0..=13) => STONE,
+                (0..=7, 14) => WATER,
+                (_, 14) => STONE,
+                _ => AIR,
+            })
+        })
+        .with_fluid_tops(tops(CubeNode::fluid_top_units(58.0, 64)));
+        let water = quads(&mesh(&river).translucent);
+        assert!(!water.is_empty());
+        let highest = water
+            .iter()
+            .flat_map(|q| q.iter().map(|v| v.pos[1]))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(highest, 58.0);
     }
 
     #[test]

@@ -19,6 +19,7 @@
 
 use super::refine::Pass;
 use super::*;
+use crate::lod::cube::{FluidTops, NO_FLUID_TOP, VOLUME};
 use horizon_world::cubic::earth::far_trees::FarDecor;
 use horizon_world::cubic::earth::{EarthGenerator, Fill, NotReady};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -113,7 +114,14 @@ pub(super) fn cover(
     if key.level > COVER_LEVEL {
         return Ok(None);
     }
-    let surfaces = surfaces(earth, key)?;
+    Ok(cover_of(key, &surfaces(earth, key)?))
+}
+
+/// [`cover`] from the node's column surfaces.
+fn cover_of(key: CubeKey, surfaces: &[i32]) -> Option<Box<CoverMask>> {
+    if key.level > COVER_LEVEL {
+        return None;
+    }
     let step = 1i32 << key.level;
     let top = key.origin()[1].saturating_add(key.size());
     // The lowest look over the node is the voxel at `top + COVER_LOOKS[0]`; ground reaching it covers the rest.
@@ -124,7 +132,52 @@ pub(super) fn cover(
             mask[i >> 6] |= 1 << (i & 63);
         }
     }
-    Ok(Some(mask))
+    Some(mask)
+}
+
+/// `surfaces` with the sea's top where the sea is: without land cover they are the elevation's, under the sea
+/// level in the sea, whose water reaches `sea_level - 1` ([`horizon_world::cubic::earth::SurfaceKind::sea_column`]).
+/// With land cover they are already the final surfaces.
+fn water_surfaces(earth: &EarthGenerator, surfaces: &[i32]) -> Vec<i32> {
+    if earth.land_cover_active() {
+        return surfaces.to_vec();
+    }
+    let top = earth.sea_level().saturating_sub(1);
+    surfaces.iter().map(|&s| s.max(top)).collect()
+}
+
+/// Where the water of each column of `node` ends inside it, from the columns' final `surfaces` (the top water
+/// block of a water column): its top fluid voxel's surface is drawn at the water's own level, also when that is the
+/// node's top. Earth's sea tops at `sea_level - 1`, on the top of a node at every level, and a lake or river whose
+/// top lies on a node's top is as common; without this the mesher took their water to go on in the node above,
+/// drew no top, and showed the bed (sand, gravel) through it. A column whose water goes on over the node, or
+/// with ice or anything over its top fluid voxel, has none. `fluid` says which states are fluids.
+pub(super) fn fluid_tops(
+    node: &CubeNode,
+    surfaces: &[i32],
+    fluid: impl Fn(BlockStateId) -> bool,
+) -> Option<Box<FluidTops>> {
+    let size = node.key.size();
+    let step = i64::from(size / 16);
+    let bottom = i64::from(node.key.origin()[1]);
+    let mut tops = Box::new([NO_FLUID_TOP; 256]);
+    let mut any = false;
+    for (i, &s) in surfaces.iter().enumerate().take(256) {
+        let (x, z) = (i & 15, i >> 4);
+        let Some(y) = (0..16).rev().find(|&y| fluid(node.get(x, y, z).state)) else {
+            continue;
+        };
+        let (lo, hi) = (y as i64 * step, (y as i64 + 1) * step);
+        let h = i64::from(s) + 1 - bottom;
+        if h > hi {
+            continue;
+        }
+        // A surface under the fluid voxel (a coarse voxel that came out fluid all the same) is its top.
+        let h = if h > lo { h } else { hi };
+        tops[i] = CubeNode::fluid_top_units(h as f64, size);
+        any = true;
+    }
+    any.then_some(tops)
 }
 
 /// Node `key` (without its sky cover) as the generator makes it, with the trees and snow `decor` asks for.
@@ -312,8 +365,24 @@ impl CubicLodSampler {
         }
         let generator = self.wg.generator.clone();
         let earth = generator.earth_generator()?;
-        let cover = self.or_request(cover(earth, key))?;
-        Some(node.with_covered(cover))
+        let fluid = |s: BlockStateId| self.kind(s) == Kind::Fluid;
+        let wet = match node.as_uniform() {
+            Some(v) => fluid(v.state),
+            None => (0..VOLUME).any(|i| fluid(node.at(i).state)),
+        };
+        if key.level > COVER_LEVEL && !wet {
+            return Some(node);
+        }
+        let surfaces = self.or_request(surfaces(earth, key))?;
+        let tops = if wet {
+            fluid_tops(&node, &water_surfaces(earth, &surfaces), fluid)
+        } else {
+            None
+        };
+        Some(
+            node.with_covered(cover_of(key, &surfaces))
+                .with_fluid_tops(tops),
+        )
     }
 
     /// [`CubeSampler::classify`] of an Earth node: `None` (ask again) while a tile it reads is missing.

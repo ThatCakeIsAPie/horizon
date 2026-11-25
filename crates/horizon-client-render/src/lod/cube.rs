@@ -154,10 +154,26 @@ pub struct CubeNode {
     /// means something solid stands over the node there (an island, the
     /// vanilla terrain). `None`: all open. See [`CubeNode::column_covered`].
     covered: Option<Box<CoverMask>>,
+    /// Where each column's fluid ends inside the node (`z << 4 | x`): the
+    /// height of its surface, so a lake, river or sea whose top lies on the
+    /// node's top is drawn there, and one inside a coarse voxel at its own
+    /// level. `None`: not known, a fluid's top on the node's top is taken to
+    /// go on in the node above. See [`CubeNode::fluid_top`].
+    fluid_tops: Option<Box<FluidTops>>,
 }
 
 /// One bit per column of a node, `z << 4 | x`.
 pub type CoverMask = [u64; 4];
+
+/// Per column of a node (`z << 4 | x`), the height its fluid's surface lies at
+/// in the node, in `1 / FLUID_TOP_SCALE` of the node's side (1 to
+/// `FLUID_TOP_SCALE`, the node's top), or [`NO_FLUID_TOP`]: no fluid, or a
+/// fluid going on over the node.
+pub type FluidTops = [u16; 256];
+/// A column of [`FluidTops`] without a surface in the node.
+pub const NO_FLUID_TOP: u16 = u16::MAX;
+/// The units of a [`FluidTops`] height per node side.
+pub const FLUID_TOP_SCALE: u16 = 4096;
 
 impl CubeNode {
     pub fn uniform(key: CubeKey, voxel: Voxel) -> Self {
@@ -165,6 +181,7 @@ impl CubeNode {
             key,
             voxels: Voxels::Uniform(voxel),
             covered: None,
+            fluid_tops: None,
         }
     }
     /// Voxels from `f(x, y, z)` (each 0..16); a node whose voxels all agree
@@ -189,6 +206,7 @@ impl CubeNode {
                 key,
                 voxels: Voxels::Dense(dense),
                 covered: None,
+                fluid_tops: None,
             }
         }
     }
@@ -206,6 +224,29 @@ impl CubeNode {
         self.covered
             .as_ref()
             .is_some_and(|mask| mask[bit >> 6] >> (bit & 63) & 1 == 1)
+    }
+    /// The node with its columns' fluid surfaces set (none set is `None`).
+    pub fn with_fluid_tops(mut self, tops: Option<Box<FluidTops>>) -> Self {
+        self.fluid_tops = tops.filter(|t| t.iter().any(|&h| h != NO_FLUID_TOP));
+        self
+    }
+    pub fn fluid_tops(&self) -> Option<&FluidTops> {
+        self.fluid_tops.as_deref()
+    }
+    /// The height (blocks over the node's bottom) at which column (`x`, `z`)'s
+    /// fluid ends inside the node: its surface, drawn there even on the node's
+    /// top. `None` when unknown, or the fluid goes on over the node.
+    pub fn fluid_top(&self, x: usize, z: usize) -> Option<f32> {
+        let h = self.fluid_tops.as_ref()?[z << 4 | x];
+        (h != NO_FLUID_TOP)
+            .then(|| f32::from(h) * self.key.size() as f32 / f32::from(FLUID_TOP_SCALE))
+    }
+    /// The [`FluidTops`] height of a surface `blocks` over the bottom of a node
+    /// of side `size`: at least one unit, at most the node's top.
+    pub fn fluid_top_units(blocks: f64, size: i32) -> u16 {
+        (blocks * f64::from(FLUID_TOP_SCALE) / f64::from(size))
+            .round()
+            .clamp(1.0, f64::from(FLUID_TOP_SCALE)) as u16
     }
     pub fn index(x: usize, y: usize, z: usize) -> usize {
         y << 8 | z << 4 | x
@@ -252,7 +293,9 @@ pub fn downsample(
     if let Some(first) = children[0].as_uniform()
         && children.iter().all(|c| c.as_uniform() == Some(first))
     {
-        return CubeNode::uniform(key, first).with_covered(merged_cover(&children));
+        return CubeNode::uniform(key, first)
+            .with_covered(merged_cover(&children))
+            .with_fluid_tops(merged_fluid_tops(&children));
     }
     let mut dense = Box::new(
         [Voxel {
@@ -273,7 +316,41 @@ pub fn downsample(
             }
         }
     }
-    CubeNode::dense(key, dense).with_covered(merged_cover(&children))
+    CubeNode::dense(key, dense)
+        .with_covered(merged_cover(&children))
+        .with_fluid_tops(merged_fluid_tops(&children))
+}
+
+/// The parent's fluid surfaces: over each parent column, the highest surface
+/// of the four child columns under it in the upper children, or else in the
+/// lower ones (a fluid going on through the upper children goes on over the
+/// parent too).
+fn merged_fluid_tops(children: &[&CubeNode; 8]) -> Option<Box<FluidTops>> {
+    if children.iter().all(|c| c.fluid_tops.is_none()) {
+        return None;
+    }
+    let mut tops = Box::new([NO_FLUID_TOP; 256]);
+    for pz in 0..SIDE {
+        for px in 0..SIDE {
+            let quarter = (px >> 3) | ((pz >> 3) << 1);
+            let (cx, cz) = ((px & 7) * 2, (pz & 7) * 2);
+            for (half, lift) in [(4, FLUID_TOP_SCALE), (0, 0)] {
+                let Some(child) = children[half | quarter].fluid_tops.as_deref() else {
+                    continue;
+                };
+                let highest = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                    .into_iter()
+                    .map(|(dx, dz)| child[(cz + dz) << 4 | (cx + dx)])
+                    .filter(|&h| h != NO_FLUID_TOP)
+                    .max();
+                if let Some(h) = highest {
+                    tops[pz << 4 | px] = ((u32::from(h) + u32::from(lift)) / 2).max(1) as u16;
+                    break;
+                }
+            }
+        }
+    }
+    Some(tops)
 }
 
 /// The parent's covered columns: what covers the upper four children, a

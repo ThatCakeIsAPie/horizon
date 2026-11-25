@@ -177,6 +177,52 @@ fn a_node_is_what_the_generator_gives_voxel_by_voxel_and_its_cover_is_ground_ove
 }
 
 #[test]
+fn the_sea_ends_on_the_top_of_its_node_at_every_level() {
+    // Earth's sea tops at sea level - 1 (sea level 0 here), so its surface lies on the top of the node under it at
+    // every level. Those nodes say their water ends there (the mesher draws its top, not the bed under it); the
+    // nodes under them, whose water goes on above, say nothing.
+    let rig = rig();
+    let g = &rig.generator;
+    assert_eq!(g.sea_level(), 0);
+    let biome = |_: i32, _: i32| 0u16;
+    let water = state(&rig.blocks, rig.blocks.water);
+    let kind = move |s: BlockStateId| match s.0 {
+        AIR => Kind::Air,
+        s if s == water => Kind::Fluid,
+        _ => Kind::Solid,
+    };
+    let fluid = |s: BlockStateId| kind(s) == Kind::Fluid;
+    for level in [0u8, 2, 3, 5] {
+        let side = 16 << level;
+        // Out at sea, west of the coast.
+        let x = -3000 / side - 1;
+        rig.load(u32::from(level), x, 0);
+        let key = CubeKey::new(level, x, -1, 0);
+        let made = node(g, key, AIR, &biome, &kind, FarDecor::default()).unwrap();
+        let tops = fluid_tops(&made, &water_surfaces(g, &surfaces(g, key).unwrap()), fluid);
+        let made = made.with_fluid_tops(tops);
+        let mut sea = 0;
+        for z in 0..16 {
+            for x in 0..16 {
+                if made.get(x, 15, z).state.0 == water {
+                    sea += 1;
+                    assert_eq!(
+                        made.fluid_top(x, z),
+                        Some(side as f32),
+                        "level {level} column {x},{z}"
+                    );
+                }
+            }
+        }
+        assert_eq!(sea, 256, "level {level}: open sea");
+        let under = CubeKey::new(level, x, -2, 0);
+        let deep = node(g, under, AIR, &biome, &kind, FarDecor::default()).unwrap();
+        let surfaces = water_surfaces(g, &surfaces(g, under).unwrap());
+        assert!(fluid_tops(&deep, &surfaces, fluid).is_none(), "level {level}");
+    }
+}
+
+#[test]
 fn a_node_whose_tile_is_missing_is_not_ready_and_names_the_tile() {
     let rig = rig();
     let g = &rig.generator;
