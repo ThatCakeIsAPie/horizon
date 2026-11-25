@@ -718,7 +718,11 @@ impl EarthGenerator {
         // is does not depend on it.
         let dry = if matches!(
             class,
-            LandClass::Bare | LandClass::Shrub | LandClass::Grass | LandClass::Wetland | LandClass::BuiltUp
+            LandClass::Bare
+                | LandClass::Shrub
+                | LandClass::Grass
+                | LandClass::Wetland
+                | LandClass::BuiltUp
         ) {
             self.dry_column(a, x, z)?
         } else {
