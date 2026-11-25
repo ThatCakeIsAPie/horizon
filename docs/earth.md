@@ -287,7 +287,7 @@ a tree stands and the share thins its density. Lily pads count as plants, so the
 
 - **The cache key.** `terrain_key()` also ends with `#vegetation<rules>` (now `#vegetation2`) while land cover and
   vegetation are on, so old far-view caches are rebuilt. The far view draws its own simple trees
-  (see Far view: trees and snow); the key also ends with `#fartrees1` then.
+  (see Far view: trees and snow); the key also ends with `#fartrees2` then.
 
 ### Climate
 

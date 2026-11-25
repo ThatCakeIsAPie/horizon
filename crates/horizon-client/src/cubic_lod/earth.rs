@@ -298,7 +298,10 @@ impl CubicLodSampler {
     pub(super) fn is_coarse(&self, key: CubeKey) -> bool {
         self.is_earth()
             && self.far_decor().trees
-            && self.refine.as_ref().is_some_and(|r| r.pass(key) == Pass::Coarse)
+            && self
+                .refine
+                .as_ref()
+                .is_some_and(|r| r.pass(key) == Pass::Coarse)
     }
 
     /// `node` (Earth's, of `key`) with its sky cover, or `None` (later) when the tiles it reads are missing. A

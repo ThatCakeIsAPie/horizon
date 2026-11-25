@@ -85,7 +85,8 @@ impl Refine {
 
     /// The next coarse nodes to refine: nearest first, those in front of the camera before those behind.
     fn next(s: &mut State, now: Instant) -> Vec<CubeKey> {
-        s.handed.retain(|_, at| now.duration_since(*at) < HANDED_FOR);
+        s.handed
+            .retain(|_, at| now.duration_since(*at) < HANDED_FOR);
         let (camera, forward) = (s.camera, s.forward);
         // Coarse nodes left far behind (a teleport) are out of the plan: forgotten, made coarse
         // again if they come back.

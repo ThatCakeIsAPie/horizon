@@ -39,10 +39,8 @@ pub mod vegetation;
 mod vegetation_tests;
 
 pub use biome::{Biome, EarthBiomes};
-pub use far_trees::{FarBlocks, FarDecor, MAX_TREE_UP};
+pub use far_trees::{FAR_TREE_RULES, FarBlocks, FarDecor, MAX_TREE_UP};
 pub use generator::{BIOME, EarthBlocks, EarthGenerator, Fill, NotReady};
 pub use settings::EarthSettings;
 pub use surface::SurfaceKind;
-pub use vegetation::{
-    EarthVegetationMask, FAR_TREE_RULES, FeatureKind, SNOW_RULES, VEGETATION_RULES,
-};
+pub use vegetation::{EarthVegetationMask, FeatureKind, SNOW_RULES, VEGETATION_RULES};

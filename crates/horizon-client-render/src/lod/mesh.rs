@@ -963,8 +963,8 @@ fn mesh_voxels<L: Look>(
     // The sea's surface in node-local blocks: a fluid voxel holding it (one of
     // 128 blocks or more, the generator's `water_at_sea`) stops there.
     let surface = sea_surface.map(|top| (i64::from(top) - i64::from(oy)) as f32);
-    let sea_top = sea_surface
-        .is_some_and(|top| i64::from(oy) + i64::from(node.key.size()) == i64::from(top));
+    let sea_top =
+        sea_surface.is_some_and(|top| i64::from(oy) + i64::from(node.key.size()) == i64::from(top));
     let span = |voxel: Voxel, light: u16| Span {
         min: 0,
         max: 1,
@@ -2802,7 +2802,10 @@ mod cube_tests {
             "only the surface: no walls or floor inside the sea"
         );
         // The node under it, or a sampler that knows no sea: nothing.
-        for (key, sea_surface) in [(CubeKey::new(2, 0, -1, 0), Some(64)), (CubeKey::new(2, 0, 0, 0), None)] {
+        for (key, sea_surface) in [
+            (CubeKey::new(2, 0, -1, 0), Some(64)),
+            (CubeKey::new(2, 0, 0, 0), None),
+        ] {
             let deep = CubeNode::from_fn(key, |_, _, _| voxel(WATER));
             let mut mesh = SectionMesh::default();
             mesh_voxels(&deep, AIR, sea_surface, material, no_foliage, &mut mesh);
@@ -2890,12 +2893,18 @@ mod cube_tests {
         }
         // The canopy's own top is in the sun, its underside under it is dimmed.
         let top = lights_at(&mesh, 1, 8.0);
-        assert!(!top.is_empty() && top.iter().all(|r| r.0 == SUNLIT), "{top:?}");
+        assert!(
+            !top.is_empty() && top.iter().all(|r| r.0 == SUNLIT),
+            "{top:?}"
+        );
         // With leaves a roof (the rule before), the floor under them is the overhang's dark.
         let mut mesh = SectionMesh::default();
         mesh_voxels(&node, AIR, None, material, no_foliage, &mut mesh);
         let floor = lights_at(&mesh, 1, 1.0);
-        assert!(floor.iter().any(|f| f.0 == SHADED && f.2[0] <= 8.0), "{floor:?}");
+        assert!(
+            floor.iter().any(|f| f.0 == SHADED && f.2[0] <= 8.0),
+            "{floor:?}"
+        );
     }
 
     #[test]
