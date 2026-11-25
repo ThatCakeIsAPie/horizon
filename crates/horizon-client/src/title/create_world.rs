@@ -325,6 +325,11 @@ impl WorldOptions {
     pub fn cubic_kind(&self) -> Option<crate::cubic_settings::CubicKind> {
         self.cubic.filter(|_| self.cubic_allowed())
     }
+    /// Whether the world is an Earth world, which makes its own terrain whatever the world type says: the World
+    /// Type button and its Customize are greyed out while it is chosen.
+    pub fn earth_chosen(&self) -> bool {
+        self.cubic_kind() == Some(crate::cubic_settings::CubicKind::Earth)
+    }
     pub fn bonus_chest(&self) -> bool {
         !self.hardcore && self.bonus_chest
     }
@@ -376,6 +381,9 @@ impl WorldOptions {
     }
     /// A step on one of the open tab's cycle buttons or switches (mouse wheel or keyboard).
     pub(super) fn cycle(&mut self, id: u8, creative: &mut bool, step: i32) {
+        if id == 25 && self.earth_chosen() {
+            return;
+        }
         match id {
             // Survival, Hardcore, Creative.
             20 => {
@@ -603,7 +611,7 @@ pub(super) fn buttons(
                 gy,
                 150.0,
                 labelled("selectWorld.mapType", o.preset_label()),
-                true,
+                !o.earth_chosen(),
                 25,
             )
             .identified("world-type"),
@@ -615,13 +623,14 @@ pub(super) fn buttons(
                 gy,
                 150.0,
                 tr("selectWorld.customizeType"),
-                (editors_ready && super::preset_editors::editor(o.preset_id()).is_some())
-                    || (o.custom_preset.is_none()
-                        && matches!(
-                            o.world_type,
-                            crate::save::WorldPreset::Flat
-                                | crate::save::WorldPreset::SingleBiomeSurface
-                        )),
+                !o.earth_chosen()
+                    && ((editors_ready && super::preset_editors::editor(o.preset_id()).is_some())
+                        || (o.custom_preset.is_none()
+                            && matches!(
+                                o.world_type,
+                                crate::save::WorldPreset::Flat
+                                    | crate::save::WorldPreset::SingleBiomeSurface
+                            ))),
                 26,
             )
             .identified("customize"),

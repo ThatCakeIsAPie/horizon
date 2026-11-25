@@ -823,7 +823,8 @@ fn next_ore(current: &str, allow_none: bool) -> String {
 }
 
 /// The kinds, a row each (ore, second ore, weight, delete), then Add kind and
-/// Reset meteors.
+/// Reset meteors. The second ore's button is the widest: "Second: Redstone" is the
+/// longest label in the row.
 fn kind_rows(b: &mut Builder, m: &MeteorSettings, off: bool) {
     b.heading(label("meteor.kinds"));
     for (k, kind) in m.kinds.iter().enumerate() {
@@ -831,7 +832,7 @@ fn kind_rows(b: &mut Builder, m: &MeteorSettings, off: bool) {
         b.sized(
             vec![
                 (
-                    88.0,
+                    84.0,
                     disabled(
                         button(
                             labelled(&key("meteor.ore"), ore_name(&kind.ore)),
@@ -841,7 +842,7 @@ fn kind_rows(b: &mut Builder, m: &MeteorSettings, off: bool) {
                     ),
                 ),
                 (
-                    88.0,
+                    104.0,
                     disabled(
                         button(
                             labelled(&key("meteor.second"), ore_name(&kind.second)),
@@ -851,7 +852,7 @@ fn kind_rows(b: &mut Builder, m: &MeteorSettings, off: bool) {
                     ),
                 ),
                 (
-                    88.0,
+                    76.0,
                     disabled(
                         number(
                             &key("meteor.weight"),
@@ -868,7 +869,7 @@ fn kind_rows(b: &mut Builder, m: &MeteorSettings, off: bool) {
                     ),
                 ),
                 (
-                    24.0,
+                    20.0,
                     disabled(
                         button("x".into(), move |st| {
                             edit_meteors(st, |m| {

@@ -842,7 +842,6 @@ fn basic_page(b: &mut Builder, state: &State) {
             c.ravines = on
         }),
     ]);
-    b.note(tr("horizon.cubic.basic.unimplemented"));
     b.heading(tr("horizon.cubic.basic.world"));
     let biome = if s.biome.is_empty() {
         tr("horizon.cubic.biome.all")
@@ -903,7 +902,6 @@ fn mark(
 /// heads the page; the list scrolls like the other pages'.
 fn structures_page(b: &mut Builder, state: &State) {
     let s = &state.settings;
-    b.note(tr("horizon.cubic.structure.help"));
     let vanilla = OVERWORLD_STRUCTURE_SETS
         .iter()
         .all(|v| s.structure_enabled(v.name) && s.structure_placement(v.name) == Some(v.placement));
@@ -1753,7 +1751,6 @@ fn terrain_page(b: &mut Builder, state: &State) {
 }
 
 fn flat_page(b: &mut Builder, state: &State) {
-    b.note(tr("horizon.cubic.flat.help"));
     b.row(vec![button(tr("horizon.cubic.flat.add"), |st| {
         let from = st
             .flat
@@ -2959,16 +2956,16 @@ mod tests {
         assert_eq!(press(&mut s, CANCEL), Exit::Cancel);
     }
 
-    /// Reset to vanilla on the Structures page: after the help note.
-    const RESET: usize = 1;
+    /// Reset to vanilla on the Structures page: it heads the page.
+    const RESET: usize = 0;
     /// Where structure set `name`'s block starts on the Structures page: after
-    /// the help note and Reset to vanilla, a switch and three sliders a set.
+    /// Reset to vanilla, a switch and three sliders a set.
     fn switch_of(name: &str) -> usize {
         let i = OVERWORLD_STRUCTURE_SETS
             .iter()
             .position(|v| v.name == name)
             .unwrap_or_else(|| panic!("{name} is an overworld set"));
-        2 + 4 * i
+        1 + 4 * i
     }
     fn slider_pos(state: &State, index: usize) -> f32 {
         match page(state).widgets[index].item.kind {
@@ -2984,7 +2981,7 @@ mod tests {
         assert_eq!(s.page_id(), Some(PageId::Structures));
         // A block a set, in the settings' order: its switch, then three sliders.
         let widgets = page(&s).widgets;
-        assert_eq!(widgets.len(), 2 + 4 * OVERWORLD_STRUCTURE_SETS.len());
+        assert_eq!(widgets.len(), 1 + 4 * OVERWORLD_STRUCTURE_SETS.len());
         assert!(widgets[RESET].item.kind == Kind::Button);
         for v in OVERWORLD_STRUCTURE_SETS {
             let at = switch_of(v.name);
@@ -3238,7 +3235,6 @@ mod tests {
             .chain(
                 [
                     PageId::Structures.name(),
-                    "horizon.cubic.structure.help",
                     "horizon.cubic.structure.vanilla",
                     "horizon.cubic.structure.chance",
                     "horizon.cubic.structure.spacing",
@@ -3555,19 +3551,13 @@ mod tests {
     }
 
     #[test]
-    fn the_scale_reads_as_blocks_to_metres_with_what_the_earth_needs() {
+    fn the_scale_has_no_hint_lines_only_a_warning_when_the_earth_does_not_fit() {
         let mut s = earth_with(crate::earth_consent::Approved::of(&[]), None);
         let lines = earth_lines(&s);
-        assert!(lines.contains(&"1 block = 1 metre".to_owned()), "{lines:?}");
         assert!(
-            lines.iter().any(|l| l.contains("y -11000 to 8849")),
+            !lines.iter().any(|l| l.starts_with("1 block =")),
             "{lines:?}"
         );
-        type_into(&mut s, 2, "0,5");
-        assert!(earth_lines(&s).contains(&"1 block = 0.5 metres".to_owned()));
-        // A scale that is not one has no hint.
-        type_into(&mut s, 2, "far");
-        assert!(!earth_lines(&s).iter().any(|l| l.starts_with("1 block =")));
         // It fits the world's height range at any scale the page takes, so there is no warning...
         type_into(&mut s, 2, "0.25");
         assert!(!earth_lines(&s).iter().any(|l| l.contains("does not fit")));
@@ -3744,6 +3734,19 @@ mod tests {
             short.iter().any(|l| l.contains("Terrain Tiles")),
             "{short:?}"
         );
+        // Every downloaded source has its line (the climate host too); the rivers and lakes ship with the game
+        // and say so.
+        assert!(short.iter().any(|l| l == "Climate: CHELSA."), "{short:?}");
+        assert!(
+            short
+                .iter()
+                .any(|l| l.starts_with("Built in:") && l.contains("HydroSHEDS")),
+            "{short:?}"
+        );
+        assert!(
+            !short.iter().any(|l| l.starts_with("Rivers and lakes:")),
+            "{short:?}"
+        );
         press_button(&mut s, "horizon.cubic.earth.credits.open");
         assert!(s.earth.credits_open());
         // Everything the publisher requires is on the page, word for word.
@@ -3769,20 +3772,6 @@ mod tests {
     }
 
     #[test]
-    fn the_scale_line_is_singular_only_for_one() {
-        use super::earth::scale_sentence;
-        let line = |scale| english(|| scale_sentence(scale));
-        assert_eq!(line(1.0), "1 block = 1 metre");
-        // A scale the page shows as 1 reads as 1.
-        assert_eq!(line(1.0004), "1 block = 1 metre");
-        assert_eq!(line(2.0), "1 block = 2 metres");
-        assert_eq!(line(0.5), "1 block = 0.5 metres");
-        assert_eq!(line(1.5), "1 block = 1.5 metres");
-        assert_eq!(line(10.0), "1 block = 10 metres");
-        assert_eq!(line(1000.0), "1 block = 1000 metres");
-    }
-
-    #[test]
     fn earths_strings_are_in_the_language_file() {
         let strings: std::collections::HashMap<String, String> =
             serde_json::from_str(include_str!("../../assets/horizon/lang/en_us.json")).unwrap();
@@ -3790,23 +3779,18 @@ mod tests {
             "horizon.cubic.type.earth",
             PageId::Earth.name(),
             "horizon.cubic.earth.title",
-            "horizon.cubic.earth.help.1",
-            "horizon.cubic.earth.help.2",
             "horizon.cubic.earth.place",
             "horizon.cubic.earth.latitude",
             "horizon.cubic.earth.longitude",
             "horizon.cubic.earth.scale",
             "horizon.cubic.earth.tiles",
             "horizon.cubic.earth.url",
-            "horizon.cubic.earth.url.help",
             "horizon.cubic.earth.invalid",
             "horizon.cubic.earth.places",
-            "horizon.cubic.earth.scale.is",
-            "horizon.cubic.earth.scale.is.one",
-            "horizon.cubic.earth.scale.needs",
             "horizon.cubic.earth.scale.too_tall",
             "horizon.cubic.earth.credits.heading",
             "horizon.cubic.earth.credits.short",
+            "horizon.cubic.earth.credits.built_in",
             "horizon.cubic.earth.consent.title",
             "horizon.cubic.earth.consent.message",
             "horizon.cubic.earth.credits.open",

@@ -1001,14 +1001,14 @@ impl Title {
     }
 }
 
-/// The consent question's lines: what Earth does, each host it will contact on a line of its own, and the data
-/// credit line.
+/// The consent question's lines: what Earth does, each host it will contact on a line of its own, and the credit
+/// of the data downloaded from them (not the data that ships with the game).
 fn earth_consent_lines(atlas: &HudAtlas, hosts: &[String], width: f32) -> Vec<String> {
     let mut lines = wrapped(
         atlas,
         &lang::get_or(
             "horizon.cubic.earth.consent.message",
-            "Earth worlds download their terrain and land cover from the internet. This game will contact:",
+            "Earth worlds download their terrain, land cover and climate from the internet. This game will contact:",
         ),
         width,
     );
@@ -1018,7 +1018,7 @@ fn earth_consent_lines(atlas: &HudAtlas, hosts: &[String], width: f32) -> Vec<St
         atlas,
         &lang::get_or(
             "horizon.cubic.earth.credits.short",
-            "Elevation: Terrain Tiles (Mapzen). Land cover: ESA WorldCover.",
+            "Elevation: Terrain Tiles (Mapzen). Land cover: ESA WorldCover. Climate: CHELSA.",
         ),
         width,
     ));
