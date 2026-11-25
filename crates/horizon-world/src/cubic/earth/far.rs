@@ -47,6 +47,7 @@ pub struct NodeColumns {
     pub width: usize,
     /// The block the first column is sampled at.
     pub origin: [i32; 2],
+    /// The final surface of each column: the top water block of a water column, the ground of the rest.
     pub surfaces: Vec<i32>,
     kinds: Vec<SurfaceKind>,
     /// The land class of each column; `None` without land cover.
@@ -134,7 +135,7 @@ impl EarthGenerator {
             z1: sz.saturating_add(span),
             zoom,
         };
-        let surfaces = self
+        let mut surfaces = self
             .field
             .surface_ys_strided(sx, sz, width, width, stride, zoom)
             .ok_or_else(|| NotReady {
@@ -150,7 +151,7 @@ impl EarthGenerator {
                 [width, width],
                 stride,
                 zoom_step,
-                &surfaces,
+                &mut surfaces,
             )
             .map_err(not_ready)?;
         Ok(NodeColumns {

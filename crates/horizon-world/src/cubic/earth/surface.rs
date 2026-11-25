@@ -1,4 +1,4 @@
-//! What the top of an Earth column is made of: grass, bare stone, snow or sand.
+//! What the top of an Earth column is made of: grass, bare stone, snow, sand, or water over a bed.
 //!
 //! The rule depends on the column's real elevation (in metres, before the world's scale and exaggeration) and
 //! its own latitude, and is the same for near generation and the far view:
@@ -8,7 +8,8 @@
 //! * Elevation at or above the snow line: [`SNOW_DEPTH`] (2) blocks of `snow_block` over stone.
 //! * Within [`ALPINE_BAND_M`] (1,500 m) below the snow line: bare stone at the surface, no soil.
 //! * Below that: grass over three dirt.
-//! * Under water (the surface below the sea level): sand over stone, whatever the elevation.
+//! * Under the sea (the elevation surface below the sea level): water up to the block under the sea level over a
+//!   sand bed, whatever the elevation ([`SurfaceKind::sea_column`]).
 //!
 //! With land cover (see [`SurfaceKind::on_classified`]) a column whose class is known takes its top from the
 //! class instead, and a column without data keeps the rule above. `docs/earth.md` has the table.
@@ -25,6 +26,15 @@
 //! unchanged. Under the top of a dry kind the ground is terracotta bands by absolute height down to
 //! [`DRY_ROCK_DEPTH`](super::dry::DRY_ROCK_DEPTH) blocks, then stone.
 //!
+//! **Water is part of the column.** A column is a pair `(s, kind)`. For a water column ([`SurfaceKind::Water`]) `s`
+//! is the TOP WATER BLOCK, not the ground: the kind says how many blocks of water there are (`depth`, at least 1)
+//! and what the bed is made of ([`Bed`]), so the ground (the top of the bed) is `s - depth`. Blocks above `s` are
+//! air; blocks `s - depth + 1 ..= s` are water; the bed block is at `s - depth`, and the same material goes
+//! [`SOIL_DEPTH`] blocks further down (stone for a stone bed), then stone. The sea is such a column with its top
+//! at the block under the sea level ([`SurfaceKind::sea_column`]); a lake is one with [`LAKE_DEPTH`] blocks of
+//! water. Everything that reads a column (near cubes, far voxels, far trees) takes `(s, kind)` together, so rules
+//! that move a column's top (water held over low ground, carved or raised banks) only have to change `s`.
+//!
 //! A column's elevation is read back from its surface block height `s` (`VerticalMap::elevation_for_y(s)`), so
 //! the material is a function of `s` and the latitude alone, and a block rectangle's materials follow from its
 //! range of surfaces.
@@ -32,6 +42,7 @@
 use horizon_earth::{LandClass, VerticalMap};
 
 use super::dry::{BARREN_MIX, DESERT_MIX, DryColumn, DryTop, SCRUB_MIX};
+use super::water::Bed;
 
 /// The snow line up to [`SNOW_LINE_FLAT_TO_DEG`] of latitude, in metres.
 pub const SNOW_LINE_LOW_LATITUDE_M: f64 = 5500.0;
@@ -54,8 +65,11 @@ pub const LAND_RULES: u32 = 2;
 /// stays white), but the line falls to sea level at the poles, where lowland the map calls bare or moss is not
 /// under permanent snow.
 pub const LAND_SNOW_FLOOR_M: f64 = 2500.0;
-/// Blocks a lake column's ground lies under its surface (the water is that deep).
+/// Blocks of water in a lake column (its ground lies this far under its top water block).
 pub const LAKE_DEPTH: i64 = 3;
+/// Blocks of water in a sea column whose elevation surface is at or just under the top of the sea: the sea always
+/// has at least one block of water over its bed.
+pub const MIN_WATER_DEPTH: i64 = 1;
 /// Blocks a marsh column's ground lies under its surface (one block of water).
 pub const MARSH_DEPTH: i64 = 1;
 /// A bare column is flat enough for sand when no neighbour a [`SLOPE_BASE_M`] away is higher or lower than this
@@ -92,16 +106,15 @@ pub enum SurfaceKind {
     Alpine,
     /// Two blocks of snow over stone.
     Snow,
-    /// Under the sea: sand over stone, with water over it up to the sea level. Only this kind is flooded.
-    Sand,
     /// Dry sand, four blocks: bare flat ground, even below the sea level.
     Dune,
     /// A gravel block over stone: built-up ground and cold bare flat ground.
     Gravel,
     /// A moss block over three dirt.
     Moss,
-    /// A lake or river: three blocks of water, ending at the surface block, over a sand bed.
-    Lake,
+    /// The sea, a lake or a river: `depth` blocks of water (at least 1) ending at the surface block `s`, over a
+    /// bed of `bed` whose top block is `s - depth`.
+    Water { depth: u32, bed: Bed },
     /// A marsh or mangrove: one block of water, at the surface block, over mud.
     Marsh,
     /// Steep rock in a dry climate: terracotta bands by absolute height ([`super::dry`]), down to
@@ -115,6 +128,34 @@ pub enum SurfaceKind {
 }
 
 impl SurfaceKind {
+    /// What a water-class column under the sea is before its surface is known: one block of water over sand. The
+    /// generator replaces it by [`SurfaceKind::sea_column`], which has the depth.
+    pub const SEA: Self = Self::Water {
+        depth: MIN_WATER_DEPTH as u32,
+        bed: Bed::Sand,
+    };
+
+    /// The sea over a column whose elevation surface is `s0` under `sea_level`: the column `(s, kind)` with the
+    /// top water block `s = sea_level - 1` and a sand bed at `min(s0, s - 1)`, so the water is
+    /// `s - bed` blocks deep (at least 1).
+    pub fn sea_column(s0: i32, sea_level: i32) -> (i32, Self) {
+        let top = i64::from(sea_level) - 1;
+        let ground = i64::from(s0).min(top - MIN_WATER_DEPTH);
+        let depth = u32::try_from(top - ground).unwrap_or(u32::MAX);
+        (
+            top as i32,
+            Self::Water {
+                depth,
+                bed: Bed::Sand,
+            },
+        )
+    }
+
+    /// Whether the column holds water over a bed (the sea, a lake, a river); a marsh is not one.
+    pub fn is_water(self) -> bool {
+        matches!(self, Self::Water { .. })
+    }
+
     /// The kind of a column of real `elevation_m` at `latitude` degrees, on land.
     pub fn on_land(elevation_m: f64, latitude: f64) -> Self {
         let line = snow_line_m(latitude);
@@ -140,13 +181,15 @@ impl SurfaceKind {
     /// * bare: stone within the alpine band under the snow line, else (steep) stone, or in a dry climate
     ///   [`SurfaceKind::Banded`], else sand, or gravel from [`GRAVEL_FROM_LATITUDE`]; gentle dry bare ground
     ///   is sand (dunes) when hot ([`HOT_C`](super::dry::HOT_C)), else [`SurfaceKind::Barren`];
-    /// * water: a lake, or the seabed (flooded to the sea level) when the surface is under the sea;
+    /// * water: a lake ([`SurfaceKind::Water`], [`LAKE_DEPTH`] blocks over sand), or [`SurfaceKind::SEA`] when the
+    ///   surface is under the sea (no data under the sea is the same); the caller turns it into the real sea
+    ///   column with [`SurfaceKind::sea_column`];
     /// * wetland and mangrove: a marsh; moss and lichen: moss; built-up: gravel.
     ///
     /// `dry` is the climate at the column with its hash; without it (`None`: no climate, or no data there) the
     /// rules are exactly those without the dry places.
     ///
-    /// Only [`SurfaceKind::Sand`] is flooded: a known class that is not water stays dry under the sea level.
+    /// A known class that is not water stays dry under the sea level.
     pub fn on_classified<E>(
         class: LandClass,
         elevation_m: f64,
@@ -160,7 +203,7 @@ impl SurfaceKind {
             return Ok(Self::Snow);
         }
         Ok(match class {
-            LandClass::NoData if below_sea => Self::Sand,
+            LandClass::NoData if below_sea => Self::SEA,
             LandClass::NoData => Self::on_land(elevation_m, latitude),
             LandClass::Tree | LandClass::Crop => Self::Grass,
             LandClass::Shrub | LandClass::Grass => match dry.filter(DryColumn::is_dry) {
@@ -194,19 +237,22 @@ impl SurfaceKind {
                 }
             }
             LandClass::SnowIce => Self::Snow,
-            LandClass::Water if below_sea => Self::Sand,
-            LandClass::Water => Self::Lake,
+            LandClass::Water if below_sea => Self::SEA,
+            LandClass::Water => Self::Water {
+                depth: LAKE_DEPTH as u32,
+                bed: Bed::Sand,
+            },
             LandClass::Wetland | LandClass::Mangrove => Self::Marsh,
             LandClass::MossLichen => Self::Moss,
             LandClass::BuiltUp => Self::Gravel,
         })
     }
 
-    /// How many blocks under the surface block the ground of this kind lies: the water of a lake or marsh fills
-    /// the space between.
+    /// How many blocks under the surface block the ground of this kind lies: the water of a water column or marsh
+    /// fills the space between.
     pub fn sink(self) -> i64 {
         match self {
-            Self::Lake => LAKE_DEPTH,
+            Self::Water { depth, .. } => i64::from(depth),
             Self::Marsh => MARSH_DEPTH,
             _ => 0,
         }
@@ -218,12 +264,21 @@ impl SurfaceKind {
         matches!(self, Self::Banded | Self::Scrub(_) | Self::Barren(_))
     }
 
-    /// The kind of a column whose surface block is `s`, at `latitude` degrees.
-    pub fn of_column(s: i32, latitude: f64, sea_level: i32, vertical: &VerticalMap) -> Self {
-        if s < sea_level {
-            Self::Sand
+    /// The column `(s, kind)` whose elevation surface block is `s0`, at `latitude` degrees: the sea
+    /// ([`SurfaceKind::sea_column`]) under the sea level, else the kind of land of that elevation on `s0`.
+    pub fn of_column(
+        s0: i32,
+        latitude: f64,
+        sea_level: i32,
+        vertical: &VerticalMap,
+    ) -> (i32, Self) {
+        if s0 < sea_level {
+            Self::sea_column(s0, sea_level)
         } else {
-            Self::on_land(vertical.elevation_for_y(f64::from(s)), latitude)
+            (
+                s0,
+                Self::on_land(vertical.elevation_for_y(f64::from(s0)), latitude),
+            )
         }
     }
 }
