@@ -80,6 +80,12 @@ pub fn default_block_names() -> Vec<String> {
         "basalt",
         "smooth_basalt",
         "blackstone",
+        // Built-up ground's tops.
+        "smooth_stone",
+        "andesite",
+        "gray_concrete",
+        "light_gray_concrete",
+        "stone_bricks",
     ] {
         let name = format!("minecraft:{n}");
         if !names.contains(&name) {

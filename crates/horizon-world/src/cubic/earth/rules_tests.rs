@@ -23,7 +23,10 @@ fn on(
     dry: Option<DryColumn>,
     slope: Slope,
 ) -> SurfaceKind {
-    SurfaceKind::on_classified(class, metres, lat, false, dry, || Ok::<_, ()>(slope)).unwrap()
+    SurfaceKind::on_classified(class, metres, lat, false, dry, [0, 0], || {
+        Ok::<_, ()>(slope)
+    })
+    .unwrap()
 }
 
 // --- The kinds -------------------------------------------------------------------------------------------------
@@ -339,4 +342,98 @@ fn wetland_is_a_marsh_unless_its_climate_is_frozen_where_it_is_tundra_ground_not
     let (s, kind) = kind_at(&warm, 0, 0);
     assert_eq!(kind, SurfaceKind::Marsh);
     assert_eq!(warm.block_at_blocking(0, s, 0, 1), rig.blocks.water);
+}
+
+// --- Built-up ground and moss -----------------------------------------------------------------------------------
+
+#[test]
+fn built_up_ground_is_a_patchwork_of_parcels_with_a_quarter_of_parks() {
+    use super::cover::{CityTop, PARCEL_BLOCKS, city_top};
+    use std::collections::HashMap;
+    let mut counts: HashMap<CityTop, u32> = HashMap::new();
+    let n = 60;
+    for pz in -n..n {
+        for px in -n..n {
+            let (x, z) = (px * PARCEL_BLOCKS, pz * PARCEL_BLOCKS);
+            let top = city_top(x, z, false);
+            // One parcel shares one top; the same column always gets the same one.
+            assert_eq!(city_top(x + PARCEL_BLOCKS - 1, z + 3, false), top);
+            assert_eq!(city_top(x, z, false), top);
+            *counts.entry(top).or_default() += 1;
+            // A dry climate turns the yards to sand and nothing else.
+            let dry = city_top(x, z, true);
+            if top == CityTop::Grass {
+                assert_eq!(dry, CityTop::Sand);
+            } else {
+                assert_eq!(dry, top);
+            }
+        }
+    }
+    let total = (2 * n * 2 * n) as f64;
+    assert!(counts.len() >= 6, "{counts:?}");
+    assert!(!counts.contains_key(&CityTop::Sand));
+    let grass = f64::from(counts[&CityTop::Grass]) / total;
+    assert!((0.18..=0.32).contains(&grass), "{grass}");
+    // No one grey covers most of the ground: the far view is not one flat colour.
+    assert!(
+        counts.values().all(|&c| f64::from(c) / total < 0.3),
+        "{counts:?}"
+    );
+    // The class gives that kind, wet or dry.
+    let wet = DryColumn::of(12.0, 3.0, 0);
+    let dry = DryColumn::of(25.0, 0.3, 0);
+    for (x, z) in [(0, 0), (17, -40), (800, 333)] {
+        let at = |d| {
+            SurfaceKind::on_classified(LandClass::BuiltUp, 50.0, 40.0, false, d, [x, z], || {
+                Ok::<_, ()>(Slope::Gentle)
+            })
+            .unwrap()
+        };
+        assert_eq!(at(Some(wet)), SurfaceKind::BuiltUp(city_top(x, z, false)));
+        assert_eq!(at(None), SurfaceKind::BuiltUp(city_top(x, z, false)));
+        assert_eq!(at(Some(dry)), SurfaceKind::BuiltUp(city_top(x, z, true)));
+    }
+}
+
+#[test]
+fn moss_and_lichen_is_mostly_moss_with_some_grass_and_bare_ground() {
+    use super::cover::{MossTop, moss_top};
+    use std::collections::HashMap;
+    let mut counts: HashMap<MossTop, u32> = HashMap::new();
+    for z in 0..100 {
+        for x in 0..100 {
+            let top = moss_top(x, z);
+            assert_eq!(moss_top(x, z), top);
+            *counts.entry(top).or_default() += 1;
+        }
+    }
+    assert_eq!(
+        on(LandClass::MossLichen, 300.0, 64.0, None, Slope::Gentle),
+        SurfaceKind::Moss(moss_top(0, 0))
+    );
+    let share = |t| f64::from(counts.get(&t).copied().unwrap_or(0)) / 10_000.0;
+    assert!((0.45..=0.65).contains(&share(MossTop::Moss)), "{counts:?}");
+    assert!((0.08..=0.25).contains(&share(MossTop::Grass)), "{counts:?}");
+    let bare = share(MossTop::Stone) + share(MossTop::Gravel) + share(MossTop::CoarseDirt);
+    assert!((0.2..=0.4).contains(&bare), "{counts:?}");
+}
+
+#[test]
+fn street_trees_grow_only_on_grass_parcels() {
+    use super::cover::{CityTop, city_top};
+    use super::vegetation::{FeatureKind, allowed};
+    let (mut trees, mut grass) = (0, 0);
+    for z in 0..200 {
+        for x in 0..200 {
+            let on_grass = city_top(x, z, false) == CityTop::Grass;
+            grass += u32::from(on_grass);
+            if allowed(LandClass::BuiltUp, FeatureKind::Tree, x, z) {
+                assert!(on_grass, "{x} {z}");
+                trees += 1;
+            }
+            assert!(!allowed(LandClass::BuiltUp, FeatureKind::Plant, x, z));
+        }
+    }
+    let share = f64::from(trees) / f64::from(grass);
+    assert!((0.2..=0.4).contains(&share), "{share}");
 }

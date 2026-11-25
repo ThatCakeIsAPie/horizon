@@ -20,6 +20,7 @@ pub mod biome;
 pub mod blocking;
 #[cfg(test)]
 mod climate_tests;
+pub mod cover;
 pub mod dry;
 #[cfg(test)]
 mod dry_tests;

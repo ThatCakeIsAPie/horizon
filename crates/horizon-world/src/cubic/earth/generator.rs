@@ -50,6 +50,7 @@ use horizon_earth::{
 };
 
 use super::biome::BIOME_SAMPLE_M;
+use super::cover::{CityTop, MossTop};
 use super::dry::{
     BAND_COUNT, BasaltTop, DRY_ROCK_DEPTH, DryColumn, DryTop, band_index, band_table,
 };
@@ -97,6 +98,12 @@ pub struct EarthBlocks {
     pub smooth_basalt: u32,
     pub tuff: u32,
     pub blackstone: u32,
+    /// Built-up ground's grey tops ([`SurfaceKind::BuiltUp`]).
+    pub smooth_stone: u32,
+    pub andesite: u32,
+    pub gray_concrete: u32,
+    pub light_gray_concrete: u32,
+    pub stone_bricks: u32,
     /// What the far view's trees and snow are made of.
     pub far: super::far_trees::FarBlocks,
 }
@@ -132,6 +139,11 @@ impl EarthBlocks {
             smooth_basalt: get("smooth_basalt")?,
             tuff: get("tuff")?,
             blackstone: get("blackstone")?,
+            smooth_stone: get("smooth_stone")?,
+            andesite: get("andesite")?,
+            gray_concrete: get("gray_concrete")?,
+            light_gray_concrete: get("light_gray_concrete")?,
+            stone_bricks: get("stone_bricks")?,
             far: super::far_trees::FarBlocks::from_registry(registry)?,
         })
     }
@@ -429,8 +441,28 @@ impl EarthGenerator {
                 BasaltTop::Blackstone => b.blackstone,
             },
             SurfaceKind::Basalt(_) => b.stone,
-            SurfaceKind::Moss if y == ground => b.moss_block,
-            SurfaceKind::Moss => b.dirt,
+            SurfaceKind::Moss(top) if y == ground => match top {
+                MossTop::Moss => b.moss_block,
+                MossTop::Grass => b.grass_block,
+                MossTop::Stone => b.stone,
+                MossTop::Gravel => b.gravel,
+                MossTop::CoarseDirt => b.coarse_dirt,
+            },
+            SurfaceKind::Moss(MossTop::Stone | MossTop::Gravel) => b.stone,
+            SurfaceKind::Moss(_) => b.dirt,
+            SurfaceKind::BuiltUp(top) if y == ground => match top {
+                CityTop::Stone => b.stone,
+                CityTop::SmoothStone => b.smooth_stone,
+                CityTop::Andesite => b.andesite,
+                CityTop::GrayConcrete => b.gray_concrete,
+                CityTop::LightGrayConcrete => b.light_gray_concrete,
+                CityTop::StoneBricks => b.stone_bricks,
+                CityTop::Grass => b.grass_block,
+                CityTop::Sand => b.sand,
+            },
+            SurfaceKind::BuiltUp(CityTop::Grass) => b.dirt,
+            SurfaceKind::BuiltUp(CityTop::Sand) => b.sand,
+            SurfaceKind::BuiltUp(_) => b.stone,
             SurfaceKind::Marsh => b.mud,
             SurfaceKind::Scrub(top) | SurfaceKind::Barren(top) if y == ground => match top {
                 DryTop::GrassBlock => b.grass_block,
@@ -682,11 +714,11 @@ impl EarthGenerator {
         class: LandClass,
     ) -> Result<(i32, SurfaceKind), Gap> {
         let elevation = self.field.vertical().elevation_for_y(f64::from(s0));
-        // Only open ground and wetland read the climate: what a tree, crop, water or snow column is does not
-        // depend on it.
+        // Only open ground, wetland and built-up ground read the climate: what a tree, crop, water or snow column
+        // is does not depend on it.
         let dry = if matches!(
             class,
-            LandClass::Bare | LandClass::Shrub | LandClass::Grass | LandClass::Wetland
+            LandClass::Bare | LandClass::Shrub | LandClass::Grass | LandClass::Wetland | LandClass::BuiltUp
         ) {
             self.dry_column(a, x, z)?
         } else {
@@ -698,6 +730,7 @@ impl EarthGenerator {
             self.latitude_at(x, z),
             s0 < self.sea_level,
             dry,
+            [x, z],
             || self.slope_at(a, x, z, s0, stride, zoom_step),
         )?;
         Ok(if kind.is_water() && s0 < self.sea_level {

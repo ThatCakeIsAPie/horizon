@@ -99,7 +99,7 @@ fn each_class_allows_what_the_table_says() {
     allows(LandClass::Crop, &[Plant]);
     allows(LandClass::MossLichen, &[Plant]);
     allows(LandClass::Bare, &[Dry]);
-    allows(LandClass::BuiltUp, &[]);
+    // Built-up ground allows street trees on grass parcels only (`rules_tests`).
     allows(LandClass::SnowIce, &[]);
     allows(LandClass::Water, &[Water]);
     allows(LandClass::Wetland, &all);
@@ -401,23 +401,19 @@ fn every_vegetal_feature_of_an_earth_biome_lands_in_its_kind() {
     let names = |kind| by_kind.get(&kind).cloned().unwrap_or_default();
     eprintln!("{by_kind:#?}");
     assert!(
-        names(Tree)
-            .iter()
-            .all(|n| n.starts_with("trees_")
-                || n.starts_with("bamboo")
-                || n == "birch_tall"
-                || n == "dark_forest_vegetation"),
+        names(Tree).iter().all(|n| n.starts_with("trees_")
+            || n.starts_with("bamboo")
+            || n == "birch_tall"
+            || n == "dark_forest_vegetation"),
         "{:?}",
         names(Tree)
     );
     assert!(names(Tree).contains("trees_plains") && names(Tree).contains("bamboo_light"));
     assert!(
-        names(Water)
-            .iter()
-            .all(|n| n.starts_with("seagrass")
-                || n.starts_with("kelp")
-                || n == "sea_pickle"
-                || n == "warm_ocean_vegetation"),
+        names(Water).iter().all(|n| n.starts_with("seagrass")
+            || n.starts_with("kelp")
+            || n == "sea_pickle"
+            || n == "warm_ocean_vegetation"),
         "{:?}",
         names(Water)
     );

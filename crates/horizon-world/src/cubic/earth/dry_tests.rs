@@ -35,7 +35,7 @@ fn kind(
     dry: Option<DryColumn>,
     steep: fn() -> Result<Slope, ()>,
 ) -> SurfaceKind {
-    SurfaceKind::on_classified(class, 1200.0, lat, false, dry, steep).unwrap()
+    SurfaceKind::on_classified(class, 1200.0, lat, false, dry, [0, 0], steep).unwrap()
 }
 
 fn climate(t: f32, p: f32) -> Option<Climate> {
@@ -69,7 +69,7 @@ fn the_cache_keys_know_the_dry_rules() {
     settings.climate = true;
     let key = settings.terrain_key();
     assert!(key.contains("#landcover"), "{key}");
-    assert_eq!(surface::LAND_RULES, 5);
+    assert_eq!(surface::LAND_RULES, 6);
     assert_eq!(biome::CLIMATE_BIOME_RULES, 3);
     assert_eq!(vegetation::VEGETATION_RULES, 2);
     assert!(key.contains(&format!(".{}", surface::LAND_RULES)), "{key}");
@@ -103,7 +103,8 @@ fn dry_bare_steep_ground_is_banded_and_gentle_ground_depends_on_the_heat() {
     );
     // The alpine band under the snow line still wins; so does the cold latitude gravel.
     assert_eq!(
-        SurfaceKind::on_classified(LandClass::Bare, 4500.0, 36.0, false, dry, SLOPE).unwrap(),
+        SurfaceKind::on_classified(LandClass::Bare, 4500.0, 36.0, false, dry, [0, 0], SLOPE)
+            .unwrap(),
         SurfaceKind::Alpine
     );
     assert_eq!(
@@ -210,11 +211,11 @@ fn trees_and_the_rest_keep_their_tops_in_a_dry_climate() {
     );
     assert_eq!(
         kind(LandClass::MossLichen, 36.0, dry, NO_SLOPE),
-        SurfaceKind::Moss
+        SurfaceKind::Moss(super::cover::moss_top(0, 0))
     );
     assert_eq!(
         kind(LandClass::BuiltUp, 36.0, dry, NO_SLOPE),
-        SurfaceKind::Gravel
+        SurfaceKind::BuiltUp(super::cover::city_top(0, 0, true))
     );
     assert_eq!(
         kind(LandClass::Water, 36.0, dry, NO_SLOPE),
@@ -229,7 +230,8 @@ fn trees_and_the_rest_keep_their_tops_in_a_dry_climate() {
     );
     // Snow wins over everything.
     assert_eq!(
-        SurfaceKind::on_classified(LandClass::Bare, 8000.0, 30.0, false, dry, SLOPE).unwrap(),
+        SurfaceKind::on_classified(LandClass::Bare, 8000.0, 30.0, false, dry, [0, 0], SLOPE)
+            .unwrap(),
         SurfaceKind::Snow
     );
 }
@@ -252,9 +254,16 @@ fn wet_climate_and_no_climate_give_the_old_kinds_except_wet_bare_rock_and_frozen
             (-5.0, 5.0),
         ] {
             for steep in [NO_SLOPE, SLOPE] {
-                let none =
-                    SurfaceKind::on_classified(class, elevation, lat, elevation < 0.0, None, steep)
-                        .unwrap();
+                let none = SurfaceKind::on_classified(
+                    class,
+                    elevation,
+                    lat,
+                    elevation < 0.0,
+                    None,
+                    [0, 0],
+                    steep,
+                )
+                .unwrap();
                 for other in [wet, frozen] {
                     let got = SurfaceKind::on_classified(
                         class,
@@ -262,6 +271,7 @@ fn wet_climate_and_no_climate_give_the_old_kinds_except_wet_bare_rock_and_frozen
                         lat,
                         elevation < 0.0,
                         Some(other),
+                        [0, 0],
                         steep,
                     )
                     .unwrap();

@@ -33,7 +33,8 @@
 //! | Crop | no | no | no | yes |
 //! | Moss and lichen | no | no | no | yes |
 //! | Bare | no | no | yes | no |
-//! | Built-up, snow and ice | no | no | no | no |
+//! | Built-up | on about 30 % of the grass parcels' columns ([`STREET_TREES`](super::cover::STREET_TREES)) | no | no | no |
+//! | Snow and ice | no | no | no | no |
 //! | Water | no | yes | no | no |
 //! | Wetland, mangrove | yes | yes | yes | yes |
 //! | No data | yes | yes | yes | yes |
@@ -56,6 +57,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use horizon_earth::{LandClass, LoadError};
 
 use super::biome::Biome;
+use super::cover::{CityTop, STREET_TREES, city_top};
 use super::dry::few_plants_allow;
 use super::generator::{EarthGenerator, Gap, Rect};
 use crate::cubic::custom::vegetation::VegetationMask;
@@ -126,6 +128,7 @@ pub fn tree_share(class: LandClass) -> f64 {
         LandClass::Tree | LandClass::Wetland | LandClass::Mangrove | LandClass::NoData => 1.0,
         LandClass::Shrub => SHRUB_TREES as f64 / 1000.0,
         LandClass::Grass => GRASS_TREES as f64 / 1000.0,
+        LandClass::BuiltUp => STREET_TREES as f64 / 1000.0,
         _ => 0.0,
     }
 }
@@ -167,7 +170,14 @@ pub fn allowed_in(
         },
         LandClass::Crop | LandClass::MossLichen => kind == Plant,
         LandClass::Bare => kind == Dry,
-        LandClass::BuiltUp | LandClass::SnowIce => false,
+        // Street and garden trees on grass parcels only (a dry climate's sand yards have none: the far view
+        // reads its kind, near trees do not grow on sand).
+        LandClass::BuiltUp => {
+            kind == Tree
+                && column_bucket(x, z) < STREET_TREES
+                && city_top(x, z, false) == CityTop::Grass
+        }
+        LandClass::SnowIce => false,
         LandClass::Water => kind == Water,
         LandClass::Wetland | LandClass::Mangrove | LandClass::NoData => true,
     }
