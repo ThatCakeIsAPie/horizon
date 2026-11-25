@@ -32,7 +32,7 @@ type into it, Escape lets go of it, and Done and Cancel are in the footer.
 | Tile server address | A template with `{z}`, `{x}` and `{y}` for the tile. With Horizon's official game it starts as AWS Terrain Tiles (below); the game built alone starts with the box empty. `https://` only (`http://` only to this computer, for testing). |
 
 The Presets overlay shows the same settings as JSON, with four that have no box: `seaLevelY` (the block height of
-sea level, 0 by default), `verticalExaggeration` (1), `maxZoom` (the finest tile zoom, 15) and `structures`.
+sea level, 0 by default), `verticalExaggeration` (1), `maxZoom` (the finest tile zoom, 15) and `structures` (on by default, see [Structures](#structures)).
 Everything is saved in the world's `cubicgen.json`. There are no switches for downloads or land cover: a new Earth
 world is always saved with `allowDownloads: true` and, when the game has a land cover source, `landCover: true` and
 `vegetation: true` (plants and trees, see [Plants and trees](#plants-and-trees)). A world made before this keeps
@@ -276,8 +276,8 @@ Choices worth knowing:
 With `"vegetation": true` and land cover on, an Earth world grows 26.3's own vegetation: the vegetal-step features of
 each biome (trees, grass, ferns, flowers, bushes, cacti, dead bushes, kelp and seagrass in water, swamp and mangrove
 trees), run by the same code as Custom Cubic (`custom/vegetation.rs`) in each cube's population. Earth's population
-does nothing else: no ores, lakes or springs. Without land cover the world has one biome and grows nothing, and the
-settings in force say `vegetation` is off (`cubic_gen.rs`).
+also places ores and structures (see [Structures](#structures)), but no lakes or springs. Without land cover the
+world has one biome and grows nothing, and the settings in force say `vegetation` is off (`cubic_gen.rs`).
 
 The biomes are read at 500 m, too coarse to place a forest's edge, so the density follows the 10 m land class of
 the exact column (`earth/vegetation.rs`, `EarthVegetationMask`). Each feature is sorted by its name into a kind:
@@ -309,6 +309,36 @@ a tree stands and the share thins its density. Lily pads count as plants, so the
 - **The cache key.** `terrain_key()` also ends with `#vegetation<rules>` (now `#vegetation2`) while land cover and
   vegetation are on, so old far-view caches are rebuilt. The far view draws its own simple trees
   (see Far view: trees and snow); the key also ends with `#fartrees2` then.
+
+### Structures
+
+With `"structures": true` (the default, also for a file that leaves it out) an Earth world builds Cubic's vanilla
+structures: villages, temples, mineshafts, strongholds, ocean monuments, woodland mansions, shipwrecks, ruins and the
+rest of 26.3's overworld sets, all on as in Custom Cubic's defaults. The client runs the same code as Custom Cubic
+(`cubic/custom/structures.rs`, built in `cubic_gen.rs`) in each cube's population, so Earth populates a cube whenever
+it has structures, vegetation or ores.
+
+- **The real ground.** A structure start reads the generator's own surface (`earth/structure_ground.rs`,
+  `chunk_ground`): the topmost solid block of each column and the water over it. A village or temple stands on the
+  ground top, wherever it is (a plain, a pass at 1,500 m, a coast); shipwrecks and ocean ruins lie on the sea floor;
+  dry land below `seaLevelY` (land cover on) is ground, not sea; a lake above sea level is water.
+- **The terrain is adapted** around a structure as in vanilla (the beard: ground filled under a house, cut away over
+  it); away from structures every block is the plain generator's.
+- **Biomes** come from Earth's biome source, so a structure's biome rules follow the land cover and climate; without
+  land cover the world has one biome and every structure that biome allows can start anywhere.
+- **Needs the generator data.** Without 26.3's generator data the world has no structures and its settings in
+  force say `structures` is false (`cubic_gen.rs`). The world option "generate structures" is not read for Cubic
+  worlds (Custom Cubic ignores it too); `structures` is the switch.
+- **Far view shows none.** The distant terrain has no structures (Custom Cubic's far villages are Custom-only), so
+  they appear as the cubes around the player are made.
+- **Underground structures keep vanilla's depths.** Mineshafts, strongholds, ancient cities and trial chambers are
+  placed against vanilla's bottom (y -64), not against the local ground: under a high mountain they are deep below
+  the surface, and nothing moves them for the sea or for a trench.
+- **Ground moves only where it joins.** The adaptation moves each column's top up or down through the blocks joined
+  to the ground; a lump the beard would make under a piece floating far over the ground is left out, and a buried
+  piece's carving under the ground does not open it.
+- A world made before structures were made keeps what its terrain was: a cube populated without them is never
+  given any later, and its starts are left out of `/locate`.
 
 ### Climate
 
@@ -657,7 +687,8 @@ header and index once; each 1-degree cell is inflated and decoded the first time
 ## Known limits
 
 - **Elevation only, one biome (land cover off).** Without land cover there are no rivers. The surface is grass, bare stone or snow by height and
-  latitude; every column has the same biome, and vanilla structures are off (`structures` stays false).
+  latitude; every column has the same biome. Vanilla structures are on (see [Structures](#structures)); their biome rules
+  see that one biome everywhere.
 - **No towns.** Earth has no buildings, roads or towns, with or without land cover: where the map says built-up the
   world is the natural land around it (see "Built-up land" under Land cover), so cities look like the
   countryside around them. Vanilla structures are separate from this.

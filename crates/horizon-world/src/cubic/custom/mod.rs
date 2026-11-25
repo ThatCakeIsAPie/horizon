@@ -362,7 +362,7 @@ impl CustomCubicGenerator {
         }
         match &self.kind {
             Kind::Flat(f) => f.generate(cube, out),
-            Kind::Heightmap(e) => e.generate_blocking(cube, out),
+            Kind::Heightmap(e) => e.generate_adapted_blocking(cube, out, beard),
             Kind::Terrain(t) => {
                 t.generate_adapted(cube, out, beard);
                 let first = out[0];
@@ -379,8 +379,10 @@ impl CustomCubicGenerator {
         if self.has_areas() {
             return;
         }
-        if let Kind::Terrain(t) = &self.kind {
-            t.adapt_tops(cx, cz, tops, beard);
+        match &self.kind {
+            Kind::Terrain(t) => t.adapt_tops(cx, cz, tops, beard),
+            Kind::Heightmap(_) => earth::structure_ground::adapt_ground(beard, cx, cz, tops),
+            Kind::Flat(_) => {}
         }
     }
 
@@ -437,6 +439,7 @@ impl CustomCubicGenerator {
                 .populate(cube, world, &t.blend, &|x, z| t.ground(x, z)),
             // Earth: no lakes or springs; ores (when on) before the vegetation, meteors after it.
             Kind::Heightmap(e) => {
+                world.place_structures(cube);
                 let ground = earth::ores::EarthGround::new(e);
                 if let Some(ores) = &self.earth_ores {
                     ores.place_ores(e, cube, world, &ground);
@@ -545,6 +548,25 @@ impl CustomCubicGenerator {
             ),
             Kind::Terrain(t) => t.chunk_tops(cx, cz),
         }
+    }
+
+    /// `[ground, water]` of each column of chunk (`cx`, `cz`) (`z << 4 | x`): the topmost solid block
+    /// ([`Self::chunk_tops`]; [`NO_TOP`] for none), and the top water block over it or [`NO_TOP`] for
+    /// dry ground: what structures stand on. Earth gives both from its data (under water the ground is
+    /// the bed; dry land below the sea level is ground). Terrain and Flat fill the sea up to sea level.
+    pub fn chunk_ground(&self, cx: i32, cz: i32) -> Box<[[i32; 2]; 256]> {
+        if let Kind::Heightmap(e) = &self.kind {
+            let found = e
+                .chunk_ground_blocking(cx, cz)
+                .and_then(|g| <[[i32; 2]; 256]>::try_from(g).ok());
+            return Box::new(found.unwrap_or([[NO_TOP; 2]; 256]));
+        }
+        let sea = self.sea_level() - 1;
+        let tops = self.chunk_tops(cx, cz);
+        Box::new(std::array::from_fn(|i| {
+            let top = tops[i];
+            [top, if top < sea { sea } else { NO_TOP }]
+        }))
     }
 
     /// Whether a box of blocks touches a `cubeAreas` entry (their blocks come
@@ -790,7 +812,7 @@ const SQUEEZE_MAX: f64 = 11.0 / 24.0;
 /// where the beard turns it; with no beard the density is untouched (the
 /// callers skip the map, so the terrain away from structures is bit for bit
 /// the same).
-fn adapt(density: f64, beard: f32) -> f64 {
+pub(crate) fn adapt(density: f64, beard: f32) -> f64 {
     if beard == 0.0 {
         return density;
     }
