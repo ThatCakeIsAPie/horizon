@@ -3697,7 +3697,8 @@ mod tests {
         assert!(!earth_settings(&none).unwrap().vegetation);
         assert!(!none.json().contains("vegetation"));
         assert!(!earth_settings(&none).unwrap().snow);
-        assert!(!none.json().contains("snow"));
+        // The key only: oreGen names snowy biomes.
+        assert!(!none.json().contains("\"snow\""));
     }
 
     #[test]
