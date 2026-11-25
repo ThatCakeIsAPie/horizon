@@ -98,6 +98,18 @@ pub struct LandTile {
 }
 
 impl LandTile {
+    /// The tile of `level` whose decoded class codes are `pixels`, with its built-up land given back to nature
+    /// ([`crate::landcover::unbuild`]): no read ever sees a built-up class.
+    fn decoded(level: &Level, mut pixels: Vec<u8>) -> Self {
+        let (width, height) = (level.tile_width, level.tile_height);
+        crate::landcover::unbuild(&mut pixels, width as usize, height as usize);
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
     /// The class at pixel `(x, y)` of the tile; [`LandClass::NoData`] for a value the dataset does not define.
     /// `None` outside the tile.
     pub fn class(&self, x: u32, y: u32) -> Option<LandClass> {
@@ -480,11 +492,7 @@ impl LandCoverStore {
             return Err(ProvideError::WrongLength);
         }
         let pixels = level.decode_tile(bytes).map_err(ProvideError::Tiff)?;
-        let tile = Arc::new(LandTile {
-            width: level.tile_width,
-            height: level.tile_height,
-            pixels,
-        });
+        let tile = Arc::new(LandTile::decoded(level, pixels));
         let _ = write_atomically(&self.tile_path(file, level_no, tile_no), bytes);
         self.remember((file, level_no, tile_no), &tile);
         Ok(())
@@ -616,11 +624,7 @@ impl LandCoverStore {
             && bytes.len() as u64 == range.len
             && let Ok(pixels) = level.decode_tile(&bytes)
         {
-            let tile = Arc::new(LandTile {
-                width: level.tile_width,
-                height: level.tile_height,
-                pixels,
-            });
+            let tile = Arc::new(LandTile::decoded(level, pixels));
             self.remember(key, &tile);
             return Ok(Some(tile));
         }
@@ -847,12 +851,60 @@ mod tests {
 
     const SIZES: [u32; 3] = [600, 300, 150];
 
-    /// What the miniature file says at a place, worked out from the pixel arithmetic alone.
+    /// The raw code the miniature file holds at a place.
+    fn raw_code(lat: f64, lon: f64, level: usize) -> u8 {
+        let file = WorldCoverFile::containing(lat, lon).unwrap();
+        let size = SIZES[level];
+        let (x, y) = file.pixel(lat, lon, size, size);
+        code(level, x, y)
+    }
+
+    /// What the miniature file says at a place, worked out from the pixel arithmetic alone: the code of the
+    /// pixel in its 256-pixel tile (padding is no data), with the tile's built-up land given back to nature.
     fn expected(lat: f64, lon: f64, level: usize) -> LandClass {
         let file = WorldCoverFile::containing(lat, lon).unwrap();
         let size = SIZES[level];
         let (x, y) = file.pixel(lat, lon, size, size);
-        LandClass::from_code(code(level, x, y)).unwrap()
+        let (tx, ty) = (x / 256 * 256, y / 256 * 256);
+        let mut tile: Vec<u8> = (0..256 * 256)
+            .map(|i| {
+                let (px, py) = (tx + i % 256, ty + i / 256);
+                if px < size && py < size {
+                    code(level, px, py)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        crate::landcover::unbuild(&mut tile, 256, 256);
+        LandClass::from_code(tile[((y - ty) * 256 + (x - tx)) as usize]).unwrap()
+    }
+
+    #[test]
+    fn no_lookup_answers_built_up_land_at_any_level_or_place() {
+        let dir = TempDir::new();
+        let store = LandCoverStore::new(dir.path(), 16);
+        let server = Server::with(&[HERE]);
+        let (mut raw_built, mut seen) = (0, 0);
+        for (level, metres) in [10.0, 1200.0, 2300.0].into_iter().enumerate() {
+            for i in 0..30 {
+                for j in 0..30 {
+                    let (lat, lon) = (27.02 + f64::from(i) * 0.033, 84.02 + f64::from(j) * 0.033);
+                    raw_built +=
+                        usize::from(raw_code(lat, lon, level) == LandClass::BuiltUp.code());
+                    let got = server.resolve(&store, lat, lon, metres);
+                    assert_ne!(got, Lookup::Class(LandClass::BuiltUp), "{lat}, {lon}");
+                    assert_eq!(
+                        got,
+                        Lookup::Class(expected(lat, lon, level)),
+                        "{lat}, {lon}"
+                    );
+                    seen += 1;
+                }
+            }
+        }
+        // The file did hold built-up pixels where the lookups went.
+        assert!(raw_built > 50, "{raw_built} of {seen}");
     }
 
     /// A pretend server: the files it has, and how often it was asked.

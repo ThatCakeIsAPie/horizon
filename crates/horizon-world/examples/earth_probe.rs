@@ -102,7 +102,6 @@ fn kind_char(s: i32, kind: SurfaceKind, sea_top: i32) -> char {
         SurfaceKind::Dune => 's',
         SurfaceKind::Gravel => '.',
         SurfaceKind::Moss(_) => 'M',
-        SurfaceKind::BuiltUp(_) => 'u',
         SurfaceKind::Banded => 'b',
         SurfaceKind::Scrub(_) => 'c',
         SurfaceKind::Barren(_) => 'r',
@@ -117,9 +116,9 @@ fn class_char(class: LandClass) -> char {
         LandClass::NoData => ' ',
         LandClass::Tree => 'T',
         LandClass::Shrub => 'h',
-        LandClass::Grass => 'g',
+        // Decoded land cover never holds built-up land; named, it is grass.
+        LandClass::Grass | LandClass::BuiltUp => 'g',
         LandClass::Crop => 'c',
-        LandClass::BuiltUp => '#',
         LandClass::Bare => 'b',
         LandClass::SnowIce => 'I',
         LandClass::Water => '~',
@@ -223,7 +222,7 @@ fn main() {
     let legend = "kinds: = water at sea level, ~ other water, m marsh, g grass, . gravel, s sand, A stone, S snow, I glacier, i icefall, M moss, k basalt, c scrub, r barren, b banded";
     println!("{legend}");
     println!(
-        "classes: ~ water, # built-up, T tree, h shrub, g grass, c crop, b bare, I snow/ice, w wetland, v mangrove, M moss, ' ' no data"
+        "classes: ~ water, T tree, h shrub, g grass, c crop, b bare, I snow/ice, w wetland, v mangrove, M moss, ' ' no data"
     );
     let center = n / 2;
     let sea_top = settings.sea_level_y - 1;

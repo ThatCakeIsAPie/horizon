@@ -227,7 +227,7 @@ The biome column below is the one without climate; with `climate` on see [Climat
 | shrubland | grass over three dirt | `savanna` under 35°, `plains`, `snowy_plains` from 66° |
 | grassland | grass over three dirt | `meadow` from 1,500 m, `savanna` under 20°, `plains`, `snowy_plains` from 66° |
 | cropland | grass over three dirt (farmland dries out without water, and nothing else fits) | `plains` |
-| built-up | a patchwork of 8 by 8 parcels (`earth/cover.rs`, `CITY_MIX`): 25 % grass (parks, yards; sand in a dry climate), the rest grey concrete, light grey concrete, stone, smooth stone, andesite and stone bricks, over stone; street trees on 30 % of the grass parcels' columns. Flat: buildings come much later | `plains` |
+| built-up | the land around it (see "Built-up land" under Choices worth knowing below): never a class of its own once decoded, so it is whichever row above its nearest natural land is | that row's |
 | bare | stone inside the 1,500 m alpine band under the snow line; else stone where steep (a neighbour 30 m away differs by 0.6 of the distance or more); else gravel from 50° latitude; else in a known wet climate basalt rock (70 % basalt, 14 % smooth basalt, 9 % tuff, 7 % blackstone, over stone); else sand | `stony_peaks` from 2,000 m, `desert` under 40°, else `windswept_gravelly_hills` |
 | water | the water rules (see Water): a lake, a river's wide bed, or the sea when at or under the sea level plus 3 m | `river` above sea level, `ocean` at or under it |
 | herbaceous wetland | one block of water at the surface block over mud; in a frozen climate (climate on, mean annual temperature under 0 C) grass over three dirt (tundra: its open water is mapped as water) | `swamp`; `snowy_plains` in a frozen climate |
@@ -240,6 +240,17 @@ Choices worth knowing:
 - **Dry below sea level.** The sea fills a column under `seaLevelY` only when its class is water or unknown. Grass,
   bare ground and the rest stay dry there (Death Valley, the Dead Sea shore, polders). With land cover on no box is
   proven all water from the heights, so deep sea costs per-column work like any other terrain.
+- **Built-up land** is natural land: as if no one ever lived there. Each decoded land-cover tile has its built-up
+  pixels (code 50) given the class of the nearest natural land (tree, shrub, grass, crop, bare, moss; 8-neighbour
+  steps through the town, within 64 pixels, the first in scan order on a tie); one beyond that takes the tile's most
+  common natural class, else grassland (`landcover::unbuild`, called as each tile is decoded in `landfield.rs`).
+  Water, wetland, mangrove and snow never spread into a town: a town on a shore is dry ground. Every read (near
+  ground, far view, biome, vegetation, water rules, far trees, the probe) gets its classes from those decoded tiles,
+  so none of them ever sees a built-up class: the ground, biome and tree density of a town are those of the land
+  around it, near and far alike, and there are no parcels, grey tops, roads or street trees. The class stays in
+  `LandClass` for the decoder only; a `match` in `horizon-world` that must name it treats it as grassland. The raw
+  tiles on disk are unchanged (the rule runs on decode), and `surface::LAND_RULES` went up so far-view nodes built
+  with grey patches are not reused.
 - **Snow.** Elevation snow stays everywhere except below 2,500 m: the map comes from a few summers of imagery and
   misses seasonal snow on high peaks (Everest is white whatever its pixel says), but at the poles the line falls to
   sea level and lowland the map calls bare or moss is not under permanent snow. A lake above the snow line is frozen
@@ -282,7 +293,6 @@ cane, pumpkins, mushrooms, lily pads, leaf litter...).
 | grassland | plants and dry plants; trees on a fixed 2 % of the columns |
 | cropland, moss and lichen | plants only |
 | bare | dry plants only (cactus and dead bush in a desert, as vanilla) |
-| built-up | trees on 30 % of the columns of grass parcels (`cover::STREET_TREES`) |
 | snow and ice | nothing |
 | water | water plants only |
 | wetland, mangroves | everything (the `swamp` and `mangrove_swamp` features) |
@@ -381,7 +391,7 @@ game reads it (500 m of ground):
 | Pacific Northwest, Olympic Peninsula | 9.4 | 2,871 | 8.77 | no |
 
 **Surface** (`SurfaceKind::on_classified`). Snow and the alpine band still win first (steep snow is rock, snow and ice class is a glacier; see the class table); bare gentle ground in a wet climate is basalt, sand stays for the hot dry places and for ground without climate data; tree cover (rim forest),
-cropland, water, wetland, mangroves and moss are unchanged; a built-up yard is sand instead of grass.
+cropland, water, wetland, mangroves and moss are unchanged.
 
 | Class in a dry climate | Steep (`STEEP_GRADIENT`) | Gentle |
 |---|---|---|
@@ -419,8 +429,8 @@ flowers, bushes) on only 30 % of the columns, by a fixed column hash, via the bi
 (`biome_at_quart_blocking`, remembered per 4 by 4 column). It needs a climate source: without one the biomes do not
 say which places are dry.
 
-- **The cache key.** `surface::LAND_RULES` is 4 (3: steep snow, glaciers, wet bare rock; 4: built-up and moss mixes), `biome::CLIMATE_BIOME_RULES` and
-  `vegetation::VEGETATION_RULES` are 2 (the key ends `#landcover<data>.4 ... #vegetation2 ... #climate<data>.2`), so
+- **The cache key.** `surface::LAND_RULES` is 7 (3: steep snow, glaciers, wet bare rock; 4: moss mix; 7: built-up land is natural land, no built-up kind), `biome::CLIMATE_BIOME_RULES` and
+  `vegetation::VEGETATION_RULES` are 2 (the key ends `#landcover<data>.7 ... #vegetation2 ... #climate<data>.2`), so
   caches made before these rules are rebuilt.
 
 ### Ore richness
@@ -534,7 +544,7 @@ shelf, the shores and lakes at a level of their own still run.
   becomes dry. Steps between two water columns stay (a river stepping down).
 - **Shores.** Dry ground within 3 blocks of sea or lake water, and at most 2 blocks over it, and the ground right
   beside a river channel, is sand, gravel where it is cold (a mean annual temperature under 2 C, or 50 degrees of
-  latitude and more without climate), stone where it is steep. Snow, marsh and built-up ground keep their own top. A
+  latitude and more without climate), stone where it is steep. Snow and marsh keep their own top. A
   cold sea or lake bed is gravel.
 - **Near and far agree.** The rules read a window of 11 samples on every side of what is asked, at the same spacing
   and zoom, and a column's answer depends only on the samples within 11 of it, so cubes, single blocks and far nodes
@@ -561,9 +571,8 @@ waits. Style, shapes and sizes are in the table of `earth/far_trees.rs`.
 
 - **Which tree.** Each Earth biome has one style (oak, birch, spruce, dark oak, jungle, acacia, mangrove; round,
   cone or flat; height, canopy radius, spacing) or none: deserts, badlands, peaks, slopes, oceans, rivers and ice
-  spikes have no trees. Trees stand on grass, moss, built-up grass parcels and marsh tops only, and the land class thins them as
-  near does (tree cover, wetland, mangrove and no data all, shrub a fifth, grass a fiftieth, built-up 30 % of its
-  grass parcels, the rest none).
+  spikes have no trees. Trees stand on grass, moss and marsh tops only, and the land class thins them as
+  near does (tree cover, wetland, mangrove and no data all, shrub a fifth, grass a fiftieth, the rest none).
 - **Level 0 and 1.** Level 0 nodes are exact cubes: trees of a jittered grid (one candidate per cell of the
   style's spacing at a fixed hash of the cell, no world seed) are drawn as real logs and leaves, only into air, and
   a tree in a neighbouring cube still draws its canopy here (the columns are read 3 blocks beyond the cube). Level 1
@@ -639,7 +648,7 @@ header and index once; each 1-degree cell is inflated and decoded the first time
 
 ### Still missing
 
-- Buildings, roads, farmland. Far trees are simple stand-ins (no mangrove roots, no vines, no thick trunks).
+- Farmland as farmland (cropland is grass ground). Far trees are simple stand-ins (no mangrove roots, no vines, no thick trunks).
 - Climate is the yearly mean only: no seasons, no snow that comes and goes.
 - Not checked against a real file by the tests (they use synthetic data only): the half-pixel convention (the reader
   treats a pixel as the area it covers), and whether overview levels keep class boundaries well (they are taken as
@@ -647,8 +656,11 @@ header and index once; each 1-degree cell is inflated and decoded the first time
 
 ## Known limits
 
-- **Elevation only, one biome (land cover off).** Without land cover there are no rivers or roads, no buildings. The surface is grass, bare stone or snow by height and
+- **Elevation only, one biome (land cover off).** Without land cover there are no rivers. The surface is grass, bare stone or snow by height and
   latitude; every column has the same biome, and vanilla structures are off (`structures` stays false).
+- **No towns.** Earth has no buildings, roads or towns, with or without land cover: where the map says built-up the
+  world is the natural land around it (see "Built-up land" under Land cover), so cities look like the
+  countryside around them. Vanilla structures are separate from this.
 - **Land below sea level floods** unless land cover says otherwise. The sea is at `seaLevelY`: with elevation
   alone any ground lower than 0 m has water over it, so a dry depression such as the Dead Sea shore, or the
   Netherlands, is under water. With land cover on, ground whose class is known and not water stays dry.

@@ -14,7 +14,7 @@
 //! | tree | `jungle` under 12 degrees, `forest` under 55, `taiga` under 66, else `snowy_taiga` |
 //! | shrub | `snowy_plains` from 66 degrees, `savanna` under 35, else `plains` |
 //! | grass | `snowy_plains` from 66 degrees, `meadow` from 1,500 m, `savanna` under 20, else `plains` |
-//! | crop, built-up | `plains` |
+//! | crop | `plains` |
 //! | bare | `stony_peaks` from 2,000 m, `desert` under 40 degrees, else `windswept_gravelly_hills` |
 //! | wetland, mangrove | `swamp`, `mangrove_swamp` |
 //! | moss and lichen | `snowy_plains` (tundra) |
@@ -324,7 +324,8 @@ impl Biome {
                     Self::Plains
                 }
             }
-            LandClass::Grass => {
+            // Decoded land cover never holds built-up land; named here it is plain grass.
+            LandClass::Grass | LandClass::BuiltUp => {
                 if lat >= 66.0 {
                     Self::SnowyPlains
                 } else if elevation_m >= 1500.0 {
@@ -335,7 +336,7 @@ impl Biome {
                     Self::Plains
                 }
             }
-            LandClass::Crop | LandClass::BuiltUp | LandClass::SnowIce => Self::Plains,
+            LandClass::Crop | LandClass::SnowIce => Self::Plains,
             LandClass::Bare => {
                 if elevation_m >= 2000.0 {
                     Self::StonyPeaks
@@ -473,7 +474,8 @@ impl Biome {
                     }
                 }
             }
-            LandClass::Grass | LandClass::NoData | LandClass::Shrub => {
+            // Decoded land cover never holds built-up land; named here it is plain grass.
+            LandClass::Grass | LandClass::NoData | LandClass::Shrub | LandClass::BuiltUp => {
                 let open = matches!(
                     pick,
                     Plains | SunflowerPlains | SnowyPlains | Savanna | SavannaPlateau | Meadow
@@ -495,10 +497,6 @@ impl Biome {
                 Row::Frozen => SnowyPlains,
                 Row::Warm | Row::Hot => Savanna,
                 _ if pick == SunflowerPlains => SunflowerPlains,
-                _ => Plains,
-            },
-            LandClass::BuiltUp => match row {
-                Row::Frozen => SnowyPlains,
                 _ => Plains,
             },
             LandClass::Bare => {

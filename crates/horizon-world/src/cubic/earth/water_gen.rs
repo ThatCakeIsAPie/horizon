@@ -29,7 +29,7 @@
 //! * A water column is [`SurfaceKind::Water`] with the depth the rules give; a sand bed turns to gravel where
 //!   the shore is cold ([`shore_is_cold`]).
 //! * A shore column is sand ([`SurfaceKind::Dune`]), gravel where cold, stone ([`SurfaceKind::Alpine`]) where
-//!   steep; snow, marsh and built-up ground keep their own top.
+//!   steep; snow and marsh keep their own top.
 //! * Any other dry column takes its land kind on its final height. A water class column the rules left dry is
 //!   shore.
 

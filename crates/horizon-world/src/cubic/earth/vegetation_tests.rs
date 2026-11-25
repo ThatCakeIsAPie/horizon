@@ -99,7 +99,6 @@ fn each_class_allows_what_the_table_says() {
     allows(LandClass::Crop, &[Plant]);
     allows(LandClass::MossLichen, &[Plant]);
     allows(LandClass::Bare, &[Dry]);
-    // Built-up ground allows street trees on grass parcels only (`rules_tests`).
     allows(LandClass::SnowIce, &[]);
     allows(LandClass::Water, &[Water]);
     allows(LandClass::Wetland, &all);
@@ -147,15 +146,20 @@ fn the_mask_reads_the_class_of_the_exact_column() {
     let (trees, _store, _land) = mask(10);
     assert!(trees.allows(3, 4, "trees_plains"));
     assert!(trees.allows(3, 4, "patch_grass_plain"));
-    let (city, _store, _land) = mask(50);
-    for feature in [
-        "trees_plains",
-        "patch_grass_plain",
-        "seagrass_normal",
-        "patch_cactus_desert",
-    ] {
-        assert!(!city.allows(3, 4, feature), "{feature}");
+    // Built-up land (code 50) is read as the grassland of a tile with nothing else natural.
+    let (town, _store, _land) = mask(50);
+    let (grass, _store, _land) = mask(30);
+    for feature in ["trees_plains", "patch_grass_plain", "seagrass_normal"] {
+        for (x, z) in [(3, 4), (40, -9), (-17, 250), (600, 601)] {
+            assert_eq!(
+                town.allows(x, z, feature),
+                grass.allows(x, z, feature),
+                "{feature} at {x},{z}"
+            );
+        }
     }
+    assert!(town.allows(3, 4, "patch_grass_plain"));
+    assert!(!town.allows(3, 4, "seagrass_normal"));
     let (lake, _store, _land) = mask(80);
     assert!(lake.allows(3, 4, "seagrass_normal"));
     assert!(!lake.allows(3, 4, "trees_water"));
@@ -355,7 +359,7 @@ fn grow(
 }
 
 #[test]
-fn real_trees_grow_on_tree_cover_and_a_city_grows_nothing() {
+fn real_trees_grow_on_tree_cover_and_a_town_is_as_sparse_as_grassland() {
     let Some(root) = resources() else { return };
     let registry: &'static BlockRegistry = Box::leak(Box::new(
         crate::level::data::load_registry(&root).expect("registry"),
@@ -367,10 +371,10 @@ fn real_trees_grow_on_tree_cover_and_a_city_grows_nothing() {
         logs > 20 && leaves > 100,
         "forest: {logs} logs, {leaves} leaves"
     );
-    let built_up = grow(&data, registry, 50, 42);
-    assert_eq!(built_up, (0, 0, 0), "built-up ground");
-    // Grassland keeps about 2 % of the trees.
+    // Grassland keeps about 2 % of the trees, and built-up land (read as grassland) the same.
     let (grass_logs, ..) = grow(&data, registry, 30, 42);
+    let built_up = grow(&data, registry, 50, 42);
+    assert_eq!(built_up.0, grass_logs, "built-up ground");
     assert!(
         grass_logs * 5 < logs,
         "grassland: {grass_logs} logs, forest {logs}"

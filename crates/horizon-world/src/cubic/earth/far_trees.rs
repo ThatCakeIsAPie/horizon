@@ -28,9 +28,9 @@
 //! | windswept gravelly hills | spruce | cone | 7-10 | 2 | 16 |
 //! | wooded badlands | oak | round | 4-6 | 2 | 10 |
 //!
-//! Trees stand on dry ground only (grass, moss, built-up grass parcels and marsh tops). The land class thins them
+//! Trees stand on dry ground only (grass, moss and marsh tops). The land class thins them
 //! as it does near ([`super::vegetation::tree_share`]): tree cover, wetland, mangrove and no data all, shrub a
-//! fifth, grass a fiftieth, built-up three tenths of its grass parcels, the rest none.
+//! fifth, grass a fiftieth, the rest none.
 //!
 //! # Where they are drawn
 //!
@@ -61,7 +61,6 @@
 use std::collections::HashMap;
 
 use super::biome::{BIOME_SAMPLE_M, Biome};
-use super::cover::CityTop;
 use super::far::NodeColumns;
 use super::generator::{Access, EarthGenerator, Fill, NotReady, Rect};
 use super::surface::SurfaceKind;
@@ -430,7 +429,6 @@ impl EarthGenerator {
                         SurfaceKind::Grass
                             | SurfaceKind::Scrub(_)
                             | SurfaceKind::Moss(_)
-                            | SurfaceKind::BuiltUp(CityTop::Grass)
                             | SurfaceKind::Marsh
                     ) || !allowed(classes[i], FeatureKind::Tree, x, z)
                     {
@@ -591,7 +589,6 @@ impl EarthGenerator {
                         SurfaceKind::Grass
                             | SurfaceKind::Scrub(_)
                             | SurfaceKind::Moss(_)
-                            | SurfaceKind::BuiltUp(CityTop::Grass)
                             | SurfaceKind::Marsh
                     )
             });

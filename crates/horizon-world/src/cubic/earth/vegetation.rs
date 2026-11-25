@@ -1,8 +1,8 @@
 //! Which of 26.3's vegetation grows where on Earth: the density of the world's plants follows ESA land cover.
 //!
 //! Earth runs the same vanilla vegetal-step biome features as Cubic ([`crate::cubic::custom::vegetation`]).
-//! The biome table ([`super::biome`]) is coarse (about 500 m), so on its own it would put a forest on a city
-//! block or a field. [`EarthVegetationMask`] is a [`VegetationMask`]: it reads the land class of the exact
+//! The biome table ([`super::biome`]) is coarse (about 500 m), so on its own it would put a forest on a field
+//! or a meadow. [`EarthVegetationMask`] is a [`VegetationMask`]: it reads the land class of the exact
 //! block column a feature is placed at and lets a feature grow there only if the class allows its kind.
 //!
 //! # Kinds of feature
@@ -33,7 +33,6 @@
 //! | Crop | no | no | no | yes |
 //! | Moss and lichen | no | no | no | yes |
 //! | Bare | no | no | yes | no |
-//! | Built-up | on about 30 % of the grass parcels' columns ([`STREET_TREES`](super::cover::STREET_TREES)) | no | no | no |
 //! | Snow and ice | no | no | no | no |
 //! | Water | no | yes | no | no |
 //! | Wetland, mangrove | yes | yes | yes | yes |
@@ -57,7 +56,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use horizon_earth::{LandClass, LoadError};
 
 use super::biome::Biome;
-use super::cover::{CityTop, STREET_TREES, city_top};
 use super::dry::few_plants_allow;
 use super::generator::{EarthGenerator, Gap, Rect};
 use crate::cubic::custom::vegetation::VegetationMask;
@@ -127,8 +125,8 @@ pub fn tree_share(class: LandClass) -> f64 {
     match class {
         LandClass::Tree | LandClass::Wetland | LandClass::Mangrove | LandClass::NoData => 1.0,
         LandClass::Shrub => SHRUB_TREES as f64 / 1000.0,
-        LandClass::Grass => GRASS_TREES as f64 / 1000.0,
-        LandClass::BuiltUp => STREET_TREES as f64 / 1000.0,
+        // Decoded land cover never holds built-up land (the land around it takes its place); named, it is grass.
+        LandClass::Grass | LandClass::BuiltUp => GRASS_TREES as f64 / 1000.0,
         _ => 0.0,
     }
 }
@@ -163,20 +161,13 @@ pub fn allowed_in(
             Plant | Dry => true,
             Water => false,
         },
-        LandClass::Grass => match kind {
+        LandClass::Grass | LandClass::BuiltUp => match kind {
             Tree => column_bucket(x, z) < GRASS_TREES,
             Plant | Dry => true,
             Water => false,
         },
         LandClass::Crop | LandClass::MossLichen => kind == Plant,
         LandClass::Bare => kind == Dry,
-        // Street and garden trees on grass parcels only (a dry climate's sand yards have none: the far view
-        // reads its kind, near trees do not grow on sand).
-        LandClass::BuiltUp => {
-            kind == Tree
-                && column_bucket(x, z) < STREET_TREES
-                && city_top(x, z, false) == CityTop::Grass
-        }
         LandClass::SnowIce => false,
         LandClass::Water => kind == Water,
         LandClass::Wetland | LandClass::Mangrove | LandClass::NoData => true,

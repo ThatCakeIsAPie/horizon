@@ -69,7 +69,7 @@ fn the_cache_keys_know_the_dry_rules() {
     settings.climate = true;
     let key = settings.terrain_key();
     assert!(key.contains("#landcover"), "{key}");
-    assert_eq!(surface::LAND_RULES, 6);
+    assert_eq!(surface::LAND_RULES, 7);
     assert_eq!(biome::CLIMATE_BIOME_RULES, 4);
     assert_eq!(vegetation::VEGETATION_RULES, 2);
     assert!(key.contains(&format!(".{}", surface::LAND_RULES)), "{key}");
@@ -215,7 +215,7 @@ fn trees_and_the_rest_keep_their_tops_in_a_dry_climate() {
     );
     assert_eq!(
         kind(LandClass::BuiltUp, 36.0, dry, NO_SLOPE),
-        SurfaceKind::BuiltUp(super::cover::city_top(0, 0, true))
+        kind(LandClass::Grass, 36.0, dry, NO_SLOPE)
     );
     assert_eq!(
         kind(LandClass::Water, 36.0, dry, NO_SLOPE),
