@@ -117,6 +117,33 @@ fn main() -> Result<(), Error> {
     };
     let band: i32 = args.get("--band", Some(if earth { 16 } else { 32 }))?;
 
+    // `--find-meteors R`: list the default meteors within R blocks of the column instead of counting.
+    let find: i32 = args.get("--find-meteors", Some(0))?;
+    if find > 0 {
+        let ores = if earth {
+            OreGenSettings::earth_defaults()
+        } else {
+            OreGenSettings::custom_defaults()
+        };
+        let meteors =
+            horizon_world::cubic::ores::meteors::Meteors::new(seed, &ores.meteors, registry)?;
+        let (cx, cz) = (x0 * 16, z0 * 16);
+        let ground = |x: i32, z: i32| generator.surface_y(x, z, 512).unwrap_or(64);
+        let mut spots = meteors.find(cx - find, cz - find, cx + find, cz + find, &ground);
+        spots.sort_by_key(|s| (s.x - cx).pow(2) + (s.z - cz).pow(2));
+        println!(
+            "meteors within {find} of {cx} {cz} (seed {seed}): {}",
+            spots.len()
+        );
+        for s in spots {
+            println!(
+                "{:>7} {:>6} {:>7}  d {:>2}  {:<8} {}",
+                s.x, s.y, s.z, s.diameter, ores.meteors.kinds[s.kind].ore, s.placement
+            );
+        }
+        return Ok(());
+    }
+
     // The counted columns and their ground (Earth: the real surface, the reference of the depths).
     let mut ground = BTreeMap::new();
     for cx in x0 + 1..x0 + size {

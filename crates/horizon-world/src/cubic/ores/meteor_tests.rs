@@ -30,7 +30,12 @@ const EXTRA: &[&str] = &[
 thread_local! {
     static REG: &'static BlockRegistry = {
         let mut names = default_block_names();
-        names.extend(EXTRA.iter().map(|n| format!("minecraft:{n}")));
+        for n in EXTRA {
+            let n = format!("minecraft:{n}");
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
         registry_of(&names)
     };
 }
@@ -599,15 +604,14 @@ fn validate_settings() {
         // `new` refuses them too (when enabled).
         assert!(Meteors::new(1, &s, reg()).is_err(), "case {i}");
     }
-    // A registry without the raw blocks: the error names the block.
-    let err = Meteors::new(
-        1,
-        &MeteorSettings::default(),
-        registry_of(&default_block_names()),
-    )
-    .err()
-    .expect("missing blocks");
-    assert!(err.contains("raw_iron_block"), "{err}");
+    // A registry without the meteor blocks: those kinds are skipped, the
+    // world still generates (with no meteors here).
+    let bare: Vec<String> = default_block_names()
+        .into_iter()
+        .filter(|n| !n.ends_with("_block"))
+        .collect();
+    let m = Meteors::new(1, &MeteorSettings::default(), registry_of(&bare)).expect("meteors");
+    assert!(!m.is_active());
 }
 
 /// A surface meteor of the given diameter in region (0, 0), placed on the

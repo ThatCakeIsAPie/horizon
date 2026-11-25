@@ -179,6 +179,18 @@ struct Kind {
     core: u32,
 }
 
+/// A meteor [`Meteors::find`] found: its centre, diameter, kind (index into
+/// the settings' kinds) and placement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeteorSpot {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub diameter: i32,
+    pub kind: usize,
+    pub placement: &'static str,
+}
+
 /// The compiled meteors of one world.
 pub struct Meteors {
     seed: i64,
@@ -456,11 +468,13 @@ impl Meteors {
             return Ok(Self::inactive(world_seed));
         }
         s.validate()?;
-        let kinds = s
+        // A kind whose blocks the registry lacks (a trimmed or modded
+        // registry) is skipped rather than failing the whole world.
+        let kinds: Vec<Kind> = s
             .kinds
             .iter()
-            .map(|k| resolve_kind(reg, k))
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(|k| resolve_kind(reg, k).ok())
+            .collect();
         let kind_total: f64 = kinds.iter().map(|k| k.weight).sum();
         let air = resolve(reg, "minecraft:air")?;
         let deepslate = resolve(reg, "minecraft:deepslate")?;
@@ -606,6 +620,39 @@ impl Meteors {
         plan.y_est = plan.raw_centre_y(g_est);
         plan.owner_cy = ((f64::from(plan.y_est) + 0.5 - 16.0) / 16.0 + 0.5).floor() as i32;
         Some(plan)
+    }
+
+    /// Every meteor whose region overlaps the block box `x0..=x1`, `z0..=z1`
+    /// (for tools that look for one, e.g. to take its picture). `ground` as
+    /// in [`Self::place`]; the Y is the centre from that estimate.
+    pub fn find(
+        &self,
+        x0: i32,
+        z0: i32,
+        x1: i32,
+        z1: i32,
+        ground: &dyn Fn(i32, i32) -> i32,
+    ) -> Vec<MeteorSpot> {
+        let mut out = Vec::new();
+        for rx in x0.div_euclid(REGION)..=x1.div_euclid(REGION) {
+            for rz in z0.div_euclid(REGION)..=z1.div_euclid(REGION) {
+                if let Some(p) = self.plan(rx, rz, ground) {
+                    out.push(MeteorSpot {
+                        x: p.x,
+                        y: p.y_est,
+                        z: p.z,
+                        diameter: p.diameter,
+                        kind: p.kind,
+                        placement: match p.placement {
+                            Placement::Surface => "surface",
+                            Placement::Sunk => "sunk",
+                            Placement::Buried => "buried",
+                        },
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// Places, whole, every meteor `cube` owns. All writes stay inside the
