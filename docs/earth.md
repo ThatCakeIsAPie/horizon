@@ -222,13 +222,13 @@ The biome column below is the one without climate; with `climate` on see [Climat
 
 | Class | Top of the column (over stone) | Biome |
 |---|---|---|
-| snow and ice, or a column at or above the snow line (the latitude line, never below 2,500 m) | two snow blocks | `frozen_peaks` from 3,000 m, `snowy_slopes` from 1,500 m, else `snowy_plains` |
+| snow and ice, or a column at or above the snow line (the latitude line, never below 2,500 m) | on ground 0.84 steep or more (about 40°) bare stone; snow and ice class, gentle (under 0.6): a glacier, one snow block over six packed ice, then stone; snow and ice class, 0.6 to 0.84: an icefall, packed ice over blue ice; other classes above the snow line: two snow blocks | `frozen_peaks` from 3,000 m, `snowy_slopes` from 1,500 m, else `snowy_plains` |
 | tree cover | grass over three dirt | `jungle` under 12° latitude, `forest` under 55°, `taiga` under 66°, else `snowy_taiga` |
 | shrubland | grass over three dirt | `savanna` under 35°, `plains`, `snowy_plains` from 66° |
 | grassland | grass over three dirt | `meadow` from 1,500 m, `savanna` under 20°, `plains`, `snowy_plains` from 66° |
 | cropland | grass over three dirt (farmland dries out without water, and nothing else fits) | `plains` |
 | built-up | one gravel block (buildings come much later) | `plains` |
-| bare | stone inside the 1,500 m alpine band under the snow line; else stone where steep (a neighbour 30 m away differs by 0.6 of the distance or more); else sand, or gravel from 50° latitude | `stony_peaks` from 2,000 m, `desert` under 40°, else `windswept_gravelly_hills` |
+| bare | stone inside the 1,500 m alpine band under the snow line; else stone where steep (a neighbour 30 m away differs by 0.6 of the distance or more); else gravel from 50° latitude; else in a known wet climate basalt rock (70 % basalt, 14 % smooth basalt, 9 % tuff, 7 % blackstone, over stone); else sand | `stony_peaks` from 2,000 m, `desert` under 40°, else `windswept_gravelly_hills` |
 | water | the water rules (see Water): a lake, a river's wide bed, or the sea when at or under the sea level plus 3 m | `river` above sea level, `ocean` at or under it |
 | herbaceous wetland | one block of water at the surface block over mud | `swamp` |
 | mangroves | the same | `mangrove_swamp` |
@@ -379,7 +379,7 @@ game reads it (500 m of ground):
 | Amazon | 26.2 | 2,376 | 3.57 | no |
 | Pacific Northwest, Olympic Peninsula | 9.4 | 2,871 | 8.77 | no |
 
-**Surface** (`SurfaceKind::on_classified`). Snow and the alpine band still win first; tree cover (rim forest),
+**Surface** (`SurfaceKind::on_classified`). Snow and the alpine band still win first (steep snow is rock, snow and ice class is a glacier; see the class table); bare gentle ground in a wet climate is basalt, sand stays for the hot dry places and for ground without climate data; tree cover (rim forest),
 cropland, water, wetland, mangroves, moss and built-up ground are unchanged.
 
 | Class in a dry climate | Steep (`STEEP_GRADIENT`) | Gentle |
@@ -418,9 +418,9 @@ flowers, bushes) on only 30 % of the columns, by a fixed column hash, via the bi
 (`biome_at_quart_blocking`, remembered per 4 by 4 column). It needs a climate source: without one the biomes do not
 say which places are dry.
 
-- **The cache key.** `surface::LAND_RULES`, `biome::CLIMATE_BIOME_RULES` and `vegetation::VEGETATION_RULES` are 2
-  (the key ends `#landcover<data>.2 ... #vegetation2 ... #climate<data>.2`), so caches made before the dry rules are
-  rebuilt.
+- **The cache key.** `surface::LAND_RULES` is 3 (steep snow, glaciers, wet bare rock), `biome::CLIMATE_BIOME_RULES` and
+  `vegetation::VEGETATION_RULES` are 2 (the key ends `#landcover<data>.3 ... #vegetation2 ... #climate<data>.2`), so
+  caches made before these rules are rebuilt.
 
 ### Ore richness
 

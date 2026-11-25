@@ -70,6 +70,46 @@ pub const BARREN_MIX: Mix = Mix {
     coarse_dirt: 450,
 };
 
+/// The shares (out of 1,000) of the tops of wet bare rock ([`BasaltTop`]): basalt, smooth basalt and tuff; the
+/// rest is blackstone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BasaltMix {
+    pub basalt: u16,
+    pub smooth_basalt: u16,
+    pub tuff: u16,
+}
+
+/// Bare gentle ground in a wet climate: 70 % basalt, 14 % smooth basalt, 9 % tuff, 7 % blackstone.
+pub const BASALT_MIX: BasaltMix = BasaltMix {
+    basalt: 700,
+    smooth_basalt: 140,
+    tuff: 90,
+};
+
+/// The block on top of wet bare rock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BasaltTop {
+    Basalt,
+    SmoothBasalt,
+    Tuff,
+    Blackstone,
+}
+
+impl BasaltMix {
+    /// The top a column with `bucket` (0..1000, [`column_bucket`]) takes.
+    pub fn pick(self, bucket: u16) -> BasaltTop {
+        if bucket < self.basalt {
+            BasaltTop::Basalt
+        } else if bucket < self.basalt + self.smooth_basalt {
+            BasaltTop::SmoothBasalt
+        } else if bucket < self.basalt + self.smooth_basalt + self.tuff {
+            BasaltTop::Tuff
+        } else {
+            BasaltTop::Blackstone
+        }
+    }
+}
+
 /// The block on top of a sparse dry column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DryTop {

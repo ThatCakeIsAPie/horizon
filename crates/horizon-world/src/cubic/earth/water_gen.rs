@@ -343,8 +343,10 @@ impl EarthGenerator {
         }
         let (s, kind) = self.land_column(a, [x, z], cw.s, stride, zoom_step, class)?;
         // A column the rules leave dry stays dry whatever its class says (no data under the sea level).
-        let keeps_own_top =
-            matches!(kind, SurfaceKind::Snow | SurfaceKind::Marsh) || class == LandClass::BuiltUp;
+        let keeps_own_top = matches!(
+            kind,
+            SurfaceKind::Snow | SurfaceKind::Glacier | SurfaceKind::Icefall | SurfaceKind::Marsh
+        ) || class == LandClass::BuiltUp;
         let kind = if kind.is_water() || s != cw.s || (cw.shore && !keeps_own_top) {
             shore(self)?
         } else {

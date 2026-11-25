@@ -70,7 +70,17 @@ pub fn default_block_names() -> Vec<String> {
         }
     }
     // Clay, a bed of Earth's water (last, so the ids of the others stay).
-    for n in ["snow", "ice", "clay"] {
+    // Packed and blue ice (glaciers), basalt-family rock (wet bare ground).
+    for n in [
+        "snow",
+        "ice",
+        "clay",
+        "packed_ice",
+        "blue_ice",
+        "basalt",
+        "smooth_basalt",
+        "blackstone",
+    ] {
         let name = format!("minecraft:{n}");
         if !names.contains(&name) {
             names.push(name);

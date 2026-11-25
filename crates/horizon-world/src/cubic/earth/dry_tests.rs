@@ -15,14 +15,14 @@ use super::dry::{
 };
 use super::generator::Access;
 use super::land_tests::LandRig;
-use super::surface::{LAKE_DEPTH, SOIL_DEPTH, SurfaceKind};
+use super::surface::{LAKE_DEPTH, SOIL_DEPTH, Slope, SurfaceKind};
 use super::tests::LON0;
 use super::vegetation::{FeatureKind, allowed, allowed_in};
 use super::water::Bed;
 use super::*;
 
-const NO_SLOPE: fn() -> Result<bool, ()> = || Ok(false);
-const SLOPE: fn() -> Result<bool, ()> = || Ok(true);
+const NO_SLOPE: fn() -> Result<Slope, ()> = || Ok(Slope::Gentle);
+const SLOPE: fn() -> Result<Slope, ()> = || Ok(Slope::Steep);
 
 /// A dry column of temperature `t` and aridity `r` (its hash decides the top, `bucket`).
 fn col(t: f64, r: f64, bucket: u16) -> Option<DryColumn> {
@@ -33,7 +33,7 @@ fn kind(
     class: LandClass,
     lat: f64,
     dry: Option<DryColumn>,
-    steep: fn() -> Result<bool, ()>,
+    steep: fn() -> Result<Slope, ()>,
 ) -> SurfaceKind {
     SurfaceKind::on_classified(class, 1200.0, lat, false, dry, steep).unwrap()
 }
@@ -69,7 +69,7 @@ fn the_cache_keys_know_the_dry_rules() {
     settings.climate = true;
     let key = settings.terrain_key();
     assert!(key.contains("#landcover"), "{key}");
-    assert_eq!(surface::LAND_RULES, 2);
+    assert_eq!(surface::LAND_RULES, 3);
     assert_eq!(biome::CLIMATE_BIOME_RULES, 2);
     assert_eq!(vegetation::VEGETATION_RULES, 2);
     assert!(key.contains(&format!(".{}", surface::LAND_RULES)), "{key}");
@@ -225,7 +225,7 @@ fn trees_and_the_rest_keep_their_tops_in_a_dry_climate() {
     );
     assert_eq!(
         kind(LandClass::SnowIce, 36.0, dry, NO_SLOPE),
-        SurfaceKind::Snow
+        SurfaceKind::Glacier
     );
     // Snow wins over everything.
     assert_eq!(
@@ -235,7 +235,7 @@ fn trees_and_the_rest_keep_their_tops_in_a_dry_climate() {
 }
 
 #[test]
-fn wet_climate_and_no_climate_give_exactly_the_old_kinds() {
+fn wet_climate_and_no_climate_give_the_old_kinds_except_wet_bare_rock() {
     // T 9, P 2,800: r = 8.75, and a frozen-dry mix (T -5, P 50) is not "dry" either.
     let wet = DryColumn::new(climate(9.0, 2800.0).unwrap(), 4, 4);
     assert!(!wet.is_dry());
@@ -265,6 +265,11 @@ fn wet_climate_and_no_climate_give_exactly_the_old_kinds() {
                         steep,
                     )
                     .unwrap();
+                    // Gentle bare ground that was sand is wet bare rock in a known wet (or frozen) climate.
+                    if class == LandClass::Bare && none == SurfaceKind::Dune {
+                        assert!(matches!(got, SurfaceKind::Basalt(_)), "{got:?}");
+                        continue;
+                    }
                     assert_eq!(got, none, "{class:?} at {elevation} m, {lat}");
                 }
                 assert!(!none.is_dry(), "{class:?} {none:?}");
@@ -597,7 +602,7 @@ fn grass_allows_dry_features_and_dry_biomes_thin_the_plants_on_shrub_and_grass()
 
 /// A land-cover rig of one class over `elevation` with a whole-world climate of `t` C and `p` mm, and the
 /// generator reading it.
-fn dry_rig(
+pub(super) fn dry_rig(
     lat: f64,
     elevation: impl Fn(f64, f64) -> f64 + Send + Sync + 'static,
     code: u8,
@@ -626,11 +631,15 @@ fn dry_rig(
 }
 
 /// 1 block of height per block of ground to the north (steep), around `base` metres.
-fn slope(lat0: f64, base: f64, gradient: f64) -> impl Fn(f64, f64) -> f64 + Send + Sync + 'static {
+pub(super) fn slope(
+    lat0: f64,
+    base: f64,
+    gradient: f64,
+) -> impl Fn(f64, f64) -> f64 + Send + Sync + 'static {
     move |lat, _| base + (lat - lat0) * 111_194.9 * gradient
 }
 
-fn kind_at(g: &EarthGenerator, x: i32, z: i32) -> (i32, SurfaceKind) {
+pub(super) fn kind_at(g: &EarthGenerator, x: i32, z: i32) -> (i32, SurfaceKind) {
     let s = g.surface_y_blocking(x, z).unwrap();
     g.kind_core(Access::Fetch, x, z, s, 1).ok().unwrap()
 }

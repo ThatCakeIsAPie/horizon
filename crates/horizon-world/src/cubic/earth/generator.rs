@@ -50,10 +50,14 @@ use horizon_earth::{
 };
 
 use super::biome::BIOME_SAMPLE_M;
-use super::dry::{BAND_COUNT, DRY_ROCK_DEPTH, DryColumn, DryTop, band_index, band_table};
+use super::dry::{
+    BAND_COUNT, BasaltTop, DRY_ROCK_DEPTH, DryColumn, DryTop, band_index, band_table,
+};
 use super::far_trees::MAX_TREE_UP;
 use super::settings::EarthSettings;
-use super::surface::{SLOPE_BASE_M, SNOW_DEPTH, SOIL_DEPTH, STEEP_GRADIENT, SurfaceKind};
+use super::surface::{
+    GLACIER_ICE_DEPTH, GLACIER_SNOW_DEPTH, SLOPE_BASE_M, SNOW_DEPTH, SOIL_DEPTH, Slope, SurfaceKind,
+};
 use super::water::{Bed, MAX_CARVE, MAX_RAISE, WINDOW_PAD};
 use crate::cubic::custom::replacers::resolve_block;
 use crate::cubic::custom::settings::BlockStateDesc;
@@ -86,6 +90,13 @@ pub struct EarthBlocks {
     pub red_terracotta: u32,
     pub white_terracotta: u32,
     pub light_gray_terracotta: u32,
+    /// The glacier ice and the wet bare rock tops ([`SurfaceKind::Glacier`], [`SurfaceKind::Basalt`]).
+    pub packed_ice: u32,
+    pub blue_ice: u32,
+    pub basalt: u32,
+    pub smooth_basalt: u32,
+    pub tuff: u32,
+    pub blackstone: u32,
     /// What the far view's trees and snow are made of.
     pub far: super::far_trees::FarBlocks,
 }
@@ -115,6 +126,12 @@ impl EarthBlocks {
             red_terracotta: get("red_terracotta")?,
             white_terracotta: get("white_terracotta")?,
             light_gray_terracotta: get("light_gray_terracotta")?,
+            packed_ice: get("packed_ice")?,
+            blue_ice: get("blue_ice")?,
+            basalt: get("basalt")?,
+            smooth_basalt: get("smooth_basalt")?,
+            tuff: get("tuff")?,
+            blackstone: get("blackstone")?,
             far: super::far_trees::FarBlocks::from_registry(registry)?,
         })
     }
@@ -376,6 +393,7 @@ impl EarthGenerator {
                 bed: Bed::Stone, ..
             } => 0,
             _ if kind.is_dry() => DRY_ROCK_DEPTH,
+            SurfaceKind::Glacier | SurfaceKind::Icefall => GLACIER_ICE_DEPTH,
             _ => SOIL_DEPTH,
         };
         if y < ground - depth {
@@ -400,6 +418,17 @@ impl EarthGenerator {
             SurfaceKind::Snow => b.stone,
             SurfaceKind::Gravel if y == ground => b.gravel,
             SurfaceKind::Gravel => b.stone,
+            SurfaceKind::Glacier if y > ground - GLACIER_SNOW_DEPTH => b.snow_block,
+            SurfaceKind::Glacier => b.packed_ice,
+            SurfaceKind::Icefall if y == ground => b.packed_ice,
+            SurfaceKind::Icefall => b.blue_ice,
+            SurfaceKind::Basalt(top) if y == ground => match top {
+                BasaltTop::Basalt => b.basalt,
+                BasaltTop::SmoothBasalt => b.smooth_basalt,
+                BasaltTop::Tuff => b.tuff,
+                BasaltTop::Blackstone => b.blackstone,
+            },
+            SurfaceKind::Basalt(_) => b.stone,
             SurfaceKind::Moss if y == ground => b.moss_block,
             SurfaceKind::Moss => b.dirt,
             SurfaceKind::Marsh => b.mud,
@@ -479,9 +508,29 @@ impl EarthGenerator {
         blocks.max(stride.max(1))
     }
 
-    /// Whether the ground at block `(x, z)` (surface `s`) is steep: a neighbour one [`EarthGenerator::slope_base`]
-    /// away north, south, east or west differs in height by [`STEEP_GRADIENT`] of that distance or more, the
-    /// heights read at the zoom of `zoom_step`. A neighbour whose tile is missing is a gap, never a guess.
+    /// How steep the ground at block `(x, z)` (surface `s`) is: the largest height difference to a neighbour one
+    /// [`EarthGenerator::slope_base`] away north, south, east or west, as a share of that distance
+    /// ([`Slope::of_gradient`]), the heights read at the zoom of `zoom_step`. A neighbour whose tile is missing
+    /// is a gap, never a guess.
+    pub(super) fn slope_at(
+        &self,
+        a: Access,
+        x: i32,
+        z: i32,
+        s: i32,
+        stride: i32,
+        zoom_step: i32,
+    ) -> Result<Slope, Gap> {
+        let d = self.slope_base(stride);
+        let mut most = 0_i64;
+        for (dx, dz) in [(d, 0), (-d, 0), (0, d), (0, -d)] {
+            let n = self.surface_core(a, x.saturating_add(dx), z.saturating_add(dz), zoom_step)?;
+            most = most.max((i64::from(n) - i64::from(s)).abs());
+        }
+        Ok(Slope::of_gradient(most as f64 / f64::from(d)))
+    }
+
+    /// Whether the ground at block `(x, z)` is steep for bare ground ([`Slope::is_steep`]).
     pub(super) fn is_steep(
         &self,
         a: Access,
@@ -491,13 +540,7 @@ impl EarthGenerator {
         stride: i32,
         zoom_step: i32,
     ) -> Result<bool, Gap> {
-        let d = self.slope_base(stride);
-        let mut most = 0_i64;
-        for (dx, dz) in [(d, 0), (-d, 0), (0, d), (0, -d)] {
-            let n = self.surface_core(a, x.saturating_add(dx), z.saturating_add(dz), zoom_step)?;
-            most = most.max((i64::from(n) - i64::from(s)).abs());
-        }
-        Ok(most as f64 >= STEEP_GRADIENT * f64::from(d))
+        Ok(self.slope_at(a, x, z, s, stride, zoom_step)?.is_steep())
     }
 
     /// The class of the column `(i, j)` of each of `width` by `depth` columns `stride` blocks apart from
@@ -651,7 +694,7 @@ impl EarthGenerator {
             self.latitude_at(x, z),
             s0 < self.sea_level,
             dry,
-            || self.is_steep(a, x, z, s0, stride, zoom_step),
+            || self.slope_at(a, x, z, s0, stride, zoom_step),
         )?;
         Ok(if kind.is_water() && s0 < self.sea_level {
             SurfaceKind::sea_column(s0, self.sea_level)
@@ -757,7 +800,9 @@ impl EarthGenerator {
             (SEA_BED_SLACK, 0)
         };
         let rock = if land && self.climate.is_some() {
-            SOIL_DEPTH.max(DRY_ROCK_DEPTH)
+            SOIL_DEPTH.max(DRY_ROCK_DEPTH).max(GLACIER_ICE_DEPTH)
+        } else if land {
+            SOIL_DEPTH.max(GLACIER_ICE_DEPTH)
         } else {
             SOIL_DEPTH
         };

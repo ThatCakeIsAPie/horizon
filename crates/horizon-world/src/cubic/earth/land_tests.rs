@@ -10,7 +10,7 @@ use horizon_earth::{
     LandClass, LandCoverFetcher, LandCoverSource, LandCoverStore, Lookup, TileStore, WorldCoverFile,
 };
 
-use super::surface::{LAKE_DEPTH, LAND_SNOW_FLOOR_M, MARSH_DEPTH, SOIL_DEPTH, SurfaceKind};
+use super::surface::{LAKE_DEPTH, LAND_SNOW_FLOOR_M, MARSH_DEPTH, SOIL_DEPTH, Slope, SurfaceKind};
 use super::tests::{LAT0, LON0, terrain};
 use super::water::Bed;
 use super::*;
@@ -122,7 +122,7 @@ impl LandRig {
     }
 
     /// Checks the column at `(x, z)` against `want(y, s)`; its surface.
-    fn check(&self, x: i32, z: i32, want: impl Fn(i32, i32) -> u32) -> i32 {
+    pub(super) fn check(&self, x: i32, z: i32, want: impl Fn(i32, i32) -> u32) -> i32 {
         let (s, got) = self.column(x, z);
         for (i, &block) in got.iter().enumerate() {
             let y = s - 8 + i as i32;
@@ -343,14 +343,17 @@ fn bare_steep_ground_and_bare_ground_in_the_alpine_band_is_stone() {
 }
 
 #[test]
-fn snow_and_ice_is_snow_whatever_the_latitude_and_height() {
+fn snow_and_ice_is_a_glacier_whatever_the_latitude_and_height() {
     for (lat, metres) in [(45.0, 120.0), (5.0, 400.0), (60.0, 50.0)] {
         let rig = LandRig::level(lat, metres, 70);
         let b = rig.blocks;
+        // Level ground: snow over six packed ice over stone.
         rig.check(0, 0, |y, s| {
-            if y < s - 1 {
+            if y < s - 6 {
                 b.stone
-            } else if y <= s {
+            } else if y < s {
+                b.packed_ice
+            } else if y == s {
                 b.snow_block
             } else {
                 b.air
@@ -376,7 +379,7 @@ fn the_snow_line_still_whitens_peaks_the_map_calls_something_else() {
         });
     }
     // The rule itself, on the places that matter.
-    let steep = || Ok::<_, ()>(false);
+    let steep = || Ok::<_, ()>(Slope::Gentle);
     let on = |class, metres, lat| {
         SurfaceKind::on_classified(class, metres, lat, false, None, steep).unwrap()
     };
@@ -385,7 +388,13 @@ fn the_snow_line_still_whitens_peaks_the_map_calls_something_else() {
             continue;
         }
         // Everest: white whatever the map calls the summit.
-        assert_eq!(on(class, 8849.0, 27.99), SurfaceKind::Snow, "{class:?}");
+        // Snow and ice class on level ground is a glacier, any other class is plain snow.
+        let want = if class == LandClass::SnowIce {
+            SurfaceKind::Glacier
+        } else {
+            SurfaceKind::Snow
+        };
+        assert_eq!(on(class, 8849.0, 27.99), want, "{class:?}");
     }
     // Svalbard: 600 m at 78 degrees is above the latitude snow line (220 m) but below the floor, so the map
     // decides; without a map the old rule does.

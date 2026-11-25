@@ -33,6 +33,8 @@ mod land_tests;
 pub mod ores;
 #[cfg(test)]
 mod ores_tests;
+#[cfg(test)]
+mod rules_tests;
 pub mod settings;
 pub mod surface;
 #[cfg(test)]

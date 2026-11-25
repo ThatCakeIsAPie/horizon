@@ -22,6 +22,14 @@
 //! | bare | [`SurfaceKind::Banded`] (terracotta bands) | hot (from 18 C): sand dunes; else [`SurfaceKind::Barren`] (red sand, coarse dirt) |
 //! | shrub, grass | [`SurfaceKind::Banded`] | [`SurfaceKind::Scrub`] (grass block, coarse dirt, red sand mixed) |
 //!
+//! **Steep snow is rock, snow/ice is a glacier, wet bare ground is basalt.** Ground that would be snow (land cover
+//! snow/ice, or at or above the snow line) whose slope is [`SNOW_STEEP_GRADIENT`] or more is bare stone
+//! ([`SurfaceKind::Alpine`]). Snow/ice class ground under that is a [`SurfaceKind::Glacier`] (snow over packed
+//! ice) when gentle (under [`STEEP_GRADIENT`]) and an [`SurfaceKind::Icefall`] (packed ice over blue ice) when
+//! steeper. Snow above the snow line on other classes stays snow over stone. Gentle bare ground below
+//! [`GRAVEL_FROM_LATITUDE`] in a known wet climate is [`SurfaceKind::Basalt`] (young volcanic rock: basalt,
+//! smooth basalt, tuff, blackstone), not sand; sand stays for hot dry ground and for ground without climate.
+//!
 //! Snow and the alpine band still win first; tree cover, crops, water, wetland, moss and built-up ground are
 //! unchanged. Under the top of a dry kind the ground is terracotta bands by absolute height down to
 //! [`DRY_ROCK_DEPTH`](super::dry::DRY_ROCK_DEPTH) blocks, then stone.
@@ -41,7 +49,7 @@
 
 use horizon_earth::{LandClass, VerticalMap};
 
-use super::dry::{BARREN_MIX, DESERT_MIX, DryColumn, DryTop, SCRUB_MIX};
+use super::dry::{BARREN_MIX, BASALT_MIX, BasaltTop, DESERT_MIX, DryColumn, DryTop, SCRUB_MIX};
 use super::water::Bed;
 
 /// The snow line up to [`SNOW_LINE_FLAT_TO_DEG`] of latitude, in metres.
@@ -59,7 +67,7 @@ pub const SNOW_DEPTH: i64 = 2;
 pub const RULES: u32 = 2;
 /// The version of the land-cover surface rule and of the biome table ([`super::biome`]): it goes up when what a
 /// column with a known class is made of changes. It is in the terrain key only while land cover is on.
-pub const LAND_RULES: u32 = 2;
+pub const LAND_RULES: u32 = 3;
 /// With land cover, the lowest elevation (m) where the latitude snow line still turns a column that is not
 /// snow or ice on the map white. A map made from one summer's imagery misses seasonal snow on high peaks (Everest
 /// stays white), but the line falls to sea level at the poles, where lowland the map calls bare or moss is not
@@ -75,6 +83,13 @@ pub const MARSH_DEPTH: i64 = 1;
 /// A bare column is flat enough for sand when no neighbour a [`SLOPE_BASE_M`] away is higher or lower than this
 /// share of that distance (0.6 is about 31 degrees).
 pub const STEEP_GRADIENT: f64 = 0.6;
+/// Snow does not hold on ground this steep (0.84 is about 40 degrees): a column that would be snow shows bare
+/// stone there. Between [`STEEP_GRADIENT`] and this, snow stays (and snow/ice class ground shows ice).
+pub const SNOW_STEEP_GRADIENT: f64 = 0.84;
+/// Blocks of snow on top of a glacier.
+pub const GLACIER_SNOW_DEPTH: i64 = 1;
+/// How many blocks under the surface block the ice of a glacier or icefall reaches (stone below that).
+pub const GLACIER_ICE_DEPTH: i64 = 6;
 /// The ground distance, in metres, over which the slope of a bare column is measured: about one elevation pixel.
 /// At a coarse step the distance is the step, so near and far agree where they can.
 pub const SLOPE_BASE_M: f64 = 30.0;
@@ -94,6 +109,36 @@ pub fn snow_line_m(latitude: f64) -> f64 {
     } else {
         SNOW_LINE_LOW_LATITUDE_M * (SNOW_LINE_ZERO_AT_DEG - lat)
             / (SNOW_LINE_ZERO_AT_DEG - SNOW_LINE_FLAT_TO_DEG)
+    }
+}
+
+/// How steep the ground around a column is, by the largest height difference to a neighbour one slope base away
+/// ([`STEEP_GRADIENT`], [`SNOW_STEEP_GRADIENT`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Slope {
+    /// Under [`STEEP_GRADIENT`].
+    Gentle,
+    /// From [`STEEP_GRADIENT`], under [`SNOW_STEEP_GRADIENT`]: too steep for sand, snow still holds.
+    Steep,
+    /// From [`SNOW_STEEP_GRADIENT`]: bare rock, snow does not hold.
+    Rock,
+}
+
+impl Slope {
+    /// The slope of a gradient (rise over run).
+    pub fn of_gradient(gradient: f64) -> Self {
+        if gradient >= SNOW_STEEP_GRADIENT {
+            Self::Rock
+        } else if gradient >= STEEP_GRADIENT {
+            Self::Steep
+        } else {
+            Self::Gentle
+        }
+    }
+
+    /// Whether bare ground here is too steep for sand ([`STEEP_GRADIENT`] or more).
+    pub fn is_steep(self) -> bool {
+        self >= Self::Steep
     }
 }
 
@@ -125,6 +170,15 @@ pub enum SurfaceKind {
     Scrub(DryTop),
     /// Bare flat ground of a dry climate that is not hot: red sand or coarse dirt over terracotta bands.
     Barren(DryTop),
+    /// A glacier: snow land cover on gentle ground, [`GLACIER_SNOW_DEPTH`] block of snow over packed ice
+    /// ([`GLACIER_ICE_DEPTH`] blocks), stone below.
+    Glacier,
+    /// An icefall: snow land cover on steeper ground shows ice at the top: packed ice over blue ice
+    /// ([`GLACIER_ICE_DEPTH`] blocks), stone below.
+    Icefall,
+    /// Young bare rock: bare gentle ground in a wet climate. The top is a basalt-family block (a fixed hash
+    /// of the column picks it), stone below.
+    Basalt(BasaltTop),
 }
 
 impl SurfaceKind {
@@ -169,25 +223,28 @@ impl SurfaceKind {
     }
 
     /// The kind of a column whose class is `class`, from the map: `elevation_m` is its real elevation and
-    /// `below_sea` whether its surface is under the sea level. `steep` says whether the ground around it is steep;
-    /// it is asked only for bare ground that nothing else decides, and its error is passed on. A class of
+    /// `below_sea` whether its surface is under the sea level. `slope` says how steep the ground around it is
+    /// ([`Slope`]); it is asked only for columns that nothing else decides, and its error is passed on. A class of
     /// [`LandClass::NoData`] gets the rule without land cover ([`SurfaceKind::of_column`]).
     ///
-    /// * snow and ice: snow, and so is any column at or above the latitude snow line or
-    ///   [`LAND_SNOW_FLOOR_M`], whichever is higher (a lake that high is frozen);
+    /// * snow and ice, and any column at or above the latitude snow line or [`LAND_SNOW_FLOOR_M`], whichever is
+    ///   higher (a lake that high is frozen): on [`Slope::Rock`] ground bare stone; else snow, except that the
+    ///   snow/ice class is a [`SurfaceKind::Glacier`] on gentle ground and an [`SurfaceKind::Icefall`] on
+    ///   steep ground;
     /// * tree and crop: grass over dirt (no block fits crops better: farmland dries out without water);
     /// * shrub and grass: grass over dirt, but in a dry climate ([`DryColumn::is_dry`]): steep ground is
     ///   [`SurfaceKind::Banded`], gentle ground [`SurfaceKind::Scrub`];
     /// * bare: stone within the alpine band under the snow line, else (steep) stone, or in a dry climate
     ///   [`SurfaceKind::Banded`], else sand, or gravel from [`GRAVEL_FROM_LATITUDE`]; gentle dry bare ground
-    ///   is sand (dunes) when hot ([`HOT_C`](super::dry::HOT_C)), else [`SurfaceKind::Barren`];
+    ///   is sand (dunes) when hot ([`HOT_C`](super::dry::HOT_C)), else [`SurfaceKind::Barren`]; gentle bare
+    ///   ground in a known wet climate is [`SurfaceKind::Basalt`];
     /// * water: a lake ([`SurfaceKind::Water`], [`LAKE_DEPTH`] blocks over sand), or [`SurfaceKind::SEA`] when the
     ///   surface is under the sea (no data under the sea is the same); the caller turns it into the real sea
     ///   column with [`SurfaceKind::sea_column`];
     /// * wetland and mangrove: a marsh; moss and lichen: moss; built-up: gravel.
     ///
     /// `dry` is the climate at the column with its hash; without it (`None`: no climate, or no data there) the
-    /// rules are exactly those without the dry places.
+    /// rules are exactly those without the dry places and without wet bare rock.
     ///
     /// A known class that is not water stays dry under the sea level.
     pub fn on_classified<E>(
@@ -196,11 +253,20 @@ impl SurfaceKind {
         latitude: f64,
         below_sea: bool,
         dry: Option<DryColumn>,
-        steep: impl FnOnce() -> Result<bool, E>,
+        slope: impl FnOnce() -> Result<Slope, E>,
     ) -> Result<Self, E> {
         let line = snow_line_m(latitude);
         if class == LandClass::SnowIce || elevation_m >= line.max(LAND_SNOW_FLOOR_M) {
-            return Ok(Self::Snow);
+            // A frozen lake is a flat sheet, whatever is around it.
+            if class == LandClass::Water {
+                return Ok(Self::Snow);
+            }
+            return Ok(match (slope()?, class) {
+                (Slope::Rock, _) => Self::Alpine,
+                (Slope::Gentle, LandClass::SnowIce) => Self::Glacier,
+                (Slope::Steep, LandClass::SnowIce) => Self::Icefall,
+                _ => Self::Snow,
+            });
         }
         Ok(match class {
             LandClass::NoData if below_sea => Self::SEA,
@@ -209,7 +275,7 @@ impl SurfaceKind {
             LandClass::Shrub | LandClass::Grass => match dry.filter(DryColumn::is_dry) {
                 None => Self::Grass,
                 Some(d) => {
-                    if steep()? {
+                    if slope()?.is_steep() {
                         Self::Banded
                     } else {
                         let mix = if d.is_desert() { DESERT_MIX } else { SCRUB_MIX };
@@ -218,10 +284,11 @@ impl SurfaceKind {
                 }
             },
             LandClass::Bare => {
+                let climate = dry;
                 let dry = dry.filter(DryColumn::is_dry);
                 if elevation_m >= line - ALPINE_BAND_M {
                     Self::Alpine
-                } else if steep()? {
+                } else if slope()?.is_steep() {
                     if dry.is_some() {
                         Self::Banded
                     } else {
@@ -230,8 +297,9 @@ impl SurfaceKind {
                 } else if latitude.abs() >= GRAVEL_FROM_LATITUDE {
                     Self::Gravel
                 } else {
-                    match dry {
-                        Some(d) if !d.is_hot() => Self::Barren(BARREN_MIX.pick(d.bucket)),
+                    match (dry, climate) {
+                        (Some(d), _) if !d.is_hot() => Self::Barren(BARREN_MIX.pick(d.bucket)),
+                        (None, Some(wet)) => Self::Basalt(BASALT_MIX.pick(wet.bucket)),
                         _ => Self::Dune,
                     }
                 }
