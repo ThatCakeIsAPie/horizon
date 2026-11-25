@@ -2934,6 +2934,17 @@ fn the_cubic_world_type_cycles_and_customize_follows_it() {
         press_id(&mut f, size, 36);
         assert_eq!(cubic_kind(&f), expected);
         assert_eq!(button_by_id(&f, size, 37).enabled, expected.is_some());
+        // Earth ignores the world type, so its button is greyed out, and a press (or the wheel) changes nothing.
+        let earth = expected == Some(Earth);
+        assert_eq!(button_by_id(&f, size, 25).enabled, !earth);
+        if earth {
+            press_id(&mut f, size, 25);
+            let Mode::Create { options, .. } = &f.title.mode else {
+                panic!()
+            };
+            assert_eq!(options.world_type, crate::save::WorldPreset::Normal);
+            assert!(!button_by_id(&f, size, 26).enabled);
+        }
     }
     // The flat and debug presets cannot be cubic, whatever the button says.
     press_id(&mut f, size, 36);

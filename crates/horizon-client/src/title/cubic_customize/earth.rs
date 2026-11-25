@@ -423,26 +423,6 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// `n` as a short number for a sentence: `1`, `2.5`, `0.25`.
-fn plain(n: f64) -> String {
-    let text = format!("{n:.3}");
-    text.trim_end_matches('0').trim_end_matches('.').to_owned()
-}
-
-/// "1 block = N metres", with "1 metre" in the singular: the wording follows the number as the page shows it,
-/// so a scale that rounds to 1 reads as 1. A language that has the plural sentence but no singular one keeps
-/// the plural, as it did before the singular existed.
-pub(super) fn scale_sentence(scale: f64) -> String {
-    let shown = plain(scale);
-    let one = "horizon.cubic.earth.scale.is.one";
-    let key = if shown == "1" && crate::lang::has(one) {
-        one
-    } else {
-        "horizon.cubic.earth.scale.is"
-    };
-    sentence(key, &[shown])
-}
-
 fn sentence(key: &str, args: &[String]) -> String {
     let args: Vec<Text> = args.iter().cloned().map(Text::literal).collect();
     Text::translate(key, &args).plain()
@@ -453,8 +433,6 @@ pub(super) fn page(b: &mut Builder, state: &State) {
     if earth.credits {
         return credits_page(b);
     }
-    b.note(tr("horizon.cubic.earth.help.1"));
-    b.note(tr("horizon.cubic.earth.help.2"));
     // What is wrong goes at the top, where Done's being unavailable is explained without scrolling.
     if let Err(problem) = earth.check() {
         b.text(Kind::Warning, tr("horizon.cubic.earth.invalid"));
@@ -481,15 +459,20 @@ pub(super) fn page(b: &mut Builder, state: &State) {
     b.heading(tr("horizon.cubic.earth.scale.heading"));
     b.note(label(2));
     field(b, 2);
-    scale_notes(b, earth);
+    scale_warning(b, earth);
     b.heading(tr("horizon.cubic.earth.tiles"));
     b.note(label(3));
     field(b, 3);
-    b.note(tr("horizon.cubic.earth.url.help"));
     b.heading(tr("horizon.cubic.earth.credits.heading"));
-    // One line a source: the whole sentence is wider than the page and ran off its edge.
-    for line in credit_lines(&tr("horizon.cubic.earth.credits.short")) {
-        b.note(line);
+    // One line a source: the whole sentence is wider than the page and ran off its edge. What is downloaded
+    // first (the consent question names the same), then what ships with the game.
+    for key in [
+        "horizon.cubic.earth.credits.short",
+        "horizon.cubic.earth.credits.built_in",
+    ] {
+        for line in credit_lines(&tr(key)) {
+            b.note(line);
+        }
     }
     b.row(vec![button(tr("horizon.cubic.earth.credits.open"), |s| {
         s.earth.credits = true;
@@ -511,8 +494,8 @@ fn credit_lines(text: &str) -> Vec<String> {
     lines
 }
 
-/// "1 block = N metres", what the whole Earth needs at this scale, and a warning when it does not fit.
-fn scale_notes(b: &mut Builder, earth: &Draft) {
+/// A warning when the whole Earth does not fit this world's height range at this scale.
+fn scale_warning(b: &mut Builder, earth: &Draft) {
     let Some(scale) = earth
         .scale
         .trim()
@@ -523,14 +506,8 @@ fn scale_notes(b: &mut Builder, earth: &Draft) {
     else {
         return;
     };
-    b.note(scale_sentence(scale));
     let vertical = VerticalMap::new(earth.rest.sea_level_y, scale)
         .with_exaggeration(earth.rest.vertical_exaggeration);
-    let (low, high) = vertical.required_y_range();
-    b.note(sentence(
-        "horizon.cubic.earth.scale.needs",
-        &[low.to_string(), high.to_string()],
-    ));
     if !vertical.fits(MIN_Y, MAX_Y) {
         for line in wrap(
             &sentence(
@@ -658,14 +635,14 @@ mod credit_line_tests {
     #[test]
     fn the_short_credits_are_a_line_a_source() {
         let lines = credit_lines(
-            "Elevation: Terrain Tiles (Mapzen). Land cover: ESA WorldCover. Rivers and lakes: HydroSHEDS.",
+            "Elevation: Terrain Tiles (Mapzen). Land cover: ESA WorldCover. Climate: CHELSA.",
         );
         assert_eq!(
             lines,
             [
                 "Elevation: Terrain Tiles (Mapzen).",
                 "Land cover: ESA WorldCover.",
-                "Rivers and lakes: HydroSHEDS."
+                "Climate: CHELSA."
             ]
         );
         assert_eq!(credit_lines("One line"), ["One line"]);
