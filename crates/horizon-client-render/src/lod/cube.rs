@@ -903,6 +903,8 @@ pub struct Plan {
     pub coarsened: f64,
     /// The tile budget kept some tiles whole.
     pub tiles_limited: bool,
+    /// Nodes that would split but wait to be drawn first ([`PlanInput::refined`]).
+    pub held: usize,
 }
 
 /// What the plan needs to draw the coarse far terrain as surface tiles
@@ -933,6 +935,25 @@ pub struct PlanInput<'a> {
     pub class: &'a dyn Fn(CubeKey) -> NodeClass,
     /// Surface tiles at the coarse levels; `None`: cube nodes everywhere.
     pub surface: Option<Surface<'a>>,
+    /// The nodes drawn, and every node holding one ([`refined_set`]). With
+    /// it, the plan refines one level at a time: a node splits only once it,
+    /// or something inside it, is drawn, so a drawn node is replaced by its 8
+    /// children, which split again in a later plan once they are in. `None`:
+    /// the plan goes straight to the target.
+    pub refined: Option<&'a FxHashSet<CubeKey>>,
+}
+
+/// The nodes `drawn` lists and every node holding one: what
+/// [`PlanInput::refined`] takes.
+pub fn refined_set(drawn: &[CubeKey]) -> FxHashSet<CubeKey> {
+    let mut out = FxHashSet::default();
+    for &key in drawn {
+        let mut up = key;
+        while out.insert(up) && up.level < MAX_CUBE_LEVEL {
+            up = up.parent();
+        }
+    }
+    out
 }
 
 /// Where a cube node's footprint lies with respect to the tiles.
@@ -1273,6 +1294,7 @@ pub fn plan_classified(
         previous,
         class,
         surface: None,
+        refined: None,
     })
 }
 
@@ -1295,7 +1317,12 @@ pub fn plan_far(input: &PlanInput) -> Plan {
         previous,
         class,
         surface,
+        refined,
     } = *input;
+    // One level a plan: a node not drawn (nor holding a drawn node) stays a
+    // leaf, to be drawn before it splits.
+    let may_split = |node: CubeKey| refined.is_none_or(|r| r.contains(&node));
+    let held = std::cell::Cell::new(0usize);
     // The nodes holding a leaf of the last plan: the ones it split.
     let mut was_split = FxHashSet::<CubeKey>::default();
     for &leaf in previous {
@@ -1349,13 +1376,24 @@ pub fn plan_far(input: &PlanInput) -> Plan {
         };
         match loaded_state(node, center, loaded, is_loaded) {
             Loaded::All => Fate::Out,
-            Loaded::Some => split(true),
+            Loaded::Some if may_split(node) => split(true),
+            // Over near cubes and not drawn yet: drawn whole first, then split
+            // a level a plan, so the part over the near ground goes a level at
+            // a time instead of once the whole edge is in.
+            Loaded::Some => match class(node) {
+                NodeClass::Air => Fate::Pruned,
+                _ => {
+                    held.set(held.get() + 1);
+                    Fate::Leaf(distance, node)
+                }
+            },
             Loaded::None => match class(node) {
                 NodeClass::Air => Fate::Pruned,
                 // Rock reaching under a tile: the tile's skirts close it.
                 NodeClass::Rock if region == Region::Split => Fate::Out,
                 NodeClass::Rock => Fate::Leaf(distance, node),
                 NodeClass::Mixed if region == Region::Split => split(true),
+                NodeClass::Mixed if beside_loaded(node, center, loaded, is_loaded) => split(true),
                 NodeClass::Mixed if node.level == 0 => Fate::Leaf(distance, node),
                 NodeClass::Mixed => {
                     let merge = if was_split.contains(&node) {
@@ -1365,7 +1403,10 @@ pub fn plan_far(input: &PlanInput) -> Plan {
                     };
                     let ratio =
                         rule.factor(camera, node) * f64::from(node.size()) * merge / distance;
-                    if ratio > 1.0 {
+                    if ratio > 1.0 && !may_split(node) {
+                        held.set(held.get() + 1);
+                        Fate::Leaf(distance, node)
+                    } else if ratio > 1.0 {
                         Fate::Split(Candidate {
                             forced: false,
                             ratio,
@@ -1426,7 +1467,15 @@ pub fn plan_far(input: &PlanInput) -> Plan {
     }
     leaves.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     out.leaves = leaves.into_iter().map(|(_, node)| node).collect();
+    out.held = held.get();
     out
+}
+
+/// How a planned node ranks in the queue: its distance over its size, so
+/// the nodes biggest on screen (whose voxels are furthest over the target,
+/// as a level's nodes share a voxel size) are made first.
+pub fn screen_order(camera: [f64; 3], key: CubeKey) -> f64 {
+    key.distance(camera) / f64::from(key.size())
 }
 
 enum Loaded {
@@ -1478,6 +1527,49 @@ fn loaded_state(
         (_, 0) => Loaded::All,
         _ => Loaded::Some,
     }
+}
+
+/// Whether a node of level 1 up to [`PROBE_LEVEL`] that holds no loaded cube has one right beside it: a cube
+/// one step away in X or Z, in the node's own height range. Such a node splits down to single cubes, which are
+/// exact: a far voxel with the surface in it is solid whole, so its top stands up to a voxel above the
+/// ground, and where it met the near terrain that showed as a wall as tall as the voxel.
+fn beside_loaded(
+    node: CubeKey,
+    center: SectionPos,
+    loaded: LoadedBox,
+    is_loaded: &dyn Fn(SectionPos) -> bool,
+) -> bool {
+    if node.level == 0 || node.level > PROBE_LEVEL {
+        return false;
+    }
+    let side = 1_i32 << node.level;
+    let (x0, y0, z0) = (
+        node.x << node.level,
+        node.y << node.level,
+        node.z << node.level,
+    );
+    // `is_loaded` is only asked inside the loaded box.
+    let inside = |p: SectionPos| {
+        (p.x - center.x).abs() <= loaded.horizontal
+            && (p.y - center.y).abs() <= loaded.vertical
+            && (p.z - center.z).abs() <= loaded.horizontal
+    };
+    for dy in 0..side {
+        for dz in -1..=side {
+            for dx in -1..=side {
+                // The cubes along the four sides, not the corners or the node's own.
+                let (off_x, off_z) = (dx < 0 || dx >= side, dz < 0 || dz >= side);
+                if off_x == off_z {
+                    continue;
+                }
+                let cube = SectionPos::new(x0 + dx, y0 + dy, z0 + dz);
+                if inside(cube) && is_loaded(cube) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // ------------------------------------------------------------- node kinds
@@ -1534,13 +1626,17 @@ const CACHE_NODES: usize = 1024;
 /// How often the plan is recomputed when the camera stays in one cube, for
 /// cubes that loaded or unloaded meanwhile.
 const REPLAN: Duration = Duration::from_millis(250);
+/// How soon after a node comes in the plan is redone while nodes wait to
+/// refine a level ([`Plan::held`]): the pace the far view subdivides at.
+const REFINE_REPLAN: Duration = Duration::from_millis(100);
 
 /// A far-view tunable: the environment variable `name` when set to a number,
 /// else `default`, read once per process. For the overnight loop's sweeps
 /// (research/far-fill): a value tried without a rebuild. Unset, the game runs
 /// on the defaults as before.
 pub fn far_knob(name: &'static str, default: u64) -> u64 {
-    static KNOBS: std::sync::OnceLock<Mutex<FxHashMap<&'static str, u64>>> = std::sync::OnceLock::new();
+    static KNOBS: std::sync::OnceLock<Mutex<FxHashMap<&'static str, u64>>> =
+        std::sync::OnceLock::new();
     *KNOBS
         .get_or_init(Mutex::default)
         .lock()
@@ -1604,7 +1700,9 @@ pub mod profile {
             let jobs: Vec<String> = crate::streaming::job_stats::take()
                 .into_iter()
                 .filter(|(_, _, count)| *count > 0)
-                .map(|(kind, nanos, count)| format!("{kind} {count} jobs {:.0} ms", nanos as f64 / 1e6))
+                .map(|(kind, nanos, count)| {
+                    format!("{kind} {count} jobs {:.0} ms", nanos as f64 / 1e6)
+                })
                 .collect();
             log::info!("Horizon near jobs ({} ms): {}", now - last, jobs.join(", "));
         }
@@ -1758,6 +1856,13 @@ pub struct CubeLodStats {
     pub tiles_complex: usize,
     /// The tile budget kept some tiles whole.
     pub tiles_limited: bool,
+    /// Planned nodes that would split but wait to be drawn first: the
+    /// refining still to come, one level a plan.
+    pub held: usize,
+    /// Far nodes drawn over loaded near cubes now, and the longest any of
+    /// them has been (milliseconds): the far view lingering over near ground.
+    pub linger_nodes: usize,
+    pub linger_ms: f32,
 }
 
 /// What a worker made of a node: a CPU mesh, or (the GPU path) a node for the
@@ -2092,6 +2197,70 @@ impl LoadedSnapshot {
         let i = ((r[1] * i64::from(self.size[2]) + r[2]) * i64::from(self.size[0]) + r[0]) as usize;
         self.bits[i >> 6] >> (i & 63) & 1 == 1
     }
+
+    /// The snapshot as summed counts ([`LoadedCounts`]), one pass over the box.
+    fn counts(&self) -> LoadedCounts {
+        let [sx, sy, sz] = self.size.map(|v| v.max(0) as usize);
+        let (px, pz) = (sx + 1, sz + 1);
+        let mut sum = vec![0u32; px * (sy + 1) * pz];
+        let at = |x: usize, y: usize, z: usize| (y * pz + z) * px + x;
+        let mut i = 0usize;
+        for y in 0..sy {
+            for z in 0..sz {
+                for x in 0..sx {
+                    let bit = (self.bits[i >> 6] >> (i & 63) & 1) as u32;
+                    i += 1;
+                    sum[at(x + 1, y + 1, z + 1)] = bit
+                        + sum[at(x, y + 1, z + 1)]
+                        + sum[at(x + 1, y, z + 1)]
+                        + sum[at(x + 1, y + 1, z)]
+                        - sum[at(x, y, z + 1)]
+                        - sum[at(x, y + 1, z)]
+                        - sum[at(x + 1, y, z)]
+                        + sum[at(x, y, z)];
+                }
+            }
+        }
+        LoadedCounts {
+            lo: self.lo,
+            size: self.size,
+            sum,
+        }
+    }
+}
+
+/// A [`LoadedSnapshot`] as summed counts: how many loaded cubes any box holds.
+struct LoadedCounts {
+    lo: [i32; 3],
+    size: [i32; 3],
+    sum: Vec<u32>,
+}
+
+impl LoadedCounts {
+    /// Whether node `key` holds a loaded cube.
+    fn holds(&self, key: CubeKey) -> bool {
+        let side = 1_i64 << key.level;
+        let o = [i64::from(key.x), i64::from(key.y), i64::from(key.z)].map(|v| v * side);
+        let mut a = [0usize; 3];
+        let mut b = [0usize; 3];
+        for i in 0..3 {
+            let lo = (o[i] - i64::from(self.lo[i])).clamp(0, i64::from(self.size[i]));
+            let hi = (o[i] + side - i64::from(self.lo[i])).clamp(0, i64::from(self.size[i]));
+            if lo >= hi {
+                return false;
+            }
+            (a[i], b[i]) = (lo as usize, hi as usize);
+        }
+        let (px, pz) = (self.size[0] as usize + 1, self.size[2] as usize + 1);
+        let s = |x: usize, y: usize, z: usize| i64::from(self.sum[(y * pz + z) * px + x]);
+        let n =
+            s(b[0], b[1], b[2]) - s(a[0], b[1], b[2]) - s(b[0], a[1], b[2]) - s(b[0], b[1], a[2])
+                + s(a[0], a[1], b[2])
+                + s(a[0], b[1], a[2])
+                + s(b[0], a[1], a[2])
+                - s(a[0], a[1], a[2]);
+        n > 0
+    }
 }
 
 /// What a plan job needs for surface tiles.
@@ -2115,6 +2284,12 @@ struct PlanJob {
     snapshot: LoadedSnapshot,
     /// The plan in place, for the hysteresis.
     previous: Arc<Vec<CubeKey>>,
+    /// The nodes drawn (or failed: not to wait on), for the refining one
+    /// level at a time ([`PlanInput::refined`]).
+    drawn: Vec<CubeKey>,
+    /// Refine one level at a time from the coverage layer down (the
+    /// `HORIZON_FAR_STEP` knob, on unless 0); off: straight to the target.
+    step: bool,
     /// Plan surface tiles at the coarse levels.
     surface: Option<SurfaceJob>,
 }
@@ -2153,6 +2328,8 @@ struct PlanDone {
     limited: bool,
     coarsened: f64,
     tiles_limited: bool,
+    /// The plan's nodes waiting to be drawn before they split.
+    held: usize,
     elapsed: Duration,
 }
 
@@ -2193,7 +2370,13 @@ struct PlanSlot {
 }
 
 /// The plan a job asks for, with `rule` and no hysteresis when `fresh`.
-fn plan_job(job: &PlanJob, rule: &Rule, fresh: bool, class: &dyn Fn(CubeKey) -> NodeClass) -> Plan {
+fn plan_job(
+    job: &PlanJob,
+    rule: &Rule,
+    fresh: bool,
+    class: &dyn Fn(CubeKey) -> NodeClass,
+    refined: Option<&FxHashSet<CubeKey>>,
+) -> Plan {
     let is_loaded = |cube: SectionPos| job.snapshot.get(cube);
     let info = |key: TileKey| job.surface.as_ref().and_then(|s| s.info.get(&key).copied());
     plan_far(&PlanInput {
@@ -2210,7 +2393,25 @@ fn plan_job(job: &PlanJob, rule: &Rule, fresh: bool, class: &dyn Fn(CubeKey) -> 
             budget: s.budget,
             previous: if fresh { &[] } else { s.previous.as_slice() },
         }),
+        refined,
     })
+}
+
+/// What a stepping plan may split ([`PlanInput::refined`]): the nodes drawn
+/// and those holding one, and every node over a coverage leaf `cover` (the
+/// coarse layer comes at once, as before; under it, a level a plan).
+fn step_set(drawn: &[CubeKey], cover: &[CubeKey]) -> FxHashSet<CubeKey> {
+    let mut out = refined_set(drawn);
+    for &leaf in cover {
+        let mut up = leaf;
+        while up.level < MAX_CUBE_LEVEL {
+            up = up.parent();
+            if !out.insert(up) {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// The change from `last` to `next`: what `next` adds, and what it drops.
@@ -2233,7 +2434,12 @@ fn make_plan(
     class: &dyn Fn(CubeKey) -> NodeClass,
 ) -> PlanDone {
     let started = Instant::now();
-    let plan = plan_job(job, &job.rule, false, class);
+    let cover_rule = job.rule.coarser(COVER_SCALE, COVER_NODES);
+    let cover = job
+        .step
+        .then(|| plan_job(job, &cover_rule, true, class, None));
+    let refined = cover.as_ref().map(|c| step_set(&job.drawn, &c.leaves));
+    let plan = plan_job(job, &job.rule, false, class, refined.as_ref());
     let (added, removed, next) = diff(&plan.leaves, last);
     let (tiles_added, tiles_removed, next_tiles) = diff(&plan.tiles, last_tiles);
     let changed = !(added.is_empty()
@@ -2263,6 +2469,7 @@ fn make_plan(
         limited: plan.limited,
         coarsened: plan.coarsened,
         tiles_limited: plan.tiles_limited,
+        held: plan.held,
         elapsed: Duration::ZERO,
     };
     if changed {
@@ -2271,6 +2478,10 @@ fn make_plan(
             .iter()
             .map(|&k| (sector(job.camera, k), k))
             .collect();
+        // Biggest on screen first, so the whole view sharpens evenly.
+        done.order.sort_by(|a, b| {
+            screen_order(job.camera, a.1).total_cmp(&screen_order(job.camera, b.1))
+        });
         done.tree = plan.leaves.iter().map(|&k| (tree_order(k), k)).collect();
         done.tree.sort_unstable();
         done.footprints = plan
@@ -2284,12 +2495,7 @@ fn make_plan(
             )
             .collect();
         done.footprints.sort_unstable();
-        let cover = plan_job(
-            job,
-            &job.rule.coarser(COVER_SCALE, COVER_NODES),
-            true,
-            class,
-        );
+        let cover = cover.unwrap_or_else(|| plan_job(job, &cover_rule, true, class, None));
         done.cover = cover.leaves.into_iter().collect();
         done.cover_tiles = cover.tiles.into_iter().collect();
         done.leaves = Arc::new(plan.leaves);
@@ -2557,6 +2763,12 @@ pub struct CubeLod {
     descent_runs_asked: u64,
     /// The plan holds for the descent's answer after a jump, since.
     jumped: Option<Instant>,
+    /// Nodes the plan holds back a level ([`Plan::held`]), and whether a node
+    /// came in since the last plan was asked for: the next level is due.
+    held: usize,
+    delivered_since: bool,
+    /// The drawn nodes over loaded near cubes, since when.
+    lingering: FxHashMap<CubeKey, Instant>,
 }
 
 impl CubeLod {
@@ -2707,6 +2919,9 @@ impl CubeLod {
             descent_asked: None,
             descent_runs_asked: 0,
             jumped: None,
+            held: 0,
+            delivered_since: false,
+            lingering: FxHashMap::default(),
             backend,
         }
     }
@@ -3014,12 +3229,11 @@ impl CubeLod {
         if answered {
             self.jumped = None;
         }
-        self.jumped
-            .is_some_and(|at| {
-                !answered
-                    && now.saturating_duration_since(at)
-                        < far_ms("HORIZON_FAR_DESCENT_WAIT_MS", DESCENT_WAIT)
-            })
+        self.jumped.is_some_and(|at| {
+            !answered
+                && now.saturating_duration_since(at)
+                    < far_ms("HORIZON_FAR_DESCENT_WAIT_MS", DESCENT_WAIT)
+        })
     }
 
     /// The nodes finished for the GPU mesher since the last call (their slots
@@ -3118,20 +3332,39 @@ impl CubeLod {
                         || a.loaded != loaded
                         || now.saturating_duration_since(a.at) >= self.replan_every()
                         || refocused(&a.rule, &rule, view)
+                        || (self.held > 0
+                            && self.delivered_since
+                            && now.saturating_duration_since(a.at)
+                                >= far_ms("HORIZON_FAR_REFINE_MS", REFINE_REPLAN))
                 }
                 None => true,
             };
         if stale && !hold {
             let mut slot = self.shared.planner.lock().unwrap();
             if slot.job.is_none() && !slot.busy && slot.done.is_none() {
+                let snapshot = LoadedSnapshot::take(cube, loaded, &is_loaded);
+                track_lingering(
+                    &self.delivered,
+                    &self.empty,
+                    &mut self.lingering,
+                    &mut self.stats,
+                    &snapshot,
+                    now,
+                );
+                self.delivered_since = false;
                 slot.job = Some(PlanJob {
                     epoch: self.epoch,
                     camera,
                     max_distance,
                     rule,
                     loaded,
-                    snapshot: LoadedSnapshot::take(cube, loaded, &is_loaded),
+                    snapshot,
                     previous: self.plan.clone(),
+                    drawn: (self.delivered.iter())
+                        .chain(self.failed.keys())
+                        .copied()
+                        .collect(),
+                    step: far_knob("HORIZON_FAR_STEP", 1) != 0,
                     surface: self.tiles.on.then(|| SurfaceJob {
                         info: self.tiles.info.clone(),
                         sea_level: self.tiles.sea_level,
@@ -3275,6 +3508,7 @@ impl CubeLod {
         if !self.delivered.insert(key) {
             return;
         }
+        self.delivered_since = true;
         self.release_dirty = true;
         self.holes_dirty = true;
         if empty {
@@ -3301,6 +3535,8 @@ impl CubeLod {
         self.stats.tiles_limited = done.tiles_limited;
         self.stats.voxel_px = self.stats.target_px * done.coarsened.max(1.0) as f32;
         self.stats.plan_ms = done.elapsed.as_secs_f32() * 1000.0;
+        self.held = done.held;
+        self.stats.held = done.held;
         if !done.changed {
             return;
         }
@@ -3446,7 +3682,7 @@ impl CubeLod {
     /// The order a short list is queued in: by sector rank, then distance.
     fn priority(&self, rank: &[u8; SECTORS], key: &CubeKey) -> f64 {
         f64::from(rank[usize::from(sector(self.camera, *key))]) * 1e9
-            + key.distance(self.camera).min(9e8)
+            + screen_order(self.camera, *key).min(9e8)
     }
 
     /// The planned nodes among `keys` with nothing drawn over their place:
@@ -3744,10 +3980,9 @@ impl CubeLod {
         let now = Instant::now();
         let waiting = |k: &CubeKey| {
             !self.delivered.contains(k)
-                && self
-                    .failed
-                    .get(k)
-                    .is_none_or(|at| now.saturating_duration_since(*at) >= far_ms("HORIZON_FAR_RETRY_MS", RETRY))
+                && self.failed.get(k).is_none_or(|at| {
+                    now.saturating_duration_since(*at) >= far_ms("HORIZON_FAR_RETRY_MS", RETRY)
+                })
         };
         let mut firsts = FxHashSet::default();
         let mut first: Vec<CubeKey> = self
@@ -3790,7 +4025,9 @@ impl CubeLod {
         let due: Vec<CubeKey> = self
             .failed
             .iter()
-            .filter(|(_, at)| now.saturating_duration_since(**at) >= far_ms("HORIZON_FAR_RETRY_MS", RETRY))
+            .filter(|(_, at)| {
+                now.saturating_duration_since(**at) >= far_ms("HORIZON_FAR_RETRY_MS", RETRY)
+            })
             .map(|(&k, _)| k)
             .collect();
         if due.is_empty() {
@@ -4020,6 +4257,9 @@ impl CubeLod {
         self.asked = None;
         self.replan = false;
         self.jumped = None;
+        self.held = 0;
+        self.delivered_since = false;
+        self.lingering.clear();
         while let Ok(done) = self.results.try_recv() {
             if let Some(Product::Gpu(node)) = &done.product {
                 self.release(node);
@@ -4032,6 +4272,33 @@ impl CubeLod {
 }
 
 /// The node of `level` holding `key` (`level` at least `key.level`).
+/// Notes the drawn nodes (`delivered`, less the `empty` ones) that hold
+/// loaded near cubes (`snapshot`) and since when (`lingering`), for
+/// [`CubeLodStats::linger_nodes`] and `linger_ms`.
+fn track_lingering(
+    delivered: &FxHashSet<CubeKey>,
+    empty: &FxHashSet<CubeKey>,
+    lingering: &mut FxHashMap<CubeKey, Instant>,
+    stats: &mut CubeLodStats,
+    snapshot: &LoadedSnapshot,
+    now: Instant,
+) {
+    let counts = snapshot.counts();
+    let mut next = FxHashMap::default();
+    for &key in delivered {
+        if empty.contains(&key) || !counts.holds(key) {
+            continue;
+        }
+        next.insert(key, lingering.get(&key).copied().unwrap_or(now));
+    }
+    stats.linger_nodes = next.len();
+    stats.linger_ms = next
+        .values()
+        .map(|t| now.saturating_duration_since(*t).as_secs_f32() * 1000.0)
+        .fold(0.0, f32::max);
+    *lingering = next;
+}
+
 fn ancestor(key: CubeKey, level: u8) -> CubeKey {
     let up = level - key.level;
     CubeKey::new(level, key.x >> up, key.y >> up, key.z >> up)
@@ -4272,7 +4539,9 @@ fn work(
                     && let Some(key) = queue.pop()
                 {
                     if gpu.is_some() && key.level < MIN_LEVEL {
-                        if cpu == far_knob("HORIZON_FAR_CPU_PER_BATCH", CPU_PER_BATCH as u64) as usize {
+                        if cpu
+                            == far_knob("HORIZON_FAR_CPU_PER_BATCH", CPU_PER_BATCH as u64) as usize
+                        {
                             later.push(key);
                             continue;
                         }
@@ -5272,9 +5541,154 @@ mod tests {
             limited: false,
             coarsened: 1.0,
             tiles_limited: false,
+            held: 0,
             elapsed: Duration::ZERO,
         };
         lod.install(done, Instant::now());
+    }
+
+    /// The plan of `camera` with nothing loaded and every node mixed, refined
+    /// from what `drawn` lists ([`PlanInput::refined`]; `None`: no stepping).
+    fn stepped(
+        camera: [f64; 3],
+        drawn: Option<&[CubeKey]>,
+        is_loaded: &dyn Fn(SectionPos) -> bool,
+    ) -> Vec<CubeKey> {
+        let refined = drawn.map(refined_set);
+        plan_far(&PlanInput {
+            camera,
+            max_distance: 3000.0,
+            rule: &Rule::distance(DETAIL),
+            loaded: BOX,
+            is_loaded,
+            previous: &[],
+            class: &|_| NodeClass::Mixed,
+            surface: None,
+            refined: refined.as_ref(),
+        })
+        .leaves
+    }
+
+    #[test]
+    fn the_far_view_refines_one_level_at_a_time_down_to_the_target() {
+        let camera = [100.5, 64.5, -40.5];
+        let nowhere = |_: SectionPos| false;
+        let target: FxHashSet<CubeKey> = stepped(camera, None, &nowhere).into_iter().collect();
+        // Nothing drawn: the roots only.
+        let mut drawn = stepped(camera, Some(&[]), &nowhere);
+        let roots = root_nodes(camera, 3000.0);
+        assert!(drawn.iter().all(|k| roots.contains(k)), "{drawn:?}");
+        let mut steps = 0;
+        loop {
+            let next = stepped(camera, Some(&drawn), &nowhere);
+            assert_disjoint(&next);
+            let before: FxHashSet<CubeKey> = drawn.iter().copied().collect();
+            // Each new node is a drawn node's child, never a grandchild.
+            for k in &next {
+                assert!(
+                    before.contains(k) || before.contains(&k.parent()),
+                    "{k:?} skips a level"
+                );
+            }
+            if next.iter().copied().collect::<FxHashSet<_>>() == before {
+                break;
+            }
+            drawn = next;
+            steps += 1;
+            assert!(steps < 32);
+        }
+        // It ends at the plan without stepping, after several visible steps.
+        assert_eq!(drawn.into_iter().collect::<FxHashSet<_>>(), target);
+        assert!(steps >= 3, "{steps}");
+    }
+
+    #[test]
+    fn a_node_over_near_cubes_stays_until_drawn_then_splits_a_level() {
+        let camera = [8.5, 64.5, 8.5];
+        let loaded = near(camera);
+        let node = CubeKey::containing(4, cube_of(camera));
+        // Not drawn: kept whole over the near cubes, no hole where they are not.
+        let held = stepped(camera, Some(&[node.parent()]), &loaded);
+        assert!(held.contains(&node), "{held:?}");
+        // Drawn: replaced by its children, those all over near cubes left out.
+        let next = stepped(camera, Some(&[node]), &loaded);
+        assert!(!next.contains(&node));
+        for child in node.children() {
+            let all = (0..8)
+                .flat_map(|y| (0..8).flat_map(move |z| (0..8).map(move |x| (x, y, z))))
+                .all(|(x, y, z)| {
+                    let o = child.origin();
+                    loaded(SectionPos::new(
+                        (o[0] >> 4) + x,
+                        (o[1] >> 4) + y,
+                        (o[2] >> 4) + z,
+                    ))
+                });
+            assert_eq!(next.contains(&child), !all, "{child:?}");
+        }
+    }
+
+    #[test]
+    fn the_queue_takes_the_biggest_on_screen_first() {
+        let camera = [0.5, 64.5, 0.5];
+        // Twice as far, eight times bigger: four times bigger on screen.
+        let big = CubeKey::containing(3, SectionPos::new(64, 4, 0));
+        let small = CubeKey::containing(0, SectionPos::new(32, 4, 0));
+        assert!(screen_order(camera, big) < screen_order(camera, small));
+    }
+
+    #[test]
+    fn a_parent_goes_as_soon_as_its_eight_are_in_while_other_work_waits() {
+        let mut lod = lod_for_test();
+        let parent = key(2, 0, 0, 0);
+        let other = key(2, 5, 0, 5);
+        put(&mut lod, &[parent, other], &[]);
+        lod.deliver(parent, false);
+        let mut next = parent.children().to_vec();
+        next.push(other);
+        put(&mut lod, &next, &[]);
+        for child in parent.children() {
+            lod.deliver(child, false);
+        }
+        // `other` still waits; the parent goes anyway.
+        assert!(!lod.delivered.contains(&other));
+        assert_eq!(lod.removed(), vec![parent]);
+    }
+
+    #[test]
+    fn far_nodes_drawn_over_near_cubes_are_counted_with_how_long() {
+        let camera = [8.5, 64.5, 8.5];
+        let c = cube_of(camera);
+        let snapshot = LoadedSnapshot::take(c, BOX, &near(camera));
+        let over = CubeKey::containing(1, c);
+        let away = CubeKey::containing(1, SectionPos::new(c.x + 400, c.y, c.z));
+        let empty = FxHashSet::default();
+        let mut lingering = FxHashMap::default();
+        let mut stats = CubeLodStats::default();
+        let delivered: FxHashSet<CubeKey> = [over, away].into_iter().collect();
+        let t0 = Instant::now();
+        track_lingering(
+            &delivered,
+            &empty,
+            &mut lingering,
+            &mut stats,
+            &snapshot,
+            t0,
+        );
+        assert_eq!(stats.linger_nodes, 1);
+        let later = t0 + Duration::from_millis(700);
+        track_lingering(
+            &delivered,
+            &empty,
+            &mut lingering,
+            &mut stats,
+            &snapshot,
+            later,
+        );
+        assert!((stats.linger_ms - 700.0).abs() < 1.0, "{}", stats.linger_ms);
+        let gone: FxHashSet<CubeKey> = [away].into_iter().collect();
+        track_lingering(&gone, &empty, &mut lingering, &mut stats, &snapshot, later);
+        assert_eq!((stats.linger_nodes, stats.linger_ms), (0, 0.0));
     }
 
     #[test]
@@ -5555,6 +5969,7 @@ mod tests {
                 budget: usize::MAX,
                 previous: &[],
             }),
+            refined: None,
         })
     }
 
@@ -5722,6 +6137,8 @@ mod tests {
             loaded: NONE,
             snapshot: LoadedSnapshot::default(),
             previous: Arc::default(),
+            drawn: Vec::new(),
+            step: false,
             surface: None,
         };
         let done = make_plan(
@@ -5973,5 +6390,49 @@ mod whole_world_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn far_nodes_beside_loaded_cubes_are_single_cubes() {
+        // A coarse rule: left to it, the nodes beside the loaded cubes would be whole voxels.
+        let rule = Rule::distance(0.25);
+        let loaded = LoadedBox {
+            horizontal: 8,
+            vertical: 3,
+        };
+        let is_loaded = |p: SectionPos| p.x.abs() <= 6 && p.z.abs() <= 6 && p.y.abs() <= 2;
+        let plan = plan_classified(
+            [8.0, 8.0, 8.0],
+            4096.0,
+            &rule,
+            loaded,
+            &is_loaded,
+            &[],
+            &|_| NodeClass::Mixed,
+        )
+        .leaves;
+        let set: FxHashSet<CubeKey> = plan.iter().copied().collect();
+        let mut beside = 0;
+        for y in -2..=2 {
+            for z in -7..=7 {
+                for x in -7..=7 {
+                    let cube = SectionPos::new(x, y, z);
+                    let next = |dx: i32, dz: i32| is_loaded(SectionPos::new(x + dx, y, z + dz));
+                    if is_loaded(cube) || !(next(1, 0) || next(-1, 0) || next(0, 1) || next(0, -1))
+                    {
+                        continue;
+                    }
+                    beside += 1;
+                    assert!(
+                        set.contains(&CubeKey::containing(0, cube)),
+                        "{cube:?} beside the loaded cubes is not a single cube"
+                    );
+                }
+            }
+        }
+        assert_eq!(beside, 4 * 13 * 5);
+        // Past that ring the rule decides again: coarser nodes stand.
+        assert!(plan.iter().any(|k| k.level >= 2));
+        disjoint(&plan);
     }
 }

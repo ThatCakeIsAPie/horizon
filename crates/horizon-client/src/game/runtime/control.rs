@@ -1795,6 +1795,11 @@ impl Game<'_> {
                     "holes": s.holes,
                     "cover_nodes": s.cover_nodes,
                     "covering": s.covering,
+                    // Nodes waiting to be drawn before they split a level, and the
+                    // far nodes drawn over loaded near cubes now, the longest for how long.
+                    "held": s.held,
+                    "linger_nodes": s.linger_nodes,
+                    "linger_ms": s.linger_ms,
                     // Surface tiles (counted in planned and ready too).
                     "surface": lod.surface_on(),
                     "tiles": s.tiles,
