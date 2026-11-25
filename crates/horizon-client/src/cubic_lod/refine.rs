@@ -136,6 +136,19 @@ impl LateContent for Refine {
         s.max_distance = max_distance;
     }
 
+    /// A handed-out node the producer has no drawn node for (the plan dropped it since it was made coarse, as
+    /// the nodes near the player are once their cubes load) is never made: it is forgotten at once, so it does
+    /// not hold a place in the batch until [`HANDED_FOR`] runs out. Before this, such nodes held the batch
+    /// nearly full and the far view stayed without trees.
+    fn not_drawn(&self, boxes: &[([i32; 3], [i32; 3])]) {
+        let mut s = self.state.lock().unwrap();
+        for (min, max) in boxes {
+            if let Some(key) = CubeKey::of_box(*min, *max) {
+                s.handed.remove(&key);
+            }
+        }
+    }
+
     fn take_refreshes(&self) -> Vec<([i32; 3], [i32; 3])> {
         let mut s = self.state.lock().unwrap();
         Self::next(&mut s, Instant::now())
@@ -194,5 +207,30 @@ mod tests {
         s.max_distance = 4096.0;
         assert!(Refine::next(&mut s, later).is_empty());
         assert!(s.coarse.is_empty());
+    }
+
+    #[test]
+    fn nodes_the_plan_dropped_free_their_place_in_the_batch_at_once() {
+        let refine = Refine::default();
+        let keys: Vec<CubeKey> = (0..200).map(|x| CubeKey::new(2, x, 0, 0)).collect();
+        for &key in &keys {
+            refine.made(key, false, true);
+        }
+        refine.view([0.0, 32.0, 32.0], [1.0, 0.0, 0.0], 1e5, true);
+        let first = refine.take_refreshes();
+        assert_eq!(first.len(), BATCH);
+        // The producer has no drawn node for any of them (they left the plan): the next batch comes at once,
+        // without waiting for them to time out.
+        refine.not_drawn(&first);
+        assert_eq!(refine.counts(), (200 - BATCH, 0));
+        let second = refine.take_refreshes();
+        assert_eq!(second.len(), BATCH);
+        assert!(
+            second.iter().all(|b| !first.contains(b)),
+            "new nodes, the dropped ones are forgotten"
+        );
+        // A box that is no node's extent changes nothing.
+        refine.not_drawn(&[([1, 0, 0], [64, 63, 63])]);
+        assert_eq!(refine.counts().1, BATCH);
     }
 }

@@ -837,6 +837,9 @@ impl CubeSampler for CubicLodSampler {
             if keep {
                 self.keep(&node, since);
             }
+            // The world's own cubes, trees and all: whole. Without this a node
+            // handed out to be refined waited out its time in the batch.
+            self.made_whole(key);
             return Some(node);
         }
         let node = self.sampled(key)?;

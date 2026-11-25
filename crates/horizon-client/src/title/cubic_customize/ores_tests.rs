@@ -972,12 +972,12 @@ fn meteor_kinds_add_cycle_and_delete() {
     let at = met(&s, "Add kind");
     tap(&mut s, at);
     assert_eq!(m(&s).kinds[2].ore, "coal");
-    // Its weight is 0 to 10.
+    // Its weight is 0 to 50.
     let kind_weight = met_nth(&s, "Weight: ", m(&s).size_curve.0.len() + 2);
     drag(&mut s, kind_weight, 0.25);
-    near(m(&s).kinds[2].weight, 2.5);
+    near(m(&s).kinds[2].weight, 12.5);
     drag(&mut s, kind_weight, 1.0);
-    assert_eq!(m(&s).kinds[2].weight, 10.0);
+    assert_eq!(m(&s).kinds[2].weight, 50.0);
     // Delete the middle one: the kinds that are left keep their order.
     let ores_before: Vec<_> = m(&s).kinds.iter().map(|k| k.ore.clone()).collect();
     let spline = m(&s).size_curve.0.len();
@@ -1151,4 +1151,20 @@ fn the_ores_page_of_an_edit_never_breaks_the_other_pages() {
         (lakes, caves)
     );
     s.settings.validate().unwrap();
+}
+
+#[test]
+fn the_default_meteor_kind_weights_sit_inside_the_slider() {
+    // The default kinds weigh up to 30 (iron); a slider topping out below that showed every heavy kind pegged at
+    // its end, and a touch cut the weight down to the slider's top.
+    let defaults = OreGenSettings::default().meteors;
+    let heaviest = defaults.kinds.iter().map(|k| k.weight).fold(0.0, f64::max);
+    assert!(
+        heaviest > 10.0,
+        "the defaults have heavy kinds ({heaviest})"
+    );
+    assert!(
+        heaviest < KIND_WEIGHT_MAX,
+        "{heaviest} fits under {KIND_WEIGHT_MAX}"
+    );
 }

@@ -487,12 +487,28 @@ pub(super) fn page(b: &mut Builder, state: &State) {
     field(b, 3);
     b.note(tr("horizon.cubic.earth.url.help"));
     b.heading(tr("horizon.cubic.earth.credits.heading"));
-    b.note(tr("horizon.cubic.earth.credits.short"));
+    // One line a source: the whole sentence is wider than the page and ran off its edge.
+    for line in credit_lines(&tr("horizon.cubic.earth.credits.short")) {
+        b.note(line);
+    }
     b.row(vec![button(tr("horizon.cubic.earth.credits.open"), |s| {
         s.earth.credits = true;
         s.earth.focus = None;
         s.scroll = crate::ui::Scroll::default();
     })]);
+}
+
+/// The short credits split after each sentence (". "), so each source is its own line.
+fn credit_lines(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .split_inclusive(". ")
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        lines.push(text.to_string());
+    }
+    lines
 }
 
 /// "1 block = N metres", what the whole Earth needs at this scale, and a warning when it does not fit.
@@ -632,5 +648,26 @@ impl Draft {
     }
     pub(super) fn credits_open(&self) -> bool {
         self.credits
+    }
+}
+
+#[cfg(test)]
+mod credit_line_tests {
+    use super::credit_lines;
+
+    #[test]
+    fn the_short_credits_are_a_line_a_source() {
+        let lines = credit_lines(
+            "Elevation: Terrain Tiles (Mapzen). Land cover: ESA WorldCover. Rivers and lakes: HydroSHEDS.",
+        );
+        assert_eq!(
+            lines,
+            [
+                "Elevation: Terrain Tiles (Mapzen).",
+                "Land cover: ESA WorldCover.",
+                "Rivers and lakes: HydroSHEDS."
+            ]
+        );
+        assert_eq!(credit_lines("One line"), ["One line"]);
     }
 }
