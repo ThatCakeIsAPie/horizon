@@ -15,9 +15,10 @@ use super::dry::{
 };
 use super::generator::Access;
 use super::land_tests::LandRig;
-use super::surface::{SOIL_DEPTH, SurfaceKind};
+use super::surface::{LAKE_DEPTH, SOIL_DEPTH, SurfaceKind};
 use super::tests::LON0;
 use super::vegetation::{FeatureKind, allowed, allowed_in};
+use super::water::Bed;
 use super::*;
 
 const NO_SLOPE: fn() -> Result<bool, ()> = || Ok(false);
@@ -217,7 +218,10 @@ fn trees_and_the_rest_keep_their_tops_in_a_dry_climate() {
     );
     assert_eq!(
         kind(LandClass::Water, 36.0, dry, NO_SLOPE),
-        SurfaceKind::Lake
+        SurfaceKind::Water {
+            depth: LAKE_DEPTH as u32,
+            bed: Bed::Sand
+        }
     );
     assert_eq!(
         kind(LandClass::SnowIce, 36.0, dry, NO_SLOPE),
@@ -628,7 +632,7 @@ fn slope(lat0: f64, base: f64, gradient: f64) -> impl Fn(f64, f64) -> f64 + Send
 
 fn kind_at(g: &EarthGenerator, x: i32, z: i32) -> (i32, SurfaceKind) {
     let s = g.surface_y_blocking(x, z).unwrap();
-    (s, g.kind_core(Access::Fetch, x, z, s, 1).ok().unwrap())
+    g.kind_core(Access::Fetch, x, z, s, 1).ok().unwrap()
 }
 
 #[test]
@@ -669,12 +673,22 @@ fn the_section_fill_shortcut_does_not_hide_the_bands_under_dry_ground() {
     let y0 = (s - 28).div_euclid(16) * 16;
     let min = [0, y0, 0];
     let max = [15, y0 + 15, 15];
-    // The same cube is proven stone without climate, and not with it.
+    // The cube holds the bands, so neither world proves it stone (a water rule may carve the ground by
+    // MAX_CARVE, and the bands reach DRY_ROCK_DEPTH under it).
     assert_eq!(
         rig.generator.classify_box_blocking(min, max, 1),
-        Fill::Stone
+        Fill::Mixed
     );
     assert_eq!(g.classify_box_blocking(min, max, 1), Fill::Mixed);
+    // A cube under the carve margin is proven stone without climate, but not with it: the dry kinds' bands may
+    // reach that deep under a ground that was carved.
+    let mid = (s - 60).div_euclid(16) * 16;
+    let (mid_min, mid_max) = ([0, mid, 0], [15, mid + 15, 15]);
+    assert_eq!(
+        rig.generator.classify_box_blocking(mid_min, mid_max, 1),
+        Fill::Stone
+    );
+    assert_eq!(g.classify_box_blocking(mid_min, mid_max, 1), Fill::Mixed);
     let mut out = Box::new([0_u32; 4096]);
     let uniform = g.generate_blocking(SectionPos::new(0, y0.div_euclid(16), 0), &mut out);
     assert_eq!(uniform, None);

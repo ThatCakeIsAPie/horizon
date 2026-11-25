@@ -47,6 +47,7 @@ pub struct NodeColumns {
     pub width: usize,
     /// The block the first column is sampled at.
     pub origin: [i32; 2],
+    /// The final surface of each column: the top water block of a water column, the ground of the rest.
     pub surfaces: Vec<i32>,
     kinds: Vec<SurfaceKind>,
     /// The land class of each column; `None` without land cover.
@@ -72,7 +73,10 @@ impl NodeColumns {
 
 impl EarthGenerator {
     /// The surfaces alone of [`EarthGenerator::columns_at`]: what only the height of the ground decides (sky
-    /// cover), which does not wait for land cover.
+    /// cover), which does not wait for land cover. With land cover the water rules move surfaces (a carved
+    /// channel, a raised bank, the sea's top over a sunken column): when the land cover is already held the final
+    /// surfaces are given, so a channel is not covered by the ground it was carved out of; when it is not, the
+    /// elevation surfaces are (as without land cover).
     pub fn surfaces_at(
         &self,
         x0: i32,
@@ -80,6 +84,11 @@ impl EarthGenerator {
         stride: i32,
         zoom_step: i32,
     ) -> Result<Vec<i32>, NotReady> {
+        if self.land_cover_active()
+            && let Ok(columns) = self.columns_at(x0, z0, stride, zoom_step)
+        {
+            return Ok(columns.surfaces);
+        }
         let stride = stride.max(1);
         let (sx, sz) = (x0.saturating_add(stride / 2), z0.saturating_add(stride / 2));
         let zoom = self.zoom_for_step(zoom_step);
@@ -134,7 +143,7 @@ impl EarthGenerator {
             z1: sz.saturating_add(span),
             zoom,
         };
-        let surfaces = self
+        let mut surfaces = self
             .field
             .surface_ys_strided(sx, sz, width, width, stride, zoom)
             .ok_or_else(|| NotReady {
@@ -150,7 +159,7 @@ impl EarthGenerator {
                 [width, width],
                 stride,
                 zoom_step,
-                &surfaces,
+                &mut surfaces,
             )
             .map_err(not_ready)?;
         Ok(NodeColumns {

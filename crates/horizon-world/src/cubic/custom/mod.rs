@@ -231,6 +231,9 @@ impl CustomCubicGenerator {
         if let Some(climate) = climate {
             generator = generator.with_climate(climate);
         }
+        if let Some(atlas) = horizon_earth::WaterAtlas::embedded() {
+            generator = generator.with_water(atlas);
+        }
         Ok(Self {
             kind: Kind::Heightmap(Arc::new(generator)),
             areas: Vec::new(),

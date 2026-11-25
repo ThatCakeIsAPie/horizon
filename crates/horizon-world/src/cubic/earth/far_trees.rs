@@ -385,13 +385,9 @@ impl EarthGenerator {
         Ok(out)
     }
 
-    /// Whether the top of a column of `kind` and surface `s` is water.
-    fn water_top(&self, kind: SurfaceKind, s: i32) -> bool {
-        match kind {
-            SurfaceKind::Sand => s < self.sea_level(),
-            SurfaceKind::Lake | SurfaceKind::Marsh => true,
-            _ => false,
-        }
+    /// Whether the top of a column of `kind` is water.
+    fn water_top(&self, kind: SurfaceKind) -> bool {
+        kind.is_water() || kind == SurfaceKind::Marsh
     }
 
     /// The trees of the jittered grids in the block of columns `cols` (stride 1): each candidate is kept
@@ -476,7 +472,6 @@ impl EarthGenerator {
         let cols = self.columns_wide(x0 - r, z0 - r, w, 1, 1)?;
         let biomes = self.column_biomes(&cols)?;
         let b = *self.blocks();
-        let sea = self.sea_level();
         let area = |c: usize| ((c >> 4) + r as usize) * w + (c & 15) + r as usize;
         // The highest block of each own column that is ground, water or tree, and whether a tree made it.
         let mut top = [0i32; 256];
@@ -485,12 +480,8 @@ impl EarthGenerator {
         for c in 0..256 {
             let a = area(c);
             let (s, kind) = (cols.surfaces[a], cols.kind(a));
-            wet[c] = self.water_top(kind, s);
-            top[c] = if kind == SurfaceKind::Sand && s < sea {
-                sea - 1
-            } else {
-                s
-            };
+            wet[c] = self.water_top(kind);
+            top[c] = s;
         }
         let mut changed = false;
         if decor.trees {
@@ -578,7 +569,6 @@ impl EarthGenerator {
         let biomes = self.column_biomes(cols)?;
         let step = cols.step;
         let level = step.max(1).ilog2();
-        let sea = self.sea_level();
         let floor = |y: i32| Self::voxel_floor(y, step);
         let b = *self.blocks();
         let mut out = Vec::with_capacity(biomes.len());
@@ -587,15 +577,10 @@ impl EarthGenerator {
             let (s, kind) = (cols.surfaces[i], cols.kind(i));
             let mut c = ColDecor {
                 snow: decor.snow && biome.snows(),
-                wet: self.water_top(kind, s),
+                wet: self.water_top(kind),
                 ..ColDecor::default()
             };
-            let ground_top = if kind == SurfaceKind::Sand && s < sea {
-                sea - 1
-            } else {
-                s
-            };
-            c.top_lo = floor(ground_top);
+            c.top_lo = floor(s);
             let styled = style(biome).filter(|_| {
                 decor.trees
                     && matches!(

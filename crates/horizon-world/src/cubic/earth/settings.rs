@@ -247,6 +247,17 @@ impl EarthSettings {
                 horizon_earth::LAND_COVER_RULES,
                 super::surface::LAND_RULES
             ));
+            // The water rules run whenever land cover does; the atlas they read is part of the build.
+            key.push_str(&format!(
+                "#water{}.{}{}",
+                horizon_earth::WATER_RULES,
+                super::water::WATER_GEN_RULES,
+                if horizon_earth::WaterAtlas::embedded().is_none() {
+                    ".noatlas"
+                } else {
+                    ""
+                }
+            ));
             if self.vegetation {
                 key.push_str(&format!(
                     "#vegetation{}#fartrees{}",
@@ -365,7 +376,12 @@ mod tests {
             horizon_earth::LAND_COVER_RULES,
             super::super::surface::LAND_RULES
         );
-        assert!(on.terrain_key().ends_with(&rules), "{}", on.terrain_key());
+        assert!(
+            on.terrain_key()
+                .ends_with(&format!("{rules}{}", water_part())),
+            "{}",
+            on.terrain_key()
+        );
         assert!(!off.terrain_key().contains("landcover"));
         // The key of a world without land cover is what it was before the setting existed.
         assert_eq!(
@@ -418,8 +434,9 @@ mod tests {
             horizon_earth::LAND_COVER_RULES,
             super::super::surface::LAND_RULES
         );
-        assert!(key(true, false).ends_with(&land));
-        assert!(with.ends_with(&format!("{land}{rules}")), "{with}");
+        let water = water_part();
+        assert!(key(true, false).ends_with(&format!("{land}{water}")));
+        assert!(with.ends_with(&format!("{land}{water}{rules}")), "{with}");
         assert!(!key(true, false).contains("#vegetation"));
         assert_ne!(with, key(true, false));
         // Without land cover vegetation does nothing, so only the file's own text differs.
@@ -487,7 +504,8 @@ mod tests {
 
     #[test]
     fn an_old_worlds_key_has_no_far_tree_or_snow_part_and_is_the_format_from_before() {
-        // A world file from before vegetation and snow: land cover only.
+        // A world file from before vegetation and snow: land cover only. Its key is the format from before
+        // with the water part, which every land-cover world now has (its terrain changed with the water rules).
         let old = EarthSettings::from_json(
             r#"{"originLatitude": 46, "originLongitude": 7.5, "landCover": true}"#,
         )
@@ -499,14 +517,38 @@ mod tests {
         assert_eq!(
             key,
             format!(
-                "{}#surface{}#clean{}#landcover{}.{}",
+                "{}#surface{}#clean{}#landcover{}.{}{}",
                 old.to_json_compact(),
                 super::super::surface::RULES,
                 horizon_earth::clean::CLEAN_RULES,
                 horizon_earth::LAND_COVER_RULES,
-                super::super::surface::LAND_RULES
+                super::super::surface::LAND_RULES,
+                water_part()
             )
         );
+    }
+
+    /// The water part of a land-cover world's key: the atlas's and the generator's rules, and whether the build
+    /// has no atlas.
+    fn water_part() -> String {
+        format!(
+            "#water{}.{}{}",
+            horizon_earth::WATER_RULES,
+            super::super::water::WATER_GEN_RULES,
+            if horizon_earth::WaterAtlas::embedded().is_none() {
+                ".noatlas"
+            } else {
+                ""
+            }
+        )
+    }
+
+    #[test]
+    fn the_terrain_key_carries_the_water_rules_only_with_land_cover() {
+        let mut s = EarthSettings::at(46.0, 7.5);
+        assert!(!s.terrain_key().contains("#water"));
+        s.land_cover = true;
+        assert!(s.terrain_key().contains(&water_part()));
     }
 
     #[test]

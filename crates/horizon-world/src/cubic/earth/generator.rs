@@ -1,13 +1,19 @@
 //! The Earth generator: a column's surface height from elevation tiles, and stone, soil, sand and water around it.
 //!
-//! With `s` the surface block height of a column and `sea` the sea level:
+//! A column is `(s, kind)`: its surface block height `s` and the [`SurfaceKind`] of its top. For a dry column `s` is
+//! the elevation surface (the DEM) and the ground; for a water column `s` is the TOP WATER BLOCK. The sea level
+//! `sea` is where the sea stops: the sea's top block is `sea - 1`.
 //!
-//! * `y <= s - 4`: stone (for the dry places' kinds, `y < s - 32`);
-//! * on land (`s >= sea`), by the column's [`SurfaceKind`] (see [`super::surface`] for the snow line and the
-//!   alpine band): grass over three dirt (`s - 3 <= y < s` dirt, a grass block at `y == s`); bare stone up to
-//!   `s`; or snow for `s - 1 <= y <= s` over stone; air above; the dry places of a world with climate
-//!   ([`super::dry`]) have terracotta bands by absolute height from 32 blocks under `s` up to their top;
-//! * under water (`s < sea`): sand for `s - 3 <= y <= s`, water for `s < y < sea`, air above.
+//! * dry columns, by kind (see [`super::surface`] for the snow line and the alpine band): `y <= s - 4` is stone
+//!   (for the dry places' kinds, `y < s - 32`); grass over three dirt (`s - 3 <= y < s` dirt, a grass block at
+//!   `y == s`); bare stone up to `s`; or snow for `s - 1 <= y <= s` over stone; air above; the dry places of a
+//!   world with climate ([`super::dry`]) have terracotta bands by absolute height from 32 blocks under `s` up to
+//!   their top;
+//! * water columns ([`SurfaceKind::Water`] with `depth` blocks of water and a [`Bed`](super::water::Bed)): the
+//!   ground is `g = s - depth`; water for `g < y <= s`, air above; the bed block for `g - 3 <= y <= g` (one
+//!   block for a stone bed, which is stone all the way down), stone below. Under the sea (`s0 < sea`, `s0` the
+//!   elevation surface) the column is `s = sea - 1`, `g = min(s0, s - 1)` over sand
+//!   ([`SurfaceKind::sea_column`]).
 //!
 //! A far voxel (a sample `step > 1` blocks tall, from `lo` to `lo + step - 1`) that holds the surface block is
 //! the surface block, so distant terrain shows one material per column and does not stripe with the height of
@@ -17,7 +23,10 @@
 //! With land cover on and a source handed in ([`EarthGenerator::with_land_cover`]) a column whose class is known
 //! takes its top from the class ([`SurfaceKind::on_classified`]): a lake or marsh is water up to the surface
 //! block over a bed under it, and a known class that is not water stays dry under the sea level. The sea fills
-//! only columns whose class is water or unknown. Columns read their class at the zoom of their step, like their
+//! only columns whose class is water or unknown. The rules may move a column's `s` (the sea's top is under the
+//! elevation of a sunken column), so every read that gives kinds gives the final surfaces with them
+//! ([`EarthGenerator::kinds_classes_core`]); a box classification widens its margins by the most the rules carve
+//! or raise ([`MAX_CARVE`], [`MAX_RAISE`]). Columns read their class at the zoom of their step, like their
 //! height; bare ground also reads its neighbours' heights for the slope. Without it every rule above is exactly
 //! what it was.
 //!
@@ -44,9 +53,8 @@ use super::biome::BIOME_SAMPLE_M;
 use super::dry::{BAND_COUNT, DRY_ROCK_DEPTH, DryColumn, DryTop, band_index, band_table};
 use super::far_trees::MAX_TREE_UP;
 use super::settings::EarthSettings;
-use super::surface::{
-    LAKE_DEPTH, SLOPE_BASE_M, SNOW_DEPTH, SOIL_DEPTH, STEEP_GRADIENT, SurfaceKind,
-};
+use super::surface::{SLOPE_BASE_M, SNOW_DEPTH, SOIL_DEPTH, STEEP_GRADIENT, SurfaceKind};
+use super::water::{Bed, MAX_CARVE, MAX_RAISE, WINDOW_PAD};
 use crate::cubic::custom::replacers::resolve_block;
 use crate::cubic::custom::settings::BlockStateDesc;
 use crate::registry::BlockRegistry;
@@ -66,6 +74,7 @@ pub struct EarthBlocks {
     pub snow_block: u32,
     pub gravel: u32,
     pub mud: u32,
+    pub clay: u32,
     pub moss_block: u32,
     /// The dry places' ground and the seven terracotta blocks of the bands ([`super::dry`]).
     pub red_sand: u32,
@@ -95,6 +104,7 @@ impl EarthBlocks {
             snow_block: get("snow_block")?,
             gravel: get("gravel")?,
             mud: get("mud")?,
+            clay: get("clay")?,
             moss_block: get("moss_block")?,
             red_sand: get("red_sand")?,
             coarse_dirt: get("coarse_dirt")?,
@@ -193,6 +203,10 @@ pub(super) enum Gap {
     Land,
 }
 
+/// How many blocks a sea column's bed lies under its elevation surface at most without land cover: the bed is
+/// under the block of water, so an elevation at the top of the sea has its bed one block lower.
+const SEA_BED_SLACK: i64 = 1;
+
 /// A generator of Earth terrain over a tile store.
 pub struct EarthGenerator {
     pub(super) field: ElevationField,
@@ -215,6 +229,8 @@ pub struct EarthGenerator {
     climate_on: bool,
     /// The climate the generator was handed, kept only while the settings ask for it (and land cover is on).
     climate: Option<Arc<horizon_earth::ClimateSource>>,
+    /// The water atlas and the river indexes built from it ([`super::water_gen`]).
+    pub(super) water: super::water_gen::WaterState,
 }
 
 impl EarthGenerator {
@@ -242,6 +258,7 @@ impl EarthGenerator {
             land: None,
             climate_on: settings.land_cover && settings.climate,
             climate: None,
+            water: super::water_gen::WaterState::default(),
         })
     }
 
@@ -347,31 +364,35 @@ impl EarthGenerator {
     }
 
     /// The block at height `y` of a column whose surface is `s` and whose top is of `kind`. The ground (the top
-    /// of the soil or bed) is `s` for most kinds and a few blocks lower under the water of a lake or marsh,
-    /// which reaches the surface block `s`; only a [`SurfaceKind::Sand`] column is flooded up to the sea level.
+    /// of the soil or bed) is `s` for most kinds and `kind.sink()` blocks lower under the water of a water column
+    /// or marsh, which reaches the surface block `s`: `s` is the top water block there.
     pub fn block_for(&self, y: i32, s: i32, kind: SurfaceKind) -> u32 {
         let (y, s) = (i64::from(y), i64::from(s));
-        let sea = i64::from(self.sea_level);
         let b = &self.blocks;
         let ground = s - kind.sink();
-        let depth = if kind.is_dry() {
-            DRY_ROCK_DEPTH
-        } else {
-            SOIL_DEPTH
+        let depth = match kind {
+            // A stone bed is stone from its top block down.
+            SurfaceKind::Water {
+                bed: Bed::Stone, ..
+            } => 0,
+            _ if kind.is_dry() => DRY_ROCK_DEPTH,
+            _ => SOIL_DEPTH,
         };
         if y < ground - depth {
             return b.stone;
         }
         if y > ground {
-            let wet = if kind == SurfaceKind::Sand {
-                s < sea && y < sea
-            } else {
-                y <= s
-            };
-            return if wet { b.water } else { b.air };
+            return if y <= s { b.water } else { b.air };
         }
         match kind {
-            SurfaceKind::Sand | SurfaceKind::Dune | SurfaceKind::Lake => b.sand,
+            SurfaceKind::Water { bed, .. } => match bed {
+                Bed::Sand => b.sand,
+                Bed::Gravel => b.gravel,
+                Bed::Mud => b.mud,
+                Bed::Clay => b.clay,
+                Bed::Stone => b.stone,
+            },
+            SurfaceKind::Dune => b.sand,
             SurfaceKind::Grass if y == ground => b.grass_block,
             SurfaceKind::Grass => b.dirt,
             SurfaceKind::Alpine => b.stone,
@@ -395,8 +416,8 @@ impl EarthGenerator {
 
     /// The block of the far voxel whose lowest block is `lo` and which is `step` blocks tall, in a column whose
     /// surface is `s` and top of `kind`. A voxel holding the surface block is the surface block; one wholly
-    /// below it is what its top block is, one wholly above it is what its bottom block is (water up to the sea
-    /// level over a sunken column, else air). `step` 1 is [`EarthGenerator::block_for`].
+    /// below it is what its top block is, one wholly above it is what its bottom block is (air, `s` being the
+    /// top of the water too). `step` 1 is [`EarthGenerator::block_for`].
     pub fn voxel_block(&self, lo: i32, step: i32, s: i32, kind: SurfaceKind) -> u32 {
         if step <= 1 {
             return self.block_for(lo, s, kind);
@@ -421,14 +442,12 @@ impl EarthGenerator {
         }
     }
 
-    /// The kind of top of the column at the point `(x, z)` whose surface block is `s`, without land cover: by
-    /// its elevation and the latitude of the point itself (not of the world's origin).
-    pub fn surface_kind(&self, x: i32, z: i32, s: i32) -> SurfaceKind {
-        if s < self.sea_level {
-            return SurfaceKind::Sand;
-        }
+    /// The column `(s, kind)` at the point `(x, z)` whose elevation surface block is `s0`, without land cover: the
+    /// sea under the sea level ([`SurfaceKind::sea_column`], its top block `sea - 1`), else the kind by its
+    /// elevation and the latitude of the point itself (not of the world's origin).
+    pub fn surface_column(&self, x: i32, z: i32, s0: i32) -> (i32, SurfaceKind) {
         SurfaceKind::of_column(
-            s,
+            s0,
             self.latitude_at(x, z),
             self.sea_level,
             self.field.vertical(),
@@ -454,7 +473,7 @@ impl EarthGenerator {
     /// Whether the ground at block `(x, z)` (surface `s`) is steep: a neighbour one [`EarthGenerator::slope_base`]
     /// away north, south, east or west differs in height by [`STEEP_GRADIENT`] of that distance or more, the
     /// heights read at the zoom of `zoom_step`. A neighbour whose tile is missing is a gap, never a guess.
-    fn is_steep(
+    pub(super) fn is_steep(
         &self,
         a: Access,
         x: i32,
@@ -508,9 +527,11 @@ impl EarthGenerator {
         }
     }
 
-    /// The kinds of `width` by `depth` columns `stride` blocks apart from `(x0, z0)` whose surfaces are
-    /// `surfaces`, row by row: by land cover where the generator has it, else by [`EarthGenerator::surface_kind`].
-    /// `zoom_step` is the spacing whose zoom and land-cover level the columns are read at.
+    /// The kinds of `width` by `depth` columns `stride` blocks apart from `(x0, z0)` whose elevation surfaces are
+    /// `surfaces`, row by row: by land cover where the generator has it, else by
+    /// [`EarthGenerator::surface_column`]. `zoom_step` is the spacing whose zoom and land-cover level the columns
+    /// are read at. On success `surfaces` holds the FINAL surfaces (a water column's top block, a moved bank);
+    /// on a gap it is left as it was.
     pub(super) fn kinds_core(
         &self,
         a: Access,
@@ -518,7 +539,7 @@ impl EarthGenerator {
         size: [usize; 2],
         stride: i32,
         zoom_step: i32,
-        surfaces: &[i32],
+        surfaces: &mut [i32],
     ) -> Result<Vec<SurfaceKind>, Gap> {
         Ok(self
             .kinds_classes_core(a, origin, size, stride, zoom_step, surfaces)?
@@ -533,7 +554,7 @@ impl EarthGenerator {
         [width, depth]: [usize; 2],
         stride: i32,
         zoom_step: i32,
-        surfaces: &[i32],
+        surfaces: &mut [i32],
     ) -> Result<(Vec<SurfaceKind>, Option<Vec<LandClass>>), Gap> {
         let at = |i: usize| {
             (
@@ -541,69 +562,93 @@ impl EarthGenerator {
                 z0.saturating_add((i / width) as i32 * stride),
             )
         };
-        let Some(land) = &self.land else {
-            let kinds = surfaces
-                .iter()
-                .enumerate()
-                .map(|(i, &s)| {
-                    let (x, z) = at(i);
-                    self.surface_kind(x, z, s)
-                })
-                .collect();
-            return Ok((kinds, None));
+        let (columns, classes) = match &self.land {
+            None => {
+                let columns = surfaces
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &s0)| {
+                        let (x, z) = at(i);
+                        self.surface_column(x, z, s0)
+                    })
+                    .collect::<Vec<_>>();
+                (columns, None)
+            }
+            Some(land) => {
+                // The water rules read a padded window around the columns ([`super::water_gen`]).
+                let water =
+                    self.water_columns(a, land, [x0, z0], [width, depth], stride, zoom_step)?;
+                let columns = water
+                    .columns
+                    .iter()
+                    .zip(&water.classes)
+                    .enumerate()
+                    .map(|(i, (&cw, &class))| {
+                        let (x, z) = at(i);
+                        self.water_column(a, [x, z], cw, class, stride, zoom_step)
+                    })
+                    .collect::<Result<Vec<_>, Gap>>()?;
+                (columns, Some(water.classes))
+            }
         };
-        let classes = self.classes_core(a, land, [x0, z0], [width, depth], stride, zoom_step)?;
-        let kinds = surfaces
-            .iter()
-            .zip(&classes)
-            .enumerate()
-            .map(|(i, (&s, &class))| {
-                let (x, z) = at(i);
-                self.land_kind(a, [x, z], s, stride, zoom_step, class)
-            })
-            .collect::<Result<Vec<_>, Gap>>()?;
-        Ok((kinds, Some(classes)))
+        let mut kinds = Vec::with_capacity(columns.len());
+        for (slot, (s, kind)) in surfaces.iter_mut().zip(columns) {
+            *slot = s;
+            kinds.push(kind);
+        }
+        Ok((kinds, classes))
     }
 
-    /// The kind of the one column at `(x, z)` whose surface is `s`, samples `step` blocks apart.
+    /// The column `(s, kind)` of the one column at `(x, z)` whose elevation surface is `s0`, samples `step`
+    /// blocks apart.
     pub(super) fn kind_core(
         &self,
         a: Access,
         x: i32,
         z: i32,
-        s: i32,
+        s0: i32,
         step: i32,
-    ) -> Result<SurfaceKind, Gap> {
+    ) -> Result<(i32, SurfaceKind), Gap> {
         if self.land.is_none() {
-            return Ok(self.surface_kind(x, z, s));
+            return Ok(self.surface_column(x, z, s0));
         }
-        Ok(self.kinds_core(a, [x, z], [1, 1], step, step, &[s])?[0])
+        let mut s = [s0];
+        let kind = self.kinds_core(a, [x, z], [1, 1], step, step, &mut s)?[0];
+        Ok((s[0], kind))
     }
 
-    fn land_kind(
+    /// The column `(s, kind)` of a column of known `class` whose elevation surface is `s0`: what the class makes
+    /// of it ([`SurfaceKind::on_classified`]), and under the sea level a water class is the sea
+    /// ([`SurfaceKind::sea_column`]: its top is the block under the sea level, not `s0`).
+    pub(super) fn land_column(
         &self,
         a: Access,
         [x, z]: [i32; 2],
-        s: i32,
+        s0: i32,
         stride: i32,
         zoom_step: i32,
         class: LandClass,
-    ) -> Result<SurfaceKind, Gap> {
-        let elevation = self.field.vertical().elevation_for_y(f64::from(s));
+    ) -> Result<(i32, SurfaceKind), Gap> {
+        let elevation = self.field.vertical().elevation_for_y(f64::from(s0));
         // Only open ground reads the climate: what a tree, crop, water or snow column is does not depend on it.
         let dry = if matches!(class, LandClass::Bare | LandClass::Shrub | LandClass::Grass) {
             self.dry_column(a, x, z)?
         } else {
             None
         };
-        SurfaceKind::on_classified(
+        let kind = SurfaceKind::on_classified(
             class,
             elevation,
             self.latitude_at(x, z),
-            s < self.sea_level,
+            s0 < self.sea_level,
             dry,
-            || self.is_steep(a, x, z, s, stride, zoom_step),
-        )
+            || self.is_steep(a, x, z, s0, stride, zoom_step),
+        )?;
+        Ok(if kind.is_water() && s0 < self.sea_level {
+            SurfaceKind::sea_column(s0, self.sea_level)
+        } else {
+            (s0, kind)
+        })
     }
 
     /// What the dry places' rules need of the column `(x, z)`: the climate at it, read as the biome reads it (at
@@ -633,13 +678,14 @@ impl EarthGenerator {
         Ok(climate.map(|c| DryColumn::new(c, x, z)))
     }
 
-    /// `r` grown by what the kinds of its columns read beyond it (a bare column's neighbours), for the lists of
-    /// tiles a read is not ready for. Unchanged without land cover.
+    /// `r` grown by what the kinds of its columns read beyond it (the water rules' window of
+    /// [`WINDOW_PAD`] samples, and a bare column's neighbours), for the lists of tiles a read is not ready for.
+    /// Unchanged without land cover.
     pub(super) fn kind_rect(&self, r: Rect, stride: i32) -> Rect {
         if self.land.is_none() {
             return r;
         }
-        let d = self.slope_base(stride);
+        let d = Self::window_grow(stride).saturating_add(self.slope_base(stride));
         Rect {
             x0: r.x0.saturating_sub(d),
             z0: r.z0.saturating_sub(d),
@@ -657,7 +703,22 @@ impl EarthGenerator {
             return Vec::new();
         };
         let metres = f64::from(step.max(1)) * self.field.projection().metres_per_block();
-        land.field().needs(x0, z0, x1, z1, metres)
+        // The water rules read the classes of a padded window around what is asked.
+        let g = Self::window_grow(step);
+        let (x0, x1) = (x0.min(x1), x0.max(x1));
+        let (z0, z1) = (z0.min(z1), z0.max(z1));
+        land.field().needs(
+            x0.saturating_sub(g),
+            z0.saturating_sub(g),
+            x1.saturating_add(g),
+            z1.saturating_add(g),
+            metres,
+        )
+    }
+
+    /// The blocks the water rules' window reaches beyond columns `stride` blocks apart.
+    pub(super) fn window_grow(stride: i32) -> i32 {
+        (WINDOW_PAD as i32).saturating_mul(stride.max(1))
     }
 
     /// The block a [`Fill`] stands for; `None` for `Mixed`.
@@ -675,18 +736,25 @@ impl EarthGenerator {
         let (ymin, ymax) = (i64::from(ymin), i64::from(ymax));
         let (s_lo, s_hi) = (i64::from(s_lo), i64::from(s_hi));
         let sea = i64::from(self.sea_level);
-        // With land cover a lake's bed lies lower under its surface, and what is under the sea level is water
-        // only where the map says so, which the heights do not prove. With climate the dry places have
-        // terracotta bands down to DRY_ROCK_DEPTH under the surface.
+        // The ground may lie under the elevation surface: by one block in a sea column whose elevation is at the
+        // top of the sea (the water takes the block over the bed), and with land cover by up to MAX_CARVE (a lake
+        // or river bed, a shelf, a carved bank), and what is under the sea level is water only where the map says
+        // so, which the heights do not prove. With climate the dry places have terracotta bands down to
+        // DRY_ROCK_DEPTH under the ground. Land the rules raise puts its top up to MAX_RAISE over the surface.
         let land = self.land.is_some();
-        let margin = match (land, self.climate.is_some()) {
-            (false, _) => SOIL_DEPTH,
-            (true, false) => SOIL_DEPTH + LAKE_DEPTH,
-            (true, true) => (SOIL_DEPTH + LAKE_DEPTH).max(DRY_ROCK_DEPTH),
+        let (carve, raise) = if land {
+            (MAX_CARVE, MAX_RAISE)
+        } else {
+            (SEA_BED_SLACK, 0)
         };
-        if ymax < s_lo - margin {
+        let rock = if land && self.climate.is_some() {
+            SOIL_DEPTH.max(DRY_ROCK_DEPTH)
+        } else {
+            SOIL_DEPTH
+        };
+        if ymax < s_lo - carve - rock {
             Fill::Stone
-        } else if ymin > s_hi && ymin >= sea {
+        } else if ymin > s_hi + raise && ymin >= sea {
             Fill::Air
         } else if !land && ymin > s_hi && ymax < sea {
             Fill::Water
@@ -823,8 +891,8 @@ impl EarthGenerator {
     }
 
     pub(super) fn block_core(&self, a: Access, [x, y, z]: [i32; 3], step: i32) -> Result<u32, Gap> {
-        let s = self.surface_core(a, x, z, step)?;
-        let kind = self.kind_core(a, x, z, s, step)?;
+        let s0 = self.surface_core(a, x, z, step)?;
+        let (s, kind) = self.kind_core(a, x, z, s0, step)?;
         Ok(self.voxel_block(Self::voxel_floor(y, step), step, s, kind))
     }
 
@@ -840,8 +908,8 @@ impl EarthGenerator {
         if ys.is_empty() {
             return Ok(None);
         }
-        let s = self.surface_core(a, x, z, step)?;
-        let kind = self.kind_core(a, x, z, s, step)?;
+        let s0 = self.surface_core(a, x, z, step)?;
+        let (s, kind) = self.kind_core(a, x, z, s0, step)?;
         for (i, &y) in ys.iter().enumerate() {
             let block = self.voxel_block(Self::voxel_floor(y, step), step, s, kind);
             if stop(block) {
@@ -919,8 +987,8 @@ impl EarthGenerator {
             out.fill(id);
             return Ok(Some(id));
         }
-        let surfaces = self.surfaces_of(a, r)?;
-        let kinds = self.kinds_core(a, [r.x0, r.z0], [16, 16], 1, 1, &surfaces)?;
+        let mut surfaces = self.surfaces_of(a, r)?;
+        let kinds = self.kinds_core(a, [r.x0, r.z0], [16, 16], 1, 1, &mut surfaces)?;
         for dy in 0..16 {
             for (column, (&s, &kind)) in surfaces.iter().zip(&kinds).enumerate() {
                 out[dy << 8 | column] = self.block_for(y0 + dy as i32, s, kind);
@@ -1078,7 +1146,10 @@ impl EarthGenerator {
             z1: max[2],
             zoom: self.zoom_for_step(step),
         };
-        self.ready(r, self.box_core_up(Access::Local, min, max, step, MAX_TREE_UP))
+        self.ready(
+            r,
+            self.box_core_up(Access::Local, min, max, step, MAX_TREE_UP),
+        )
     }
 }
 

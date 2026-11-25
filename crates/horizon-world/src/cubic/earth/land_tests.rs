@@ -12,6 +12,7 @@ use horizon_earth::{
 
 use super::surface::{LAKE_DEPTH, LAND_SNOW_FLOOR_M, MARSH_DEPTH, SOIL_DEPTH, SurfaceKind};
 use super::tests::{LAT0, LON0, terrain};
+use super::water::Bed;
 use super::*;
 use crate::cubic::custom::CustomCubicGenerator;
 use crate::cubic::custom::biomes::BiomeColumns;
@@ -401,15 +402,18 @@ fn the_snow_line_still_whitens_peaks_the_map_calls_something_else() {
 
 #[test]
 fn a_lake_above_the_sea_is_water_to_its_surface_over_a_sand_bed() {
+    // With no atlas record the lake is flat one block under the lowest elevation of its columns
+    // ([`super::water`]), here the level ground: its top is `s - 1` of the elevation surface `s`.
     let rig = LandRig::level(45.0, 120.0, 80);
     let b = rig.blocks;
     let bed = LAKE_DEPTH as i32;
     let s = rig.check(0, 0, |y, s| {
-        if y < s - bed - 3 {
+        let top = s - 1;
+        if y < top - bed - 3 {
             b.stone
-        } else if y <= s - bed {
+        } else if y <= top - bed {
             b.sand
-        } else if y <= s {
+        } else if y <= top {
             b.water
         } else {
             b.air
@@ -536,6 +540,11 @@ fn a_file_the_source_does_not_have_is_no_data_asked_for_once_and_never_waited_fo
     let start = std::time::Instant::now();
     for c in area(&rig).into_iter().take(60) {
         let (got, uniform) = blocks_of(&rig.generator, c);
+        // Away from the coast no data is the elevation rule; at the coast the water rules ([`super::water`])
+        // add the sea's tolerance, shelf and shore, which the plain world does not have.
+        if c.x.abs() < 20 {
+            continue;
+        }
         let (want, want_uniform) = blocks_of(&rig.plain, c);
         assert_eq!(&got[..], &want[..], "cube {c:?}");
         assert_eq!(uniform, want_uniform);
@@ -670,8 +679,8 @@ fn near_and_far_give_the_same_surface_material_at_every_step() {
                 let (sx, sz) = (x0 + stride / 2, z0 + stride / 2);
                 for i in (0..256).step_by(if stride < 8 { 5 } else { 1 }) {
                     let (wx, wz) = (sx + (i & 15) as i32 * stride, sz + (i >> 4) as i32 * stride);
-                    kinds.insert(format!("{:?}", cols.kind(i)));
                     let s = cols.surfaces[i];
+                    kinds.insert(kind_name(g, s, cols.kind(i)));
                     let floor = s.div_euclid(stride) * stride;
                     for lo in [floor - stride, floor, floor + stride] {
                         assert_eq!(
@@ -687,20 +696,27 @@ fn near_and_far_give_the_same_surface_material_at_every_step() {
     }
     assert!(compared > 2000);
     // The mosaic put every kind of top there to compare.
-    for kind in [
-        SurfaceKind::Grass,
-        SurfaceKind::Snow,
-        SurfaceKind::Lake,
-        SurfaceKind::Marsh,
-        SurfaceKind::Moss,
-        SurfaceKind::Gravel,
-        SurfaceKind::Sand,
-    ] {
-        assert!(
-            kinds.contains(&format!("{kind:?}")),
-            "no {kind:?} in {kinds:?}"
-        );
+    for kind in ["Grass", "Snow", "Lake", "Marsh", "Moss", "Gravel", "Sea"] {
+        assert!(kinds.contains(kind), "no {kind:?} in {kinds:?}");
     }
+}
+
+/// The name of a column's kind for the lists of kinds a test saw: the variant's name, and a water column is the
+/// "Sea" when its top is the block under the sea level, else a "Lake".
+fn kind_name(g: &EarthGenerator, s: i32, kind: SurfaceKind) -> String {
+    if kind.is_water() {
+        return if s == g.sea_level() - 1 {
+            "Sea"
+        } else {
+            "Lake"
+        }
+        .into();
+    }
+    format!("{kind:?}")
+        .split(['(', ' '])
+        .next()
+        .unwrap_or_default()
+        .into()
 }
 
 #[test]
@@ -748,7 +764,13 @@ fn a_lake_shows_in_the_far_view_and_dry_land_under_the_sea_level_is_not_flooded_
     let cols = lake.loaded(|g| g.node_columns(5, 0, 0));
     for i in 0..256 {
         let s = cols.surfaces[i];
-        assert_eq!(cols.kind(i), SurfaceKind::Lake);
+        assert_eq!(
+            cols.kind(i),
+            SurfaceKind::Water {
+                depth: LAKE_DEPTH as u32,
+                bed: Bed::Sand
+            }
+        );
         let lo = s.div_euclid(32) * 32;
         assert_eq!(lake.generator.far_voxel(&cols, i, lo), lake.blocks.water);
         assert_eq!(lake.generator.far_voxel(&cols, i, lo + 32), lake.blocks.air);

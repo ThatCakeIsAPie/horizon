@@ -83,20 +83,33 @@ impl Rig {
         LAT0 - ((f64::from(z) + 0.5) * self.settings.metres_per_block / EARTH_RADIUS_M).to_degrees()
     }
 
-    /// The terrain rule, restated: what the column at row `z` whose surface is `s` has at height `y` (one-block
-    /// samples).
+    /// The terrain rule, restated: what the column at row `z` whose elevation surface is `s` has at height `y`
+    /// (one-block samples).
     fn expected(&self, y: i32, s: i32, z: i32) -> u32 {
         let sea = self.settings.sea_level_y;
         let b = &self.blocks;
         let elevation = f64::from(s - sea) * self.settings.metres_per_block
             / self.settings.vertical_exaggeration;
         let line = snow_line(self.latitude(z));
+        if s < sea {
+            // The sea: water up to the block under the sea level over a sand bed of four blocks whose top is the
+            // elevation surface, or one block under the top water when the elevation is at the top.
+            let top = sea - 1;
+            let ground = s.min(top - 1);
+            return if y > top {
+                b.air
+            } else if y > ground {
+                b.water
+            } else if y >= ground - 3 {
+                b.sand
+            } else {
+                b.stone
+            };
+        }
         if y <= s - 4 {
             b.stone
         } else if y > s {
-            if s < sea && y < sea { b.water } else { b.air }
-        } else if s < sea {
-            b.sand
+            b.air
         } else if elevation >= line {
             if y >= s - 1 { b.snow_block } else { b.stone }
         } else if elevation >= line - 1500.0 {
@@ -112,9 +125,15 @@ impl Rig {
     /// holds the surface, else the block at its top (below the ground) or bottom (above it).
     fn expected_voxel(&self, lo: i32, step: i32, s: i32, z: i32) -> u32 {
         let top = lo + step - 1;
-        let at = if lo <= s && s <= top {
+        // A water column's surface block is its top water block.
+        let surface = if s < self.settings.sea_level_y {
+            self.settings.sea_level_y - 1
+        } else {
             s
-        } else if top < s {
+        };
+        let at = if lo <= surface && surface <= top {
+            surface
+        } else if top < surface {
             top
         } else {
             lo
@@ -974,16 +993,22 @@ fn a_column_uses_its_own_latitude_not_the_origins() {
 
 #[test]
 fn a_far_voxel_holding_the_surface_is_the_surface_block_of_each_kind_at_every_step() {
-    // Grass, sand, snow and bare stone, each from its own latitude and elevation.
+    // Grass, the sea (a water column's surface block is its top water block), snow and bare stone, each from its
+    // own latitude and elevation.
     let cases: [(f64, f64, fn(&EarthBlocks) -> u32); 4] = [
         (45.0, 120.5, |b| b.grass_block),
-        (45.0, -37.5, |b| b.sand),
+        (45.0, -37.5, |b| b.water),
         (20.0, 6100.5, |b| b.snow_block),
         (45.0, 3000.5, |b| b.stone),
     ];
     for (lat, metres, surface_block) in cases {
         let (g, b, _dir) = flat(lat, 1.0, move |_| metres);
-        let s = g.surface_y_blocking(5, 9).unwrap();
+        let s0 = g.surface_y_blocking(5, 9).unwrap();
+        let s = if s0 < g.sea_level() {
+            g.sea_level() - 1
+        } else {
+            s0
+        };
         let want = surface_block(&b);
         for step in [2, 8, 64] {
             let lo = s.div_euclid(step) * step;
@@ -995,16 +1020,10 @@ fn a_far_voxel_holding_the_surface_is_the_surface_block_of_each_kind_at_every_st
                     "lat {lat}, {metres} m, step {step}, y {y} (surface {s})"
                 );
             }
-            // Above it is air or water, below it ground, never the surface block's neighbour by accident.
+            // Above it is air, below it ground, never the surface block's neighbour by accident.
             let above = g.block_at_blocking(5, lo + step, 9, step);
-            assert_eq!(
-                above,
-                if s < 0 && lo + step < 0 {
-                    b.water
-                } else {
-                    b.air
-                }
-            );
+            // (A sea column's top water block is the last block under the sea level: above it is air.)
+            assert_eq!(above, b.air);
             let below = g.block_at_blocking(5, lo - step, 9, step);
             assert_ne!(below, b.air);
         }
@@ -1094,18 +1113,29 @@ fn the_spire_has_every_kind_of_top_and_a_far_node_over_it_agrees_with_the_blocks
     let mut kinds = std::collections::BTreeSet::new();
     for x in (-2000..2600).step_by(20) {
         let s = rig.surface(x, 0, 1);
-        kinds.insert(format!("{:?}", g.surface_kind(x, 0, s)));
+        let (top, kind) = g.surface_column(x, 0, s);
+        kinds.insert(if kind.is_water() {
+            "Water".to_string()
+        } else {
+            format!("{kind:?}")
+        });
+        assert_eq!(kind.is_water(), s < g.sea_level());
+        assert_eq!(
+            top,
+            if kind.is_water() {
+                g.sea_level() - 1
+            } else {
+                s
+            }
+        );
     }
     for k in [
-        SurfaceKind::Grass,
-        SurfaceKind::Alpine,
-        SurfaceKind::Snow,
-        SurfaceKind::Sand,
+        format!("{:?}", SurfaceKind::Grass),
+        format!("{:?}", SurfaceKind::Alpine),
+        format!("{:?}", SurfaceKind::Snow),
+        "Water".to_string(),
     ] {
-        assert!(
-            kinds.contains(&format!("{k:?}")),
-            "no {k:?} among {kinds:?}"
-        );
+        assert!(kinds.contains(&k), "no {k:?} among {kinds:?}");
     }
     // A far node's columns, read at once, give each voxel the block a point query gives.
     for level in [2u32, 4, 6] {
@@ -1126,7 +1156,10 @@ fn the_spire_has_every_kind_of_top_and_a_far_node_over_it_agrees_with_the_blocks
                     -side + (i >> 4) as i32 * step + step / 2,
                 );
                 let s = cols.surfaces[i];
-                assert_eq!(s, rig.surface(wx, wz, step));
+                let raw = rig.surface(wx, wz, step);
+                // The final surface of a sea column is its top water block.
+                let sea = rig.settings.sea_level_y;
+                assert_eq!(s, if raw < sea { sea - 1 } else { raw });
                 for lo in [
                     (s.div_euclid(step) - 1) * step,
                     s.div_euclid(step) * step,
@@ -1168,4 +1201,61 @@ fn a_far_node_that_lacks_tiles_says_which_and_they_can_be_requested_once() {
         rig.store.load(t).unwrap();
     }
     assert!(g.node_columns(3, 0, 0).is_ok());
+}
+
+#[test]
+fn a_water_column_is_water_down_to_its_bed_over_four_blocks_of_the_bed_material() {
+    use super::surface::SurfaceKind;
+    use super::water::Bed;
+    let rig = rig();
+    let (g, b) = (&rig.generator, rig.blocks);
+    // Top water block 10, three blocks of water: ground (the bed's top block) at 7.
+    for (bed, material) in [
+        (Bed::Sand, b.sand),
+        (Bed::Gravel, b.gravel),
+        (Bed::Mud, b.mud),
+        (Bed::Clay, b.clay),
+    ] {
+        let kind = SurfaceKind::Water { depth: 3, bed };
+        assert!(kind.is_water());
+        assert_eq!(kind.sink(), 3);
+        assert_eq!(g.block_for(11, 10, kind), b.air);
+        for y in 8..=10 {
+            assert_eq!(g.block_for(y, 10, kind), b.water, "{bed:?} at {y}");
+        }
+        for y in 4..=7 {
+            assert_eq!(g.block_for(y, 10, kind), material, "{bed:?} at {y}");
+        }
+        assert_eq!(g.block_for(3, 10, kind), b.stone);
+        // The far voxel holding the top water block is water, whatever the step.
+        assert_eq!(g.voxel_block(0, 16, 10, kind), b.water);
+    }
+    // A stone bed is stone from its top block down.
+    let kind = SurfaceKind::Water {
+        depth: 3,
+        bed: Bed::Stone,
+    };
+    assert_eq!(g.block_for(8, 10, kind), b.water);
+    assert_eq!(g.block_for(7, 10, kind), b.stone);
+    assert_eq!(g.block_for(6, 10, kind), b.stone);
+    assert!(!SurfaceKind::Marsh.is_water());
+}
+
+#[test]
+fn the_sea_column_tops_at_the_block_under_the_sea_level_over_a_bed_at_most_one_block_under_the_water()
+ {
+    use super::surface::SurfaceKind;
+    use super::water::Bed;
+    let sand = |depth| SurfaceKind::Water {
+        depth,
+        bed: Bed::Sand,
+    };
+    // Deep: the ground is the elevation surface.
+    assert_eq!(SurfaceKind::sea_column(-50, 0), (-1, sand(49)));
+    assert_eq!(SurfaceKind::sea_column(-3, 0), (-1, sand(2)));
+    // At the top of the sea (and above it, for a water class the DEM puts higher): at least one block of water.
+    assert_eq!(SurfaceKind::sea_column(-2, 0), (-1, sand(1)));
+    assert_eq!(SurfaceKind::sea_column(-1, 0), (-1, sand(1)));
+    assert_eq!(SurfaceKind::sea_column(62, 63), (62, sand(1)));
+    assert_eq!(SurfaceKind::sea_column(7, 63), (62, sand(55)));
 }

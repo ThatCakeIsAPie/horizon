@@ -281,17 +281,20 @@ fn with_land_cover_a_node_is_later_until_its_class_is_held_and_then_shows_the_cl
         }
     }
     let made = made.expect("the node was built once its data was held");
-    // The ground is a lake: the voxel holding each surface is water, not grass.
+    // The class shows: no grass. Every file says water, but this is a slope, and the water rules of
+    // `horizon_world`'s Earth generator keep a lake flat and never carve more than 32 blocks under the ground, so
+    // the slope's columns far over the lowest water are dry, with a sand shore; those near it are water.
     let o = key.origin();
-    let (mut water, mut grass) = (0, 0);
+    let (mut water, mut sand, mut grass) = (0, 0, 0);
     for i in 0..4096 {
         let v = made.at(i);
         water += usize::from(v.state.0 == blocks.water);
+        sand += usize::from(v.state.0 == blocks.sand);
         grass += usize::from(v.state.0 == blocks.grass_block);
     }
     assert!(
-        water > 0 && grass == 0,
-        "water {water}, grass {grass} in {o:?}"
+        water + sand > 0 && grass == 0,
+        "water {water}, sand {sand}, grass {grass} in {o:?}"
     );
     // Without land cover the same node over the same tiles shows grass.
     let mut off = settings.clone();

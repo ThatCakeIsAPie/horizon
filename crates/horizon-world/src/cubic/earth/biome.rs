@@ -612,6 +612,9 @@ pub fn variant_cell(lat: f64, lon: f64) -> bool {
     (h ^ (h >> 31)) % 1000 < VARIANT_SHARE
 }
 
+/// The elevation (m) a river channel's biome is read at, at least: water above the sea is a river.
+const RIVER_BIOME_MIN_M: f64 = 1.0;
+
 impl EarthGenerator {
     /// The biome of the 4 by 4 column `(qx, qz)` (block `x >> 2`), read at its middle: the class and the height
     /// at [`BIOME_SAMPLE_M`] of ground. Without land cover, `plains`.
@@ -661,6 +664,16 @@ impl EarthGenerator {
         let class = class?;
         let climate = climate?;
         let elevation = f64::from(height.ok_or(Gap::Missing)?);
+        // A river channel of the water atlas through the middle block is a river (frozen by the same rule as
+        // water above the sea), whatever the map says there.
+        let (class, elevation) = if self
+            .river_channel_at(qx.saturating_mul(4) + 2, qz.saturating_mul(4) + 2)
+            .is_some()
+        {
+            (LandClass::Water, elevation.max(RIVER_BIOME_MIN_M))
+        } else {
+            (class, elevation)
+        };
         let at = self.field.projection().to_lat_lon(x, z);
         if !self.climate_wanted() {
             return Ok(Biome::of(class, elevation, at.lat));

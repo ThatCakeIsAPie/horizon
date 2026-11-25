@@ -60,7 +60,8 @@ pub fn default_block_names() -> Vec<String> {
             names.push(format!("minecraft:{tree}_{part}"));
         }
     }
-    for n in ["snow", "ice"] {
+    // Clay, a bed of Earth's water (last, so the ids of the others stay).
+    for n in ["snow", "ice", "clay"] {
         let name = format!("minecraft:{n}");
         if !names.contains(&name) {
             names.push(name);
