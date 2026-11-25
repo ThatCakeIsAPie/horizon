@@ -529,6 +529,10 @@ fn ocean(t: f64, elevation_m: f64) -> Biome {
     }
 }
 
+/// The mean annual temperature (C) under which a climate is vanilla's frozen row: its biomes snow, and the snow
+/// pass freezes their still water ([`Biome::snows`]).
+pub const FROZEN_BELOW_C: f64 = 0.0;
+
 /// Vanilla's temperature rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Row {
@@ -554,7 +558,7 @@ fn humidity_index(r: f64) -> usize {
 }
 
 fn temperature_row(t: f64, hum: usize) -> Row {
-    if t < 0.0 {
+    if t < FROZEN_BELOW_C {
         Row::Frozen
     } else if t < 8.0 {
         Row::Cold
