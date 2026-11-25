@@ -227,7 +227,7 @@ The biome column below is the one without climate; with `climate` on see [Climat
 | shrubland | grass over three dirt | `savanna` under 35°, `plains`, `snowy_plains` from 66° |
 | grassland | grass over three dirt | `meadow` from 1,500 m, `savanna` under 20°, `plains`, `snowy_plains` from 66° |
 | cropland | grass over three dirt (farmland dries out without water, and nothing else fits) | `plains` |
-| built-up | the land around it (see "Built-up land" under Choices worth knowing below): never a class of its own once decoded, so it is whichever row above its nearest natural land is | that row's |
+| built-up | the land around it (see "Built-up land" under Choices worth knowing below): never a class of its own once decoded, so it is whichever row above the most common natural land around the town is | that row's |
 | bare | stone inside the 1,500 m alpine band under the snow line; else stone where steep (a neighbour 30 m away differs by 0.6 of the distance or more); else gravel from 50° latitude; else in a known wet climate basalt rock (70 % basalt, 14 % smooth basalt, 9 % tuff, 7 % blackstone, over stone); else sand | `stony_peaks` from 2,000 m, `desert` under 40°, else `windswept_gravelly_hills` |
 | water | the water rules (see Water): a lake, a river's wide bed, or the sea when at or under the sea level plus 3 m | `river` above sea level, `ocean` at or under it |
 | herbaceous wetland | one block of water at the surface block over mud; in a frozen climate (climate on, mean annual temperature under 0 C) grass over three dirt (tundra: its open water is mapped as water) | `swamp`; `snowy_plains` in a frozen climate |
@@ -241,9 +241,10 @@ Choices worth knowing:
   bare ground and the rest stay dry there (Death Valley, the Dead Sea shore, polders). With land cover on no box is
   proven all water from the heights, so deep sea costs per-column work like any other terrain.
 - **Built-up land** is natural land: as if no one ever lived there. Each decoded land-cover tile has its built-up
-  pixels (code 50) given the class of the nearest natural land (tree, shrub, grass, crop, bare, moss; 8-neighbour
-  steps through the town, within 64 pixels, the first in scan order on a tie); one beyond that takes the tile's most
-  common natural class, else grassland (`landcover::unbuild`, called as each tile is decoded in `landfield.rs`).
+  pixels (code 50) given, town by town (a patch of joined built-up pixels), the most common natural class (tree,
+  shrub, grass, crop, bare, moss) within 32 pixels around the town, so a town in a forest is forest with its trees,
+  not the lawns at its edge; a town with none around it takes the tile's most common natural class, else grassland
+  (`landcover::unbuild`, called as each tile is decoded in `landfield.rs`).
   Water, wetland, mangrove and snow never spread into a town: a town on a shore is dry ground. Every read (near
   ground, far view, biome, vegetation, water rules, far trees, the probe) gets its classes from those decoded tiles,
   so none of them ever sees a built-up class: the ground, biome and tree density of a town are those of the land

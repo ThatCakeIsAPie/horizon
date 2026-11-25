@@ -232,9 +232,9 @@ pub fn level_for(levels: &[Level], metres_per_sample: f64) -> usize {
         .unwrap_or(0)
 }
 
-/// How far, in pixels of the level read (8-neighbour steps), built-up land looks for the natural land whose
-/// class it takes ([`unbuild`]): 64 pixels is 640 m at full resolution.
-pub const NATURAL_REACH_PIXELS: usize = 64;
+/// How wide, in pixels of the level read (8-neighbour steps), the ring around a town is whose natural land
+/// it takes ([`unbuild`]): 32 pixels is 320 m at full resolution.
+pub const NATURAL_RING_PIXELS: usize = 32;
 
 impl LandClass {
     /// Whether this is land as nature left it, which built-up land takes the class of ([`unbuild`]): tree,
@@ -248,11 +248,12 @@ impl LandClass {
     }
 }
 
-/// The land as if no one ever lived there: every built-up pixel of a decoded tile (`pixels`, class codes,
-/// `width` by `height` row by row) takes the class of the nearest natural land pixel ([`LandClass::is_natural_land`])
-/// reached through built-up pixels within [`NATURAL_REACH_PIXELS`] (8-neighbour steps, the first reached in
-/// scan order on a tie); one beyond that takes the tile's most common natural class, and grassland when the
-/// tile has none. Each tile is done once, as it is decoded, so every read (near ground, far view, biome,
+/// The land as if no one ever lived there: each town of a decoded tile (`pixels`, class codes, `width` by
+/// `height` row by row; a town is a patch of built-up pixels joined 8-neighbour) takes, whole, the most common
+/// natural class ([`LandClass::is_natural_land`]) of the land within [`NATURAL_RING_PIXELS`] around it (the
+/// lower code on a tie). So a town in a forest is forest, with its trees, not the lawns and clearings at its
+/// edge. A town with no natural land in its ring takes the tile's most common natural class, and grassland when
+/// the tile has none. Each tile is done once, as it is decoded, so every read (near ground, far view, biome,
 /// vegetation) sees the same classes and no built-up class at all.
 pub fn unbuild(pixels: &mut [u8], width: usize, height: usize) {
     let built = LandClass::BuiltUp.code();
@@ -276,44 +277,68 @@ pub fn unbuild(pixels: &mut [u8], width: usize, height: usize) {
             }
         }
     };
-    let mut counts = [0_usize; 256];
-    let mut frontier = Vec::new();
-    for i in 0..n {
-        let code = pixels[i];
-        if !natural(code) {
+    let most = |counts: &[usize; 256]| {
+        (0..256)
+            .filter(|&c| counts[c] > 0)
+            .max_by_key(|&c| (counts[c], std::cmp::Reverse(c)))
+            .map(|c| c as u8)
+    };
+    let mut tile_counts = [0_usize; 256];
+    for &code in pixels.iter() {
+        if natural(code) {
+            tile_counts[usize::from(code)] += 1;
+        }
+    }
+    let fallback = most(&tile_counts).unwrap_or(LandClass::Grass.code());
+    // `seen[i]`: the town (counted from 1) that last reached pixel i, so each ring is walked once.
+    let mut seen = vec![0_u32; n];
+    let mut town = 0_u32;
+    let (mut patch, mut ring, mut next) = (Vec::new(), Vec::new(), Vec::new());
+    for start in 0..n {
+        if pixels[start] != built || seen[start] != 0 {
             continue;
         }
-        counts[usize::from(code)] += 1;
-        let mut next_to_town = false;
-        neighbours(i, &mut |j| next_to_town |= pixels[j] == built);
-        if next_to_town {
-            frontier.push(i);
-        }
-    }
-    for _ in 0..NATURAL_REACH_PIXELS {
-        let mut next = Vec::new();
-        for &i in &frontier {
-            let code = pixels[i];
-            neighbours(i, &mut |j| {
-                if pixels[j] == built {
-                    pixels[j] = code;
-                    next.push(j);
+        town += 1;
+        // The town: every built-up pixel joined to `start`.
+        patch.clear();
+        patch.push(start);
+        seen[start] = town;
+        let mut k = 0;
+        while k < patch.len() {
+            neighbours(patch[k], &mut |j| {
+                if pixels[j] == built && seen[j] != town {
+                    seen[j] = town;
+                    patch.push(j);
                 }
             });
+            k += 1;
         }
-        if next.is_empty() {
-            break;
+        // Its ring: the land within the reach, counted by class.
+        let mut counts = [0_usize; 256];
+        ring.clear();
+        ring.extend_from_slice(&patch);
+        for _ in 0..NATURAL_RING_PIXELS {
+            next.clear();
+            for &i in &ring {
+                neighbours(i, &mut |j| {
+                    if seen[j] != town {
+                        seen[j] = town;
+                        let code = pixels[j];
+                        if natural(code) {
+                            counts[usize::from(code)] += 1;
+                        }
+                        next.push(j);
+                    }
+                });
+            }
+            if next.is_empty() {
+                break;
+            }
+            std::mem::swap(&mut ring, &mut next);
         }
-        frontier = next;
-    }
-    // Beyond the reach: the land of the tile around the town.
-    let most = (0..256)
-        .filter(|&c| counts[c] > 0)
-        .max_by_key(|&c| (counts[c], std::cmp::Reverse(c)))
-        .map_or(LandClass::Grass.code(), |c| c as u8);
-    for p in pixels.iter_mut() {
-        if *p == built {
-            *p = most;
+        let class = most(&counts).unwrap_or(fallback);
+        for &i in &patch {
+            pixels[i] = class;
         }
     }
 }
@@ -524,29 +549,45 @@ mod tests {
     }
 
     #[test]
-    fn built_up_land_takes_the_class_of_the_nearest_natural_land() {
-        let (mut p, w, h) = tile(&["TTUUUUGG", "TTUUUUGG", "WWUUUUWW"]);
+    fn a_town_takes_the_most_common_natural_land_around_it() {
+        // A town in a forest, with lawns (grass) and a clearing (shrub) at its edge: forest, all of it.
+        let (mut p, w, h) = tile(&[
+            "TTTTTTTTTT",
+            "TTGUUUUSTT",
+            "TTGUUUUSTT",
+            "TTTTTTTTTT",
+            "WWWWWWWWWW",
+        ]);
         unbuild(&mut p, w, h);
-        let (want, _, _) = tile(&["TTTTGGGG", "TTTTGGGG", "WWTTGGWW"]);
+        let (want, _, _) = tile(&[
+            "TTTTTTTTTT",
+            "TTGTTTTSTT",
+            "TTGTTTTSTT",
+            "TTTTTTTTTT",
+            "WWWWWWWWWW",
+        ]);
         assert_eq!(p, want);
-        // Water never spreads into a town, and no built-up class is left.
+        // Water never counts, and no built-up class is left.
         assert!(!p.contains(&LandClass::BuiltUp.code()));
+        // Two towns apart each take their own surroundings.
+        let sea = "W".repeat(2 * NATURAL_RING_PIXELS);
+        let (mut p, w, h) = tile(&[&format!("BBUBB{sea}GGUGG")]);
+        unbuild(&mut p, w, h);
+        let (want, _, _) = tile(&[&format!("BBBBB{sea}GGGGG")]);
+        assert_eq!(p, want);
     }
 
     #[test]
-    fn built_up_land_out_of_reach_is_the_tiles_most_common_natural_land_else_grass() {
-        // A town on a shore wider than twice the reach: two forest pixels at one end, three bare at the other.
-        let w = 2 * NATURAL_REACH_PIXELS + 10;
-        let mut row = vec!['U'; w];
-        row[..2].fill('T');
+    fn a_town_with_no_natural_land_around_it_is_the_tiles_most_common_else_grass() {
+        // A town on an island far out at sea: the tile's land (bare) beyond its ring.
+        let w = 2 * NATURAL_RING_PIXELS + 10;
+        let mut row = vec!['W'; w];
+        row[0] = 'U';
         row[w - 3..].fill('B');
         let line: String = row.iter().collect();
-        let (mut p, w, h) = tile(&[&line, &"W".repeat(w)]);
+        let (mut p, w, h) = tile(&[&line]);
         unbuild(&mut p, w, h);
-        let (tree, bare) = (LandClass::Tree.code(), LandClass::Bare.code());
-        // Forest reaches its 64 pixels; past that the middle is the tile's most common natural land (bare).
-        assert!(p[..2 + NATURAL_REACH_PIXELS].iter().all(|&c| c == tree));
-        assert!(p[2 + NATURAL_REACH_PIXELS..w].iter().all(|&c| c == bare));
+        assert_eq!(p[0], LandClass::Bare.code());
         // Only water and town: grassland.
         let (mut p, w, h) = tile(&["WUU", "UUW"]);
         unbuild(&mut p, w, h);

@@ -1376,17 +1376,10 @@ pub fn plan_far(input: &PlanInput) -> Plan {
         };
         match loaded_state(node, center, loaded, is_loaded) {
             Loaded::All => Fate::Out,
-            Loaded::Some if may_split(node) => split(true),
-            // Over near cubes and not drawn yet: drawn whole first, then split
-            // a level a plan, so the part over the near ground goes a level at
-            // a time instead of once the whole edge is in.
-            Loaded::Some => match class(node) {
-                NodeClass::Air => Fate::Pruned,
-                _ => {
-                    held.set(held.get() + 1);
-                    Fate::Leaf(distance, node)
-                }
-            },
+            // Over near cubes: split at once, drawn or not, so no far node is
+            // ever drawn over near ground (the one-level steps are for the
+            // far land only).
+            Loaded::Some => split(true),
             Loaded::None => match class(node) {
                 NodeClass::Air => Fate::Pruned,
                 // Rock reaching under a tile: the tile's skirts close it.
@@ -1469,13 +1462,6 @@ pub fn plan_far(input: &PlanInput) -> Plan {
     out.leaves = leaves.into_iter().map(|(_, node)| node).collect();
     out.held = held.get();
     out
-}
-
-/// How a planned node ranks in the queue: its distance over its size, so
-/// the nodes biggest on screen (whose voxels are furthest over the target,
-/// as a level's nodes share a voxel size) are made first.
-pub fn screen_order(camera: [f64; 3], key: CubeKey) -> f64 {
-    key.distance(camera) / f64::from(key.size())
 }
 
 enum Loaded {
@@ -2288,7 +2274,9 @@ struct PlanJob {
     /// level at a time ([`PlanInput::refined`]).
     drawn: Vec<CubeKey>,
     /// Refine one level at a time from the coverage layer down (the
-    /// `HORIZON_FAR_STEP` knob, on unless 0); off: straight to the target.
+    /// `HORIZON_FAR_STEP=1` knob, off by default: in play, after a flight it
+    /// left coarse nodes round the player for 20 s and more, where going
+    /// straight to the target, nearest first, refined them in a few seconds).
     step: bool,
     /// Plan surface tiles at the coarse levels.
     surface: Option<SurfaceJob>,
@@ -2478,10 +2466,6 @@ fn make_plan(
             .iter()
             .map(|&k| (sector(job.camera, k), k))
             .collect();
-        // Biggest on screen first, so the whole view sharpens evenly.
-        done.order.sort_by(|a, b| {
-            screen_order(job.camera, a.1).total_cmp(&screen_order(job.camera, b.1))
-        });
         done.tree = plan.leaves.iter().map(|&k| (tree_order(k), k)).collect();
         done.tree.sort_unstable();
         done.footprints = plan
@@ -3364,7 +3348,7 @@ impl CubeLod {
                         .chain(self.failed.keys())
                         .copied()
                         .collect(),
-                    step: far_knob("HORIZON_FAR_STEP", 1) != 0,
+                    step: far_knob("HORIZON_FAR_STEP", 0) != 0,
                     surface: self.tiles.on.then(|| SurfaceJob {
                         info: self.tiles.info.clone(),
                         sea_level: self.tiles.sea_level,
@@ -3682,7 +3666,7 @@ impl CubeLod {
     /// The order a short list is queued in: by sector rank, then distance.
     fn priority(&self, rank: &[u8; SECTORS], key: &CubeKey) -> f64 {
         f64::from(rank[usize::from(sector(self.camera, *key))]) * 1e9
-            + screen_order(self.camera, *key).min(9e8)
+            + key.distance(self.camera).min(9e8)
     }
 
     /// The planned nodes among `keys` with nothing drawn over their place:
@@ -5573,20 +5557,37 @@ mod tests {
     fn the_far_view_refines_one_level_at_a_time_down_to_the_target() {
         let camera = [100.5, 64.5, -40.5];
         let nowhere = |_: SectionPos| false;
+        // Whether a node's box takes in the near box: those split at once,
+        // the steps are for the land beyond.
+        let c = cube_of(camera);
+        let over_near = |k: CubeKey| {
+            let side = 1_i32 << k.level;
+            let o = [k.x, k.y, k.z].map(|v| v * side);
+            let (h, v) = (BOX.horizontal, BOX.vertical);
+            o[0] <= c.x + h
+                && c.x - h < o[0] + side
+                && o[1] <= c.y + v
+                && c.y - v < o[1] + side
+                && o[2] <= c.z + h
+                && c.z - h < o[2] + side
+        };
         let target: FxHashSet<CubeKey> = stepped(camera, None, &nowhere).into_iter().collect();
-        // Nothing drawn: the roots only.
+        // Nothing drawn: roots, and beside the near box the children of the
+        // nodes split around it.
         let mut drawn = stepped(camera, Some(&[]), &nowhere);
         let roots = root_nodes(camera, 3000.0);
-        assert!(drawn.iter().all(|k| roots.contains(k)), "{drawn:?}");
+        for k in &drawn {
+            assert!(roots.contains(k) || over_near(k.parent()), "{k:?}");
+        }
         let mut steps = 0;
         loop {
             let next = stepped(camera, Some(&drawn), &nowhere);
             assert_disjoint(&next);
             let before: FxHashSet<CubeKey> = drawn.iter().copied().collect();
             // Each new node is a drawn node's child, never a grandchild.
-            for k in &next {
+            for k in next.iter().filter(|k| !before.contains(k)) {
                 assert!(
-                    before.contains(k) || before.contains(&k.parent()),
+                    before.contains(&k.parent()) || over_near(k.parent()),
                     "{k:?} skips a level"
                 );
             }
@@ -5603,38 +5604,27 @@ mod tests {
     }
 
     #[test]
-    fn a_node_over_near_cubes_stays_until_drawn_then_splits_a_level() {
+    fn no_far_node_is_drawn_over_near_cubes_even_while_stepping() {
         let camera = [8.5, 64.5, 8.5];
         let loaded = near(camera);
-        let node = CubeKey::containing(4, cube_of(camera));
-        // Not drawn: kept whole over the near cubes, no hole where they are not.
-        let held = stepped(camera, Some(&[node.parent()]), &loaded);
-        assert!(held.contains(&node), "{held:?}");
-        // Drawn: replaced by its children, those all over near cubes left out.
-        let next = stepped(camera, Some(&[node]), &loaded);
-        assert!(!next.contains(&node));
-        for child in node.children() {
-            let all = (0..8)
-                .flat_map(|y| (0..8).flat_map(move |z| (0..8).map(move |x| (x, y, z))))
-                .all(|(x, y, z)| {
-                    let o = child.origin();
-                    loaded(SectionPos::new(
-                        (o[0] >> 4) + x,
-                        (o[1] >> 4) + y,
-                        (o[2] >> 4) + z,
-                    ))
-                });
-            assert_eq!(next.contains(&child), !all, "{child:?}");
+        // Nothing drawn yet: the far land waits a level, the ground by the
+        // near cubes does not.
+        for leaf in stepped(camera, Some(&[]), &loaded) {
+            let o = leaf.origin();
+            let side = 1_i32 << leaf.level;
+            let holds = (0..side).any(|y| {
+                (0..side).any(|z| {
+                    (0..side).any(|x| {
+                        loaded(SectionPos::new(
+                            (o[0] >> 4) + x,
+                            (o[1] >> 4) + y,
+                            (o[2] >> 4) + z,
+                        ))
+                    })
+                })
+            });
+            assert!(!holds, "{leaf:?} is over near cubes");
         }
-    }
-
-    #[test]
-    fn the_queue_takes_the_biggest_on_screen_first() {
-        let camera = [0.5, 64.5, 0.5];
-        // Twice as far, eight times bigger: four times bigger on screen.
-        let big = CubeKey::containing(3, SectionPos::new(64, 4, 0));
-        let small = CubeKey::containing(0, SectionPos::new(32, 4, 0));
-        assert!(screen_order(camera, big) < screen_order(camera, small));
     }
 
     #[test]
