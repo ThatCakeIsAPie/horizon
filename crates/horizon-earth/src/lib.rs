@@ -15,6 +15,10 @@
 //! and the field, [`climatesource`] the fetcher trait. A place gets the temperature in degrees Celsius and the
 //! precipitation in millimetres a year, the bilinear mix of the four nearest pixels, land and sea alike.
 //!
+//! Water (rivers and lakes) is a small preprocessed atlas shipped inside the game ([`water`], format in
+//! [`waterfile`]): river lines with discharge and water levels from RiverATLAS, lake boxes and levels from
+//! HydroLAKES, decoded one 1-degree cell at a time on first use.
+//!
 //! Missing data is never invented: every query that needs a tile the store does not hold says so with `None`.
 #![forbid(unsafe_code)]
 
@@ -33,6 +37,7 @@ pub mod testing;
 pub mod tiff;
 pub mod tile;
 pub mod water;
+pub mod waterfile;
 
 pub use climate::{CLIMATE_RULES, Climate, ClimateVar};
 pub use climatefield::{ClimateFetch, ClimateField, ClimateGrid, ClimateLookup, ClimateStore};
@@ -44,4 +49,4 @@ pub use landsource::{LandCoverFetcher, LandCoverSource};
 pub use projection::{LatLon, LocalTangent, Projection, VerticalMap};
 pub use source::{FetchError, LoadError, SEA_FLOOR_M, TileFetcher, TileStore};
 pub use tile::{Tile, TileError, TileId};
-pub use water::{Lake, RiverReach, WATER_RULES, WaterAtlas};
+pub use water::{Lake, RiverReach, WATER_RULES, WaterAtlas, WaterAtlasError};

@@ -51,6 +51,10 @@ const ATTRIBUTION: &str = include_str!("earth/attribution.txt");
 /// is, in English.
 const LAND_ATTRIBUTION: &str = include_str!("earth/land_attribution.txt");
 
+/// The river network's origin, HydroSHEDS v1, in its publisher's words (HydroSHEDS Technical Documentation v1.4,
+/// Exhibit B): shown as it is, in English. The rivers and lakes ship with the game (RiverATLAS and HydroLAKES).
+const WATER_ATTRIBUTION: &str = include_str!("earth/water_attribution.txt");
+
 /// What the page knows of the player and the game, apart from the world.
 #[derive(Clone, Debug)]
 pub(super) struct Context {
@@ -542,6 +546,18 @@ fn credits_page(b: &mut Builder) {
     for line in wrap(&tr("horizon.cubic.earth.credits.land_licence"), LINE) {
         b.note(line);
     }
+    b.heading(tr("horizon.cubic.earth.credits.water_source"));
+    for key in [
+        "horizon.cubic.earth.credits.water_about",
+        "horizon.cubic.earth.credits.water_cite",
+    ] {
+        for line in wrap(&tr(key), LINE) {
+            b.note(line);
+        }
+    }
+    for line in wrap(WATER_ATTRIBUTION.trim(), LINE) {
+        b.note(line);
+    }
     b.heading(tr("horizon.cubic.earth.credits.climate_source"));
     for key in [
         "horizon.cubic.earth.credits.climate_about",
@@ -565,6 +581,11 @@ pub(super) fn attribution() -> &'static str {
 #[cfg(test)]
 pub(super) fn land_attribution() -> &'static str {
     LAND_ATTRIBUTION
+}
+
+#[cfg(test)]
+pub(super) fn water_attribution() -> &'static str {
+    WATER_ATTRIBUTION
 }
 
 #[cfg(test)]

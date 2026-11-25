@@ -3961,6 +3961,21 @@ mod tests {
     }
 
     #[test]
+    fn the_river_and_lake_credits_are_on_the_credits_view() {
+        let mut s = earth_with_land(crate::earth_consent::Approved::of(&[]));
+        press_button(&mut s, "horizon.cubic.earth.credits.open");
+        let squeeze = |t: &str| t.split_whitespace().collect::<String>();
+        let shown = squeeze(&earth_lines(&s).join(""));
+        assert!(
+            shown.contains(&squeeze(earth::water_attribution())),
+            "{shown}"
+        );
+        for name in ["RiverATLAS", "HydroLAKES", "CCBY4.0", "Linke", "Messager"] {
+            assert!(shown.contains(name), "{name}: {shown}");
+        }
+    }
+
+    #[test]
     fn the_credits_are_one_press_away_say_who_made_the_data_and_close_with_escape() {
         let mut s = earth_with(crate::earth_consent::Approved::of(&[]), None);
         let short = english(|| {
