@@ -15,7 +15,9 @@
 //! Only levels 1 to [`MAX_CACHED_LEVEL`] are stored: a level 0 node is the saved
 //! cube itself. When a cube is saved again the owner of the save calls
 //! [`CubeLodCache::invalidate`], which erases every stored node over it.
-use super::cube::{Changes, CoverMask, CubeKey, CubeNode, MAX_CUBE_LEVEL, VOLUME, Voxel};
+use super::cube::{
+    Changes, CoverMask, CubeKey, CubeNode, FluidTops, MAX_CUBE_LEVEL, NO_FLUID_TOP, VOLUME, Voxel,
+};
 use crate::fast_hash::FxHashMap;
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use horizon_core::position::SectionPos;
@@ -30,7 +32,7 @@ use std::{
 
 /// The coarsest level kept on disk (nodes 4,096 blocks wide).
 pub const MAX_CACHED_LEVEL: u8 = 8;
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const FINGERPRINT: &str = "fingerprint.txt";
 /// Nodes along one side of a bucket file.
 const BUCKET: i32 = 8;
@@ -388,10 +390,20 @@ fn encode(node: &CubeNode) -> Vec<u8> {
     let mut out = Vec::new();
     let uniform = node.as_uniform();
     let cover = node.covered_mask();
-    out.push(u8::from(uniform.is_some()) | u8::from(cover.is_some()) << 1);
+    let tops = node.fluid_tops();
+    out.push(
+        u8::from(uniform.is_some())
+            | u8::from(cover.is_some()) << 1
+            | u8::from(tops.is_some()) << 2,
+    );
     if let Some(mask) = cover {
         for word in mask {
             out.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+    if let Some(tops) = tops {
+        for h in tops {
+            out.extend_from_slice(&h.to_le_bytes());
         }
     }
     match uniform {
@@ -427,6 +439,16 @@ fn decode(key: CubeKey, body: &[u8]) -> Option<CubeNode> {
         cover = Some(Box::new(mask));
         rest = tail;
     }
+    let mut tops = None;
+    if flags & 4 != 0 {
+        let mut heights: FluidTops = [NO_FLUID_TOP; 256];
+        let (bytes, tail) = rest.split_at_checked(512)?;
+        for (h, pair) in heights.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *h = u16::from_le_bytes(*pair);
+        }
+        tops = Some(Box::new(heights));
+        rest = tail;
+    }
     let node = if flags & 1 != 0 {
         let state = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?);
         let biome = u16::from_le_bytes(rest.get(4..6)?.try_into().ok()?);
@@ -458,7 +480,7 @@ fn decode(key: CubeKey, body: &[u8]) -> Option<CubeNode> {
         }
         CubeNode::from_dense(key, dense)
     };
-    Some(node.with_covered(cover))
+    Some(node.with_covered(cover).with_fluid_tops(tops))
 }
 
 #[cfg(test)]
@@ -480,6 +502,7 @@ mod tests {
     fn same(a: &CubeNode, b: &CubeNode) {
         assert_eq!(a.key, b.key);
         assert_eq!(a.covered_mask(), b.covered_mask());
+        assert_eq!(a.fluid_tops(), b.fluid_tops());
         for i in 0..VOLUME {
             assert_eq!(a.at(i), b.at(i), "voxel {i}");
         }
@@ -492,7 +515,11 @@ mod tests {
         let uniform_key = CubeKey::new(3, 0, -1, 0);
         let mut mask = Box::new([0u64; 4]);
         mask[1] = 0xdead_beef;
-        let node = dense(key, 1).with_covered(Some(mask));
+        let mut tops = Box::new([NO_FLUID_TOP; 256]);
+        tops[17] = 4096;
+        let node = dense(key, 1)
+            .with_covered(Some(mask))
+            .with_fluid_tops(Some(tops));
         let uniform = CubeNode::uniform(
             uniform_key,
             Voxel {
