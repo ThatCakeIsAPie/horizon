@@ -33,6 +33,9 @@ fn real_places_get_the_biomes_they_look_like() {
     assert_eq!(of(LandClass::Tree, 300.0, 50.0, c(2.0, 600.0)), Taiga);
     // Pacific Northwest rainforest: mild and very wet is old growth spruce.
     assert_eq!(of(LandClass::Tree, 200.0, 47.9, c(10.0, 2500.0)), OldGrowthSpruceTaiga);
+    // A wet tropical highland (Costa Rica's cloud forest, 17 C) is jungle, a drier one forest: never spruce.
+    assert_eq!(of(LandClass::Tree, 1500.0, 10.3, c(17.0, 3000.0)), Jungle);
+    assert_eq!(of(LandClass::Tree, 1500.0, -10.0, c(16.0, 500.0)), Forest);
     // A temperate wood of middling rain is a plain forest; wetter is birch, wetter again dark forest.
     assert_eq!(of(LandClass::Tree, 200.0, 48.0, c(10.0, 600.0)), Forest);
     assert_eq!(of(LandClass::Tree, 200.0, 48.0, c(10.0, 1000.0)), BirchForest);

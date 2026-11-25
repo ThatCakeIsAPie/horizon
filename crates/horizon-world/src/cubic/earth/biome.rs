@@ -44,7 +44,7 @@
 //!
 //! | Class | Fits | Otherwise |
 //! |---|---|---|
-//! | tree | the forests, taigas and jungles, wooded badlands; savanna when warm or hot; always snowy taiga when frozen | frozen snowy taiga, cold taiga, temperate forest, warm jungle (humidity 3+) or savanna, hot savanna; temperate with `r` of 6 or more: old growth spruce taiga (temperate rainforest) |
+//! | tree | the forests, taigas and jungles, wooded badlands; savanna when warm or hot; always snowy taiga when frozen | frozen snowy taiga, cold taiga, temperate forest, warm jungle (humidity 3+) or savanna, hot savanna; temperate with `r` of 6 or more: old growth spruce taiga (temperate rainforest); temperate within the tropics (latitude under 23.44): jungle at humidity 3+, else forest (tropical highland forest) |
 //! | grass, no data on land | plains, sunflower plains, snowy plains, savanna, savanna plateau, meadow | frozen snowy plains, cold and temperate plains (meadow from 1,500 m), warm and hot savanna |
 //! | shrub | as grass, and desert | as grass, but desert when humidity is 0 and the row is temperate or warmer (dry places: see below) |
 //! | crop | plains, sunflower plains | frozen snowy plains, warm and hot savanna, else plains |
@@ -90,7 +90,10 @@ use crate::worldgen::biome::BiomeId;
 pub const BIOME_SAMPLE_M: f64 = 500.0;
 
 /// The version of the climate biome rules above; in the terrain key while climate is on.
-pub const CLIMATE_BIOME_RULES: u32 = 2;
+pub const CLIMATE_BIOME_RULES: u32 = 3;
+
+/// Latitude (degrees) under which a temperate-row forest is a tropical highland one ([`Biome::with_relief`]).
+pub const TROPICS_LATITUDE: f64 = 23.44;
 
 /// The ground size, in metres, of the cells a vanilla variant biome is chosen in.
 const VARIANT_CELL_M: f64 = 2000.0;
@@ -423,6 +426,11 @@ impl Biome {
                 }
             }
             LandClass::Tree => {
+                // Tropical highlands are temperate by their yearly mean but have no winter: their forests are
+                // broadleaf cloud forest (jungle where wet), never spruce.
+                if row == Row::Temperate && latitude.abs() < TROPICS_LATITUDE {
+                    return if hum >= 3 { Jungle } else { Forest };
+                }
                 if row == Row::Temperate && r >= 6.0 {
                     return OldGrowthSpruceTaiga;
                 }
