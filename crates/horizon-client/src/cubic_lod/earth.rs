@@ -9,11 +9,16 @@
 //!    for each height from them ([`EarthGenerator::far_voxel`]);
 //! 3. its sky cover from the same surfaces ([`cover`]).
 //!
+//! With trees on (the world's vegetation) the nodes also get trees and, with snow on, snow and ice
+//! ([`horizon_world::cubic::earth::far_trees`]); they read the class and the biome of their columns, which are
+//! "later" like a tile when missing. A node is air only from the height trees reach ([`class`]).
+//!
 //! When a tile is missing each of these says so instead of inventing a height. The sampler then asks the
 //! generator to have the tile fetched ([`EarthGenerator::request_tiles`], taken by the prefetcher) and answers
 //! "later" (`None`); a node is never built, drawn or kept without its data.
 
 use super::*;
+use horizon_world::cubic::earth::far_trees::FarDecor;
 use horizon_world::cubic::earth::{EarthGenerator, Fill, NotReady};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -46,13 +51,23 @@ fn log_stats() {
     );
 }
 
-/// The class of node `key` from the elevation bounds alone: air and water are pruned, stone is a closed shell, the
-/// rest is unknown. Levels below 2 are made from cubes and are always unknown.
-pub(super) fn class(earth: &EarthGenerator, key: CubeKey) -> Result<NodeClass, NotReady> {
+/// The class of node `key` from the elevation bounds alone (and, with trees, the height they reach): air and
+/// water are pruned, stone is a closed shell, the rest is unknown. Levels below 2 are made from cubes and are always unknown.
+pub(super) fn class(
+    earth: &EarthGenerator,
+    key: CubeKey,
+    decor: FarDecor,
+) -> Result<NodeClass, NotReady> {
     if key.level < 2 {
         return Ok(NodeClass::Mixed);
     }
-    let class = match earth.classify_node(u32::from(key.level), key.x, key.y, key.z)? {
+    // With trees, air is only proven from the height they reach.
+    let fill = if decor.trees {
+        earth.classify_node_above(u32::from(key.level), key.x, key.y, key.z)
+    } else {
+        earth.classify_node(u32::from(key.level), key.x, key.y, key.z)
+    };
+    let class = match fill? {
         Fill::Air | Fill::Water => NodeClass::Air,
         Fill::Stone => NodeClass::Rock,
         Fill::Mixed => NodeClass::Mixed,
@@ -100,14 +115,15 @@ pub(super) fn cover(
     Ok(Some(mask))
 }
 
-/// Node `key` (without its sky cover) as the generator makes it. `biome` is the biome id of a block column;
-/// `kind` how downsampling counts a state.
+/// Node `key` (without its sky cover) as the generator makes it, with the trees and snow `decor` asks for.
+/// `biome` is the biome id of a block column; `kind` how downsampling counts a state.
 pub(super) fn node(
     earth: &EarthGenerator,
     key: CubeKey,
     air: u32,
     biome: &dyn Fn(i32, i32) -> u16,
     kind: &dyn Fn(BlockStateId) -> Kind,
+    decor: FarDecor,
 ) -> Result<CubeNode, NotReady> {
     let origin = key.origin();
     // With land cover the biomes read the map at a coarse level: have them before building, never wait for them.
@@ -135,7 +151,12 @@ pub(super) fn node(
         0 => {
             let mut blocks = Box::new([0u32; 4096]);
             let pos = SectionPos::new(key.x, key.y, key.z);
-            if let Some(id) = earth.generate(pos, &mut blocks)? {
+            let mut whole = earth.generate(pos, &mut blocks)?;
+            // Trees (and snow) can stand in a cube of sky or of one block.
+            if earth.decorate_cube(pos, &mut blocks, decor)? {
+                whole = None;
+            }
+            if let Some(id) = whole {
                 BUILT[0].fetch_add(1, Relaxed);
                 return Ok(uniform(id));
             }
@@ -152,20 +173,24 @@ pub(super) fn node(
             // Eight exact cubes, downsampled: a node this near is made as the saved ones are.
             let mut nodes = Vec::with_capacity(8);
             for child in key.children() {
-                nodes.push(node(earth, child, air, biome, kind)?);
+                nodes.push(node(earth, child, air, biome, kind, decor)?);
             }
             let refs: [&CubeNode; 8] = std::array::from_fn(|i| &nodes[i]);
             Ok(downsample(refs, BlockStateId(air), kind))
         }
         level => {
-            if let Some(id) =
-                earth.fill_block(earth.classify_node(u32::from(level), key.x, key.y, key.z)?)
-            {
+            let fill = if decor.trees {
+                earth.classify_node_above(u32::from(level), key.x, key.y, key.z)?
+            } else {
+                earth.classify_node(u32::from(level), key.x, key.y, key.z)?
+            };
+            if let Some(id) = earth.fill_block(fill) {
                 BUILT[0].fetch_add(1, Relaxed);
                 return Ok(uniform(id));
             }
             BUILT[1].fetch_add(1, Relaxed);
-            let cols = earth.node_columns(u32::from(level), key.x, key.z)?;
+            let mut cols = earth.node_columns(u32::from(level), key.x, key.z)?;
+            earth.decorate_columns(&mut cols, decor)?;
             let step = 1i32 << level;
             let biomes: Vec<u16> = (0..256)
                 .map(|i| {
@@ -207,13 +232,26 @@ impl CubicLodSampler {
         }
     }
 
+    /// What the far view draws over the terrain: trees where the world has vegetation (it has land cover then),
+    /// snow where it also has snow. The settings in force, not the ones asked for (see `Generation`).
+    fn far_decor(&self) -> FarDecor {
+        let Some(parts) = &self.wg.earth else {
+            return FarDecor::default();
+        };
+        let trees = parts.settings.land_cover && parts.settings.vegetation;
+        FarDecor {
+            trees,
+            snow: trees && parts.settings.snow,
+        }
+    }
+
     /// Node `key` of an Earth world without its sky cover; `None` (later) while a tile it reads is missing.
     pub(super) fn earth_plain(&mut self, key: CubeKey) -> Option<CubeNode> {
         let generator = self.wg.generator.clone();
         let earth = generator.earth_generator()?;
         let level = self.level.clone();
         let biome = |x: i32, z: i32| level.biome_id_at(x, z);
-        let made = node(earth, key, self.air, &biome, &|s| self.kind(s));
+        let made = node(earth, key, self.air, &biome, &|s| self.kind(s), self.far_decor());
         log_stats();
         self.or_request(made)
     }
@@ -234,7 +272,7 @@ impl CubicLodSampler {
     pub(super) fn earth_class(&self, key: CubeKey) -> Option<NodeClass> {
         let generator = self.wg.generator.clone();
         let earth = generator.earth_generator()?;
-        self.or_request(class(earth, key))
+        self.or_request(class(earth, key, self.far_decor()))
     }
 }
 

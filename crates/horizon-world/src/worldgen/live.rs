@@ -40,6 +40,8 @@ pub struct LiveFeatures {
     bone_meal: Vec<Vec<String>>,
     /// Temperature settings per biome (`Biome.getTemperature`).
     temperatures: Vec<super::biome_temperature::BiomeTemperatureSettings>,
+    /// The block sets freezing and snowing look at, built when first asked.
+    weather: OnceLock<Option<super::biome_weather::BiomeWeatherBindings>>,
 }
 
 fn resource(message: impl Into<String>) -> GeneratorError {
@@ -219,7 +221,14 @@ impl LiveFeatures {
             provider_ids: OnceLock::new(),
             configured_tags: OnceLock::new(),
             bone_meal,
+            weather: OnceLock::new(),
         }))
+    }
+    /// The block sets of `Biome.shouldFreeze` / `shouldSnow`; `None` when the bundle lacks them.
+    pub(crate) fn weather(&self) -> Option<&super::biome_weather::BiomeWeatherBindings> {
+        self.weather
+            .get_or_init(|| super::biome_weather::BiomeWeatherBindings::new(&self.bindings).ok())
+            .as_ref()
     }
     pub fn data(&self) -> &Arc<GeneratorData> {
         &self.data

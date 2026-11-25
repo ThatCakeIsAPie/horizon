@@ -73,7 +73,7 @@ fn the_classifier_prunes_sky_and_deep_rock_and_never_a_node_with_surface_in_it()
                 rig.load(level, x, z);
                 for y in -8_000 / side - 2..=9_000 / side + 2 {
                     let key = CubeKey::new(level as u8, x, y, z);
-                    let class = class(g, key).unwrap();
+                    let class = class(g, key, FarDecor::default()).unwrap();
                     // The column surfaces at the voxels' middles, and every voxel as the generator gives it.
                     let o = key.origin();
                     let mut surface_inside = false;
@@ -114,7 +114,7 @@ fn the_classifier_prunes_sky_and_deep_rock_and_never_a_node_with_surface_in_it()
     assert!(air > 50 && rock > 50 && mixed > 20, "{air} {rock} {mixed}");
     // The levels made of cubes are never classified.
     assert_eq!(
-        class(g, CubeKey::new(1, 0, 200, 0)).unwrap(),
+        class(g, CubeKey::new(1, 0, 200, 0), FarDecor::default()).unwrap(),
         NodeClass::Mixed
     );
 }
@@ -137,7 +137,7 @@ fn a_node_is_what_the_generator_gives_voxel_by_voxel_and_its_cover_is_ground_ove
             .unwrap();
         for y in s_mid.div_euclid(side) - 2..=s_mid.div_euclid(side) + 3 {
             let key = CubeKey::new(level, x, y, 0);
-            let made = node(g, key, AIR, &biome, &kind).unwrap();
+            let made = node(g, key, AIR, &biome, &kind, FarDecor::default()).unwrap();
             let o = key.origin();
             for i in (0..4096).step_by(5) {
                 let (vx, vy, vz) = ((i & 15) as i32, (i >> 8) as i32, (i >> 4 & 15) as i32);
@@ -187,9 +187,9 @@ fn a_node_whose_tile_is_missing_is_not_ready_and_names_the_tile() {
         CubeKey::new(1, 3, 0, 3),
         CubeKey::new(4, 2, 1, -1),
     ] {
-        let missing = node(g, key, AIR, &biome, &kind).unwrap_err();
+        let missing = node(g, key, AIR, &biome, &kind, FarDecor::default()).unwrap_err();
         assert!(!missing.tiles.is_empty(), "{key:?}");
-        assert!(class(g, key).is_ok() || key.level >= 2);
+        assert!(class(g, key, FarDecor::default()).is_ok() || key.level >= 2);
         let missing = cover(g, key).err();
         assert!(missing.is_some() || key.level > COVER_LEVEL);
     }
@@ -246,7 +246,7 @@ fn with_land_cover_a_node_is_later_until_its_class_is_held_and_then_shows_the_cl
     let key = CubeKey::new(level, x, s_mid(&g).div_euclid(side), 0);
     // The biomes read a coarse elevation zoom of their own: have those tiles too, so that only land cover lacks.
     let err = loop {
-        match node(&g, key, AIR, &biome, &kind) {
+        match node(&g, key, AIR, &biome, &kind, FarDecor::default()) {
             Err(e) if !e.tiles.is_empty() => {
                 for t in e.tiles {
                     store.load(t).unwrap();
@@ -267,7 +267,7 @@ fn with_land_cover_a_node_is_later_until_its_class_is_held_and_then_shows_the_cl
         for fetch in asked.drain(..) {
             source.satisfy(&fetch).unwrap();
         }
-        match node(&g, key, AIR, &biome, &kind) {
+        match node(&g, key, AIR, &biome, &kind, FarDecor::default()) {
             Ok(n) => {
                 made = Some(n);
                 break;
@@ -297,7 +297,7 @@ fn with_land_cover_a_node_is_later_until_its_class_is_held_and_then_shows_the_cl
     let mut off = settings.clone();
     off.land_cover = false;
     let plain = EarthGenerator::new(&off, store.clone(), blocks).unwrap();
-    let plain_node = node(&plain, key, AIR, &biome, &kind).unwrap();
+    let plain_node = node(&plain, key, AIR, &biome, &kind, FarDecor::default()).unwrap();
     assert!((0..4096).any(|i| plain_node.at(i).state.0 == blocks.grass_block));
     // The sky cover reads heights only: it is ready without any land cover.
     let fresh = EarthGenerator::new(&settings, store.clone(), blocks)
@@ -463,4 +463,125 @@ fn the_samplers_classification_prunes_sky_and_rock_through_the_trait() {
     assert_eq!(e.sampler.classify_ready(rock), Some(NodeClass::Rock));
     // The coast is somewhere in the node at the origin's height.
     assert_eq!(e.sampler.classify_ready(ground), Some(NodeClass::Mixed));
+}
+
+/// The far view with trees over a slope of tree cover: leaf and log voxels at level 0 and coarser, none with
+/// trees off or over farmland, and a node over the ground is not called sky.
+#[test]
+fn far_nodes_over_tree_cover_get_trees_and_a_node_just_over_the_ground_is_not_sky() {
+    use horizon_earth::testing::MemoryLandCover;
+    use horizon_earth::{LandCoverStore, WorldCoverFile};
+
+    let rig_of = |class: u8| {
+        let mut settings = EarthSettings::at(LAT0, LON0);
+        settings.land_cover = true;
+        let dir = TempDir::new();
+        let land_dir = TempDir::new();
+        let store = Arc::new(TileStore::new(
+            dir.path(),
+            Arc::new(MemoryFetcher::new(terrain)),
+            256,
+        ));
+        let mut land = MemoryLandCover::new();
+        for (lat, lon) in [(45.5, 7.5), (44.5, 7.5), (45.5, 6.5), (44.5, 6.5)] {
+            let file = WorldCoverFile::containing(lat, lon).unwrap();
+            land = land.with_classes(file, 192, 96, 2, move |_, _| class);
+        }
+        let source = settings
+            .land_cover_source(Arc::new(LandCoverStore::new(land_dir.path(), 16)), Arc::new(land))
+            .unwrap();
+        let blocks = EarthBlocks::from_registry(default_registry()).unwrap();
+        let g = EarthGenerator::new(&settings, store.clone(), blocks)
+            .unwrap()
+            .with_land_cover(source.clone());
+        (g, store, source, blocks, (dir, land_dir))
+    };
+    let biome = |_: i32, _: i32| 0u16;
+    let kind = kind_of(AIR);
+    let trees = FarDecor {
+        trees: true,
+        snow: false,
+    };
+    // Builds `key` the way the downloader does: load what is named, hand over what was recorded, ask again.
+    let build = |class: u8, key: CubeKey, decor: FarDecor| {
+        let (g, store, source, blocks, _dirs) = rig_of(class);
+        for _ in 0..80 {
+            match node(&g, key, AIR, &biome, &kind, decor) {
+                Ok(n) => return (n, blocks),
+                Err(missing) => {
+                    for t in missing.tiles {
+                        store.load(t).unwrap();
+                    }
+                    for fetch in g.take_land_requests() {
+                        source.satisfy(&fetch).unwrap();
+                    }
+                }
+            }
+        }
+        panic!("never ready");
+    };
+    let count = |n: &CubeNode, blocks: &EarthBlocks, ids: &[u32]| {
+        let _ = blocks;
+        (0..4096).filter(|&i| ids.contains(&n.at(i).state.0)).count()
+    };
+    // The slope 500 m east of the coast (the spire is further out): ground at about 200 blocks.
+    let (g, ..) = rig_of(10);
+    let leaves: Vec<u32> = g.blocks().far.leaves.to_vec();
+    let logs: Vec<u32> = g.blocks().far.logs.to_vec();
+    let ground_y = |level: u32, x: i32| {
+        let step = 1i32 << level;
+        let side = 16 * step;
+        // The tiles it needs are loaded by `build`, so read the height from a throwaway rig of the same.
+        let (g, store, ..) = rig_of(10);
+        for t in g.missing_tiles_for_node(level, x, 0) {
+            store.load(t).unwrap();
+        }
+        g.field()
+            .surface_y(x * side + side / 2, side / 2, g.zoom_for_step(step))
+            .unwrap()
+    };
+    // Level 0: the cube holding the surface.
+    let s0 = ground_y(0, 500 / 16);
+    let key0 = CubeKey::new(0, 500 / 16, s0.div_euclid(16), 0);
+    let (n, blocks) = build(10, key0, trees);
+    let (l, t) = (count(&n, &blocks, &leaves), count(&n, &blocks, &logs));
+    assert!(l + t > 0, "no tree in a cube of forest");
+    let (n, blocks) = build(10, key0, FarDecor::default());
+    assert_eq!(count(&n, &blocks, &leaves) + count(&n, &blocks, &logs), 0);
+    let (n, blocks) = build(40, key0, trees);
+    assert_eq!(count(&n, &blocks, &leaves) + count(&n, &blocks, &logs), 0, "trees on farmland");
+    // Level 3: the voxels of the canopy.
+    let s3 = ground_y(3, 500 / 128);
+    let key3 = CubeKey::new(3, 500 / 128, s3.div_euclid(128), 0);
+    let (n, blocks) = build(10, key3, trees);
+    assert!(count(&n, &blocks, &leaves) > 0, "no canopy at level 3");
+    let (n, blocks) = build(10, key3, FarDecor::default());
+    assert_eq!(count(&n, &blocks, &leaves), 0);
+    // A node of 64 blocks starting a little over the ground is not pruned as sky with trees on. The ground slopes
+    // across a node, so look along the slope for the nodes where sky starts.
+    let (g, store, ..) = rig_of(10);
+    let mut probe = Vec::new();
+    for x in 7..15 {
+        for t in g.missing_tiles_for_node(2, x, 0) {
+            store.load(t).unwrap();
+        }
+        let ground = g
+            .field()
+            .surface_y(x * 64 + 32, 32, g.zoom_for_step(4))
+            .unwrap();
+        for n in 0..5 {
+            let key = CubeKey::new(2, x, ground.div_euclid(64) + n, 0);
+            probe.push((
+                class(&g, key, FarDecor::default()).unwrap(),
+                class(&g, key, trees).unwrap(),
+            ));
+        }
+    }
+    assert!(
+        probe.contains(&(NodeClass::Air, NodeClass::Mixed)),
+        "trees did not keep a low node of sky: {probe:?}"
+    );
+    assert!(probe.contains(&(NodeClass::Air, NodeClass::Air)));
+    // Trees only ever take away sky.
+    assert!(probe.iter().all(|&(p, t)| p != NodeClass::Mixed || t == NodeClass::Mixed));
 }

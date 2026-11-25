@@ -3401,7 +3401,7 @@ fn a_new_earth_world_writes_land_cover_and_downloads_on_even_without_opening_cus
     let settings =
         horizon_world::cubic::earth::EarthSettings::from_json(&options.cubic_json).unwrap();
     assert!(
-        settings.land_cover && settings.allow_downloads && settings.vegetation,
+        settings.land_cover && settings.allow_downloads && settings.vegetation && settings.snow,
         "{}",
         options.cubic_json
     );
