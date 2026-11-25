@@ -70,7 +70,7 @@ fn the_cache_keys_know_the_dry_rules() {
     let key = settings.terrain_key();
     assert!(key.contains("#landcover"), "{key}");
     assert_eq!(surface::LAND_RULES, 6);
-    assert_eq!(biome::CLIMATE_BIOME_RULES, 3);
+    assert_eq!(biome::CLIMATE_BIOME_RULES, 4);
     assert_eq!(vegetation::VEGETATION_RULES, 2);
     assert!(key.contains(&format!(".{}", surface::LAND_RULES)), "{key}");
     assert!(key.contains("#vegetation2"), "{key}");

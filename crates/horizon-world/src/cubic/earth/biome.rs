@@ -89,8 +89,12 @@ use crate::worldgen::biome::BiomeId;
 /// The ground resolution, in metres, the biome of a column is read at.
 pub const BIOME_SAMPLE_M: f64 = 500.0;
 
+/// A snowy mountain cell whose ground spans this many metres over a [`BIOME_SAMPLE_M`] cell (a slope of about 40
+/// degrees, [`super::surface::SNOW_STEEP_GRADIENT`]) is a rock face: stony peaks, where the snow pass lays no snow.
+pub const ROCK_FACE_RELIEF_M: f64 = 420.0;
+
 /// The version of the climate biome rules above; in the terrain key while climate is on.
-pub const CLIMATE_BIOME_RULES: u32 = 3;
+pub const CLIMATE_BIOME_RULES: u32 = 4;
 
 /// Latitude (degrees) under which a temperate-row forest is a tropical highland one ([`Biome::with_relief`]).
 pub const TROPICS_LATITUDE: f64 = 23.44;
@@ -376,7 +380,9 @@ impl Biome {
             return match class {
                 LandClass::Water if elevation_m <= 0.0 => ocean(t, elevation_m),
                 LandClass::NoData if elevation_m < 0.0 => ocean(t, elevation_m),
-                LandClass::Water if Self::snowy(class, elevation_m, latitude).is_none() && t < 0.0 => {
+                LandClass::Water
+                    if Self::snowy(class, elevation_m, latitude).is_none() && t < 0.0 =>
+                {
                     Self::FrozenRiver
                 }
                 _ => Self::of(class, elevation_m, latitude),
@@ -592,12 +598,30 @@ fn vanilla(row: Row, hum: usize, plateau: bool, variant: bool) -> Biome {
     const VARIANT: [[Option<Biome>; 5]; 5] = [
         [Some(IceSpikes), None, Some(SnowyTaiga), None, None],
         [None, None, None, None, Some(OldGrowthPineTaiga)],
-        [Some(SunflowerPlains), None, None, Some(OldGrowthBirchForest), None],
-        [None, None, Some(Plains), Some(SparseJungle), Some(BambooJungle)],
+        [
+            Some(SunflowerPlains),
+            None,
+            None,
+            Some(OldGrowthBirchForest),
+            None,
+        ],
+        [
+            None,
+            None,
+            Some(Plains),
+            Some(SparseJungle),
+            Some(BambooJungle),
+        ],
         [None, None, None, None, None],
     ];
     const PLATEAU: [[Biome; 5]; 5] = [
-        [SnowyPlains, SnowyPlains, SnowyPlains, SnowyTaiga, SnowyTaiga],
+        [
+            SnowyPlains,
+            SnowyPlains,
+            SnowyPlains,
+            SnowyTaiga,
+            SnowyTaiga,
+        ],
         [Meadow, Meadow, Forest, Taiga, OldGrowthSpruceTaiga],
         [Meadow, Meadow, Meadow, Meadow, DarkForest],
         [SavannaPlateau, SavannaPlateau, Forest, Forest, Jungle],
@@ -701,14 +725,27 @@ impl EarthGenerator {
             } else {
                 0.0
             };
-        Ok(Biome::with_relief(
+        let biome = Biome::with_relief(
             class,
             elevation,
             at.lat,
             climate,
             variant_cell(at.lat, at.lon),
             relief,
-        ))
+        );
+        // Snow does not hold on a rock face: a snowy mountain cell (open ground or snow/ice, not trees) whose
+        // ground spans a rock wall's height is stony peaks, so the snow pass leaves its bare stone and ice bare.
+        if climate.is_some()
+            && matches!(biome, Biome::FrozenPeaks | Biome::SnowySlopes)
+            && matches!(
+                class,
+                LandClass::Bare | LandClass::SnowIce | LandClass::Grass | LandClass::Shrub
+            )
+            && self.relief_m(a, x, z, zoom, elevation)? >= ROCK_FACE_RELIEF_M
+        {
+            return Ok(Biome::StonyPeaks);
+        }
+        Ok(biome)
     }
 
     /// The relief around the point `(x, z)` whose height at `zoom` is `middle` (m): the range of that height
