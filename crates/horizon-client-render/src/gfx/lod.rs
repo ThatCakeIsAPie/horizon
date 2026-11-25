@@ -10,6 +10,7 @@ use crate::{
     lod::{
         MAX_LEVEL, TileKey,
         cube::{CubeKey, GpuBatch, TileWork},
+        swap::Swap,
     },
     mesher::SectionMesh,
 };
@@ -102,12 +103,14 @@ pub(super) fn far_tile_mut<'a>(
     }
 }
 
-/// Finished node meshes not uploaded yet and the nodes to retire once they are in.
+/// Finished node meshes not uploaded yet, and which nodes show and which go
+/// as the sets they belong to come in (`Swap`). It lives as long as the tiles
+/// it tracks (`clear_cube_lods`).
 #[derive(Default)]
 pub(super) struct CubePending {
     meshes: FxHashMap<CubeKey, SectionMesh>,
     order: VecDeque<CubeKey>,
-    removed: FxHashSet<CubeKey>,
+    swap: Swap,
 }
 
 impl CubePending {
@@ -115,14 +118,16 @@ impl CubePending {
     /// again are not removed, nodes removed drop their waiting meshes.
     fn add(&mut self, meshes: Vec<(CubeKey, SectionMesh)>, removed: Vec<CubeKey>) {
         for (key, mesh) in meshes {
-            self.removed.remove(&key);
+            self.swap.queued(key);
             if self.meshes.insert(key, mesh).is_none() {
                 self.order.push_back(key);
             }
         }
         for key in removed {
-            self.meshes.remove(&key);
-            self.removed.insert(key);
+            if self.meshes.remove(&key).is_some() {
+                self.swap.unwait(key);
+            }
+            self.swap.retire(key);
         }
     }
 }
@@ -675,9 +680,10 @@ impl Renderer {
         }
     }
 
-    /// A node meshed again keeps its slot and fade; a new one waits for the
-    /// rest of its job (`upload_cube_lods`) before it fades in.
-    fn upload_cube_lod(&mut self, key: CubeKey, mesh: &SectionMesh) {
+    /// A node meshed again keeps its slot and fade; a new one waits for its
+    /// set (`upload_cube_lods`) before it fades in. Whether the node is in and
+    /// already shown; none if it has no mesh.
+    fn upload_cube_lod(&mut self, key: CubeKey, mesh: &SectionMesh) -> Option<bool> {
         let (old_slot, shown) = match self.lod_cubes.remove(&key) {
             Some(old) => {
                 let kept = (old.cull_slot, old.shown.filter(|_| old.dying.is_none()));
@@ -706,8 +712,12 @@ impl Renderer {
                         cull_slot,
                     },
                 );
+                Some(shown.is_some())
             }
-            None => self.lod_cull_free.extend(old_slot),
+            None => {
+                self.lod_cull_free.extend(old_slot);
+                None
+            }
         }
     }
 
@@ -896,9 +906,12 @@ impl Renderer {
             .add(meshes, removed);
     }
 
-    /// Uploads queued node meshes for about `budget` (at least one). Once all
-    /// are in they fade in together, and the nodes they replace stand whole
-    /// for `FADE` and go: nothing opens a hole while the new ones come in.
+    /// Uploads queued node meshes for about `budget` (at least one). A node
+    /// that replaces another fades in once nothing overlapping it waits and
+    /// no shown node covers it; a node removed stands whole until what
+    /// replaces it is in, then fades for `FADE` and goes (`Swap::step`):
+    /// nothing opens a hole while the new ones come in, and a set does not
+    /// wait for the rest of the queue.
     pub fn upload_cube_lods(&mut self, budget: Duration) {
         let start = Instant::now();
         if let Some(far) = &mut self.cube_far {
@@ -917,23 +930,40 @@ impl Renderer {
             let next = std::iter::from_fn(|| pending.order.pop_front())
                 .find(|key| pending.meshes.contains_key(key));
             let Some(key) = next else {
-                let pending = self.cube_pending.take().expect("pending nodes");
-                for tile in self.lod_cubes.values_mut() {
-                    tile.shown.get_or_insert(start);
-                }
-                for key in pending.removed {
-                    if let Some(tile) = self.lod_cubes.get_mut(&key)
-                        && tile.dying.is_none()
-                    {
-                        tile.dying = Some(start);
-                    }
-                }
-                return;
+                break;
             };
             let mesh = pending.meshes.remove(&key).expect("pending node");
-            self.upload_cube_lod(key, &mesh);
+            let shown = self.upload_cube_lod(key, &mesh);
+            let swap = &mut self.cube_pending.as_mut().expect("pending nodes").swap;
+            match shown {
+                Some(shown) => swap.installed(key, shown),
+                None => {
+                    swap.unwait(key);
+                    swap.forget(key);
+                }
+            }
             if start.elapsed() >= budget {
-                return;
+                break;
+            }
+        }
+        let Some(pending) = &mut self.cube_pending else {
+            return;
+        };
+        let step = pending.swap.step();
+        for key in step.fade {
+            let Some(tile) = self.lod_cubes.get_mut(&key) else {
+                continue;
+            };
+            if tile.shown.is_none() {
+                // Never drawn: nothing to fade.
+                self.remove_cube_lod(key);
+            } else if tile.dying.is_none() {
+                tile.dying = Some(start);
+            }
+        }
+        for key in step.show {
+            if let Some(tile) = self.lod_cubes.get_mut(&key) {
+                tile.shown.get_or_insert(start);
             }
         }
     }

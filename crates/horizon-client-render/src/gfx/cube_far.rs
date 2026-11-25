@@ -11,8 +11,9 @@
 //!
 //! 1. [`CubeFar::upload`] (the call that replaces `upload_cube_lods` for these
 //!    nodes): polls the mesher, installs meshed nodes in the node table, hands
-//!    the next batch to the mesher, and, once nothing is pending, fades the new
-//!    nodes in and the replaced ones out, as `Renderer::upload_cube_lods` does.
+//!    the next batch to the mesher, and fades new nodes in and replaced ones
+//!    out set by set (`lod::swap`): as soon as nothing overlapping them is
+//!    pending or in the mesher, as `Renderer::upload_cube_lods` does.
 //! 2. [`CubeFar::prepare`]: the culling pass (`cube_cull.wgsl`), before the
 //!    world pass.
 //! 3. [`CubeFar::draw`]: in the world pass, solid after the terrain, then the
@@ -32,8 +33,11 @@ use super::{
     },
 };
 use crate::{
-    fast_hash::{FxHashMap, FxHashSet},
-    lod::cube::{CubeKey, GpuContent, GpuNode},
+    fast_hash::FxHashMap,
+    lod::{
+        cube::{CubeKey, GpuContent, GpuNode},
+        swap::Swap,
+    },
 };
 use glam::{DVec3, Vec4};
 use std::{borrow::Cow, collections::VecDeque, time::Instant};
@@ -145,7 +149,8 @@ pub struct CubeFar {
     next_id: u32,
     pending: FxHashMap<CubeKey, GpuNode>,
     order: VecDeque<CubeKey>,
-    removed: FxHashSet<CubeKey>,
+    /// Which nodes show and fade, and when: pending and meshing ones wait.
+    swap: Swap,
     /// The batch in the mesher belongs to a forgotten plan (`clear`).
     discard: bool,
     epoch: Instant,
@@ -393,7 +398,7 @@ impl CubeFar {
             next_id: 0,
             pending: FxHashMap::default(),
             order: VecDeque::new(),
-            removed: FxHashSet::default(),
+            swap: Swap::default(),
             discard: false,
             epoch: Instant::now(),
             stats: FarStats::default(),
@@ -446,8 +451,8 @@ impl CubeFar {
     /// Takes in nodes to mesh and the keys to retire once they are in.
     pub fn queue(&mut self, nodes: Vec<GpuNode>, removed: Vec<CubeKey>) {
         for node in nodes {
-            self.removed.remove(&node.key);
             let key = node.key;
+            self.swap.queued(key);
             if let Some(old) = self.pending.insert(key, node) {
                 self.release(&old);
             } else {
@@ -457,8 +462,18 @@ impl CubeFar {
         for key in removed {
             if let Some(old) = self.pending.remove(&key) {
                 self.release(&old);
+                self.swap.unwait(key);
             }
-            self.removed.insert(key);
+            self.swap.retire(key);
+        }
+    }
+
+    /// `key` stops waiting for the mesher (installed, failed or discarded),
+    /// unless a newer node of it is pending.
+    fn unwait(&mut self, key: CubeKey) {
+        self.swap.unwait(key);
+        if self.pending.contains_key(&key) {
+            self.swap.queued(key);
         }
     }
 
@@ -508,6 +523,8 @@ impl CubeFar {
                 None => {
                     self.mesher.free(start, total);
                     self.stats.failed += 1;
+                    self.swap.forget(key);
+                    self.unwait(key);
                     return;
                 }
             }
@@ -538,6 +555,10 @@ impl CubeFar {
                 dying: None,
             },
         );
+        self.swap.installed(key, shown.is_some());
+        if self.pending.contains_key(&key) {
+            self.swap.queued(key);
+        }
     }
 
     fn drop_held(&mut self, held: &Held) {
@@ -588,6 +609,7 @@ impl CubeFar {
         let total = all.len() as u32;
         let Some(first) = self.mesher.write_quads(&all) else {
             self.stats.failed += 1;
+            self.unwait(key);
             return;
         };
         let mut at = first;
@@ -600,7 +622,7 @@ impl CubeFar {
     }
 
     /// Polls the mesher, starts the next batch, and fades the nodes in and
-    /// out once nothing waits. Call every frame.
+    /// out as their sets are in (`Swap::step`). Call every frame.
     pub fn upload(&mut self) {
         let now = self.now_ms();
         let faded: Vec<CubeKey> = self
@@ -632,6 +654,7 @@ impl CubeFar {
                 }
                 if failed {
                     self.stats.failed += 1;
+                    self.unwait(key);
                     continue;
                 }
                 self.stats.meshed += 1;
@@ -673,33 +696,34 @@ impl CubeFar {
                 self.mesher.begin(jobs);
             }
         }
-        if self.pending.is_empty() && self.mesher.idle() {
-            let now = self.now_ms();
-            let shown: Vec<(CubeKey, u32)> = self
-                .nodes
-                .iter_mut()
-                .filter(|(_, n)| n.shown.is_none())
-                .filter_map(|(&k, n)| {
-                    n.shown = Some(now);
-                    n.id.map(|id| (k, id))
-                })
-                .collect();
-            for (_, id) in shown {
-                self.word(id, 4, now);
+        let step = self.swap.step();
+        if step.show.is_empty() && step.fade.is_empty() {
+            return;
+        }
+        let now = self.now_ms();
+        for key in step.fade {
+            let Some(held) = self.nodes.get_mut(&key) else {
+                continue;
+            };
+            if held.dying.is_some() {
+                continue;
             }
-            for key in std::mem::take(&mut self.removed) {
-                let Some(held) = self.nodes.get_mut(&key) else {
-                    continue;
-                };
-                if held.dying.is_some() {
-                    continue;
+            match held.id {
+                Some(id) if held.shown.is_some() => {
+                    held.dying = Some(now);
+                    self.word(id, 5, now);
                 }
-                held.dying = Some(now);
-                match held.id {
-                    Some(id) => self.word(id, 5, now),
-                    // Nothing drawn: nothing to fade.
-                    None => self.remove(key),
-                }
+                // Nothing drawn, or never shown: nothing to fade.
+                _ => self.remove(key),
+            }
+        }
+        for key in step.show {
+            let Some(held) = self.nodes.get_mut(&key) else {
+                continue;
+            };
+            held.shown = Some(now);
+            if let Some(id) = held.id {
+                self.word(id, 4, now);
             }
         }
     }
@@ -729,7 +753,7 @@ impl CubeFar {
             self.release(&node);
         }
         self.order.clear();
-        self.removed.clear();
+        self.swap.clear();
         self.discard = !self.mesher.idle();
         let keys: Vec<CubeKey> = self.nodes.keys().copied().collect();
         for key in keys {

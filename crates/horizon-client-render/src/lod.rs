@@ -19,6 +19,7 @@ pub(crate) mod mesh;
 pub(crate) use mesh::{far_look, far_top_vertex};
 pub mod packed;
 mod samples;
+pub mod swap;
 use horizon_world::registry::BlockStateId;
 use std::{
     collections::VecDeque,
