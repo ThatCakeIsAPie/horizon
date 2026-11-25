@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use horizon_earth::{Fetch, LandClass, TileId};
 
 use super::far_trees::ColumnsDecor;
-use super::generator::{Access, EarthGenerator, NotReady, Rect, node_box};
+use super::generator::{Access, EarthGenerator, Gap, NotReady, Rect, node_box};
 use super::surface::SurfaceKind;
 
 /// How many requests wait at most; a long list means whatever fetches them is far behind.
@@ -60,6 +60,11 @@ impl NodeColumns {
     /// The kind of top of column `i`.
     pub fn kind(&self, i: usize) -> SurfaceKind {
         self.kinds[i]
+    }
+
+    /// The land class of column `i`; `None` without land cover.
+    pub fn class(&self, i: usize) -> Option<LandClass> {
+        self.classes.as_ref().map(|c| c[i])
     }
 
     /// The block `(x, z)` column `i` is sampled at.
@@ -170,6 +175,55 @@ impl EarthGenerator {
             kinds,
             classes,
             decor: None,
+        })
+    }
+
+    /// The columns of `width` by `depth` samples `stride` blocks apart from the block `(x0, z0)` (no half-step
+    /// shift), read at the zoom and land cover level of `zoom_step`, loading what they need and waiting for it
+    /// (as [`super::blocking`] does): what tools such as `examples/earth_probe.rs` show of the terrain. `None`
+    /// when cancelled.
+    pub fn columns_blocking(
+        &self,
+        [x0, z0]: [i32; 2],
+        [width, depth]: [usize; 2],
+        stride: i32,
+        zoom_step: i32,
+    ) -> Option<NodeColumns> {
+        let stride = stride.max(1);
+        let zoom = self.zoom_for_step(zoom_step);
+        let span = |n: usize| (n.saturating_sub(1) as i64 * i64::from(stride)) as i32;
+        let rect = Rect {
+            x0,
+            z0,
+            x1: x0.saturating_add(span(width)),
+            z1: z0.saturating_add(span(depth)),
+            zoom,
+        };
+        self.wait_for(self.kind_rect(rect, stride), || {
+            self.field
+                .range_blocking(rect.x0, rect.z0, rect.x1, rect.z1, zoom)
+                .map_err(Gap::Load)?;
+            let mut surfaces = self
+                .field
+                .surface_ys_strided(x0, z0, width, depth, stride, zoom)
+                .ok_or(Gap::Missing)?;
+            let (kinds, classes) = self.kinds_classes_core(
+                Access::Fetch,
+                [x0, z0],
+                [width, depth],
+                stride,
+                zoom_step,
+                &mut surfaces,
+            )?;
+            Ok(NodeColumns {
+                step: stride,
+                width,
+                origin: [x0, z0],
+                surfaces,
+                kinds,
+                classes,
+                decor: None,
+            })
         })
     }
 

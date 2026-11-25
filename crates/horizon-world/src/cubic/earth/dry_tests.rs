@@ -69,7 +69,7 @@ fn the_cache_keys_know_the_dry_rules() {
     settings.climate = true;
     let key = settings.terrain_key();
     assert!(key.contains("#landcover"), "{key}");
-    assert_eq!(surface::LAND_RULES, 3);
+    assert_eq!(surface::LAND_RULES, 5);
     assert_eq!(biome::CLIMATE_BIOME_RULES, 3);
     assert_eq!(vegetation::VEGETATION_RULES, 2);
     assert!(key.contains(&format!(".{}", surface::LAND_RULES)), "{key}");
@@ -235,7 +235,7 @@ fn trees_and_the_rest_keep_their_tops_in_a_dry_climate() {
 }
 
 #[test]
-fn wet_climate_and_no_climate_give_the_old_kinds_except_wet_bare_rock() {
+fn wet_climate_and_no_climate_give_the_old_kinds_except_wet_bare_rock_and_frozen_wetland() {
     // T 9, P 2,800: r = 8.75, and a frozen-dry mix (T -5, P 50) is not "dry" either.
     let wet = DryColumn::new(climate(9.0, 2800.0).unwrap(), 4, 4);
     assert!(!wet.is_dry());
@@ -268,6 +268,12 @@ fn wet_climate_and_no_climate_give_the_old_kinds_except_wet_bare_rock() {
                     // Gentle bare ground that was sand is wet bare rock in a known wet (or frozen) climate.
                     if class == LandClass::Bare && none == SurfaceKind::Dune {
                         assert!(matches!(got, SurfaceKind::Basalt(_)), "{got:?}");
+                        continue;
+                    }
+                    // Wetland in a frozen climate is tundra ground, not a marsh (rules_tests).
+                    if class == LandClass::Wetland && none == SurfaceKind::Marsh && other == frozen
+                    {
+                        assert_eq!(got, SurfaceKind::Grass);
                         continue;
                     }
                     assert_eq!(got, none, "{class:?} at {elevation} m, {lat}");

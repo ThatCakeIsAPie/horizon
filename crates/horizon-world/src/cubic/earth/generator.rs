@@ -682,8 +682,12 @@ impl EarthGenerator {
         class: LandClass,
     ) -> Result<(i32, SurfaceKind), Gap> {
         let elevation = self.field.vertical().elevation_for_y(f64::from(s0));
-        // Only open ground reads the climate: what a tree, crop, water or snow column is does not depend on it.
-        let dry = if matches!(class, LandClass::Bare | LandClass::Shrub | LandClass::Grass) {
+        // Only open ground and wetland read the climate: what a tree, crop, water or snow column is does not
+        // depend on it.
+        let dry = if matches!(
+            class,
+            LandClass::Bare | LandClass::Shrub | LandClass::Grass | LandClass::Wetland
+        ) {
             self.dry_column(a, x, z)?
         } else {
             None

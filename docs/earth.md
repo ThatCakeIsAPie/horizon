@@ -230,7 +230,7 @@ The biome column below is the one without climate; with `climate` on see [Climat
 | built-up | one gravel block (buildings come much later) | `plains` |
 | bare | stone inside the 1,500 m alpine band under the snow line; else stone where steep (a neighbour 30 m away differs by 0.6 of the distance or more); else gravel from 50° latitude; else in a known wet climate basalt rock (70 % basalt, 14 % smooth basalt, 9 % tuff, 7 % blackstone, over stone); else sand | `stony_peaks` from 2,000 m, `desert` under 40°, else `windswept_gravelly_hills` |
 | water | the water rules (see Water): a lake, a river's wide bed, or the sea when at or under the sea level plus 3 m | `river` above sea level, `ocean` at or under it |
-| herbaceous wetland | one block of water at the surface block over mud | `swamp` |
+| herbaceous wetland | one block of water at the surface block over mud; in a frozen climate (climate on, mean annual temperature under 0 C) grass over three dirt (tundra: its open water is mapped as water) | `swamp`; `snowy_plains` in a frozen climate |
 | mangroves | the same | `mangrove_swamp` |
 | moss and lichen | moss block over three dirt | `snowy_plains` (tundra) |
 | no data, or no file | the elevation rule (snow line, alpine band, grass, sand under the sea) | `ocean` under the sea level, else `plains` |
@@ -544,6 +544,11 @@ shelf, the shores and lakes at a level of their own still run.
   not shaded by the ground it was carved from.
 - **The cache key.** `terrain_key()` also has `#water<atlas rules>.<generator rules>` while land cover is on, with
   `.noatlas` when the build has no atlas.
+- **Checking a place without the game.** `cargo run --profile fast -p horizon-world --example earth_probe -- <lat>
+  <lon> --cache <game>/.horizon-cache --size 4000 --cell 50` builds the generator a new world at that place gets
+  (land cover, climate, the water atlas; it downloads with `curl` what the cache lacks) and prints, north up, the
+  surface kinds of the near rules and of the far rules and the WorldCover class at every cell, and a few columns
+  in detail (height, kind, class, biome, temperature).
 
 ### Far view: trees and snow
 

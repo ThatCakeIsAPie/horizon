@@ -1,5 +1,5 @@
 //! Tests of the general surface rules on made-up data: steep snow is rock, snow/ice is a glacier, wet bare ground
-//! is basalt ([`super::surface`]). No network, no real data.
+//! is basalt, frozen wetland is tundra ([`super::surface`]). No network, no real data.
 
 use horizon_earth::LandClass;
 
@@ -14,6 +14,7 @@ use super::*;
 
 const SNOW_ICE: u8 = 70;
 const BARE: u8 = 60;
+const WETLAND: u8 = 90;
 
 fn on(
     class: LandClass,
@@ -288,4 +289,54 @@ fn a_steep_bare_wet_wall_stays_stone() {
     let (s, kind) = kind_at(&wet, 0, 0);
     assert_eq!(kind, SurfaceKind::Alpine);
     assert_eq!(wet.block_at_blocking(0, s, 0, 1), rig.blocks.stone);
+}
+
+// --- Frozen wetland ----------------------------------------------------------------------------------------------
+
+#[test]
+fn wetland_is_a_marsh_unless_its_climate_is_frozen_where_it_is_tundra_ground_not_a_sheet_of_ice() {
+    use horizon_earth::Climate;
+    let climate = |t: f32| {
+        Some(Climate {
+            temperature_c: t,
+            precipitation_mm: 300.0,
+        })
+    };
+    // The surface and the biome agree on what is frozen: a marsh never lies in a biome whose snow pass freezes it.
+    for (t, kind, biome) in [
+        (-10.0, SurfaceKind::Grass, Biome::SnowyPlains),
+        (-0.5, SurfaceKind::Grass, Biome::SnowyPlains),
+        (0.5, SurfaceKind::Marsh, Biome::Swamp),
+        (25.0, SurfaceKind::Marsh, Biome::Swamp),
+    ] {
+        let col = Some(DryColumn::of(f64::from(t), 2.0, 0));
+        assert_eq!(
+            on(LandClass::Wetland, 10.0, 70.0, col, Slope::Gentle),
+            kind,
+            "{t} C"
+        );
+        let b = Biome::with_climate(LandClass::Wetland, 10.0, 70.0, climate(t), false);
+        assert_eq!(b, biome, "{t} C");
+        assert_eq!(b.snows(), kind == SurfaceKind::Grass, "{t} C");
+        // Mangroves are never frozen ground.
+        assert_eq!(
+            on(LandClass::Mangrove, 10.0, 70.0, col, Slope::Gentle),
+            SurfaceKind::Marsh
+        );
+    }
+    // Without a climate the wetland stays a marsh, at any latitude (its biome is a swamp, which does not freeze).
+    assert_eq!(
+        on(LandClass::Wetland, 10.0, 70.0, None, Slope::Gentle),
+        SurfaceKind::Marsh
+    );
+    // The generator reads the climate for wetland: a frozen coastal plain is grass over dirt, a warm one a marsh.
+    let (rig, cold, _dir) = dry_rig(70.0, |_, _| 12.0, WETLAND, -10.0, 200.0);
+    let (s, kind) = kind_at(&cold, 0, 0);
+    assert_eq!(kind, SurfaceKind::Grass);
+    assert_eq!(cold.block_at_blocking(0, s, 0, 1), rig.blocks.grass_block);
+    assert_eq!(cold.block_at_blocking(0, s + 1, 0, 1), rig.blocks.air);
+    let (rig, warm, _dir) = dry_rig(25.0, |_, _| 12.0, WETLAND, 24.0, 1500.0);
+    let (s, kind) = kind_at(&warm, 0, 0);
+    assert_eq!(kind, SurfaceKind::Marsh);
+    assert_eq!(warm.block_at_blocking(0, s, 0, 1), rig.blocks.water);
 }
