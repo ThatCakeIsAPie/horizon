@@ -381,7 +381,7 @@ fn the_snow_line_still_whitens_peaks_the_map_calls_something_else() {
     // The rule itself, on the places that matter.
     let steep = || Ok::<_, ()>(Slope::Gentle);
     let on = |class, metres, lat| {
-        SurfaceKind::on_classified(class, metres, lat, false, None, steep).unwrap()
+        SurfaceKind::on_classified(class, metres, lat, false, None, [0, 0], steep).unwrap()
     };
     for class in LandClass::ALL {
         if class == LandClass::NoData {
@@ -466,19 +466,48 @@ fn water_under_the_sea_level_is_the_sea_rule_and_wetland_is_one_block_of_water_o
 }
 
 #[test]
-fn moss_is_moss_over_dirt_and_built_up_ground_is_gravel_over_stone() {
+fn moss_and_built_up_ground_take_their_mixed_tops() {
+    use super::cover::{CityTop, MossTop, city_top, moss_top};
     let moss = LandRig::level(45.0, 120.0, 100);
     let b = moss.blocks;
+    let top = match moss_top(0, 0) {
+        MossTop::Moss => b.moss_block,
+        MossTop::Grass => b.grass_block,
+        MossTop::Stone => b.stone,
+        MossTop::Gravel => b.gravel,
+        MossTop::CoarseDirt => b.coarse_dirt,
+    };
+    let soil = if top == b.stone || top == b.gravel {
+        b.stone
+    } else {
+        b.dirt
+    };
     moss.check(0, 0, |y, s| match y.cmp(&s) {
         _ if y < s - 3 => b.stone,
-        std::cmp::Ordering::Less => b.dirt,
-        std::cmp::Ordering::Equal => b.moss_block,
+        std::cmp::Ordering::Less => soil,
+        std::cmp::Ordering::Equal => top,
         std::cmp::Ordering::Greater => b.air,
     });
     let built = LandRig::level(45.0, 120.0, 50);
+    let top = match city_top(0, 0, false) {
+        CityTop::Grass => b.grass_block,
+        CityTop::Stone => b.stone,
+        CityTop::SmoothStone => b.smooth_stone,
+        CityTop::Andesite => b.andesite,
+        CityTop::GrayConcrete => b.gray_concrete,
+        CityTop::LightGrayConcrete => b.light_gray_concrete,
+        CityTop::StoneBricks => b.stone_bricks,
+        CityTop::Sand => b.sand,
+    };
+    let soil = if top == b.grass_block {
+        b.dirt
+    } else {
+        b.stone
+    };
     built.check(0, 0, |y, s| match y.cmp(&s) {
-        std::cmp::Ordering::Less => b.stone,
-        std::cmp::Ordering::Equal => b.gravel,
+        _ if y < s - 3 => b.stone,
+        std::cmp::Ordering::Less => soil,
+        std::cmp::Ordering::Equal => top,
         std::cmp::Ordering::Greater => b.air,
     });
 }
@@ -486,13 +515,17 @@ fn moss_is_moss_over_dirt_and_built_up_ground_is_gravel_over_stone() {
 #[test]
 fn land_under_the_sea_level_stays_dry_where_the_map_says_it_is_not_water() {
     // 86 m below the sea: Death Valley, the Dead Sea shore, a polder.
-    for (code, top) in [(60, "sand"), (30, "grass"), (50, "gravel"), (70, "snow")] {
+    for (code, top) in [(60, "sand"), (30, "grass"), (50, "city"), (70, "snow")] {
         let rig = LandRig::level(45.0, -86.0, code);
         let b = rig.blocks;
         let top = match top {
             "sand" => b.sand,
             "grass" => b.grass_block,
-            "gravel" => b.gravel,
+            "city" => rig.generator.block_for(
+                0,
+                0,
+                SurfaceKind::BuiltUp(super::cover::city_top(0, 0, false)),
+            ),
             _ => b.snow_block,
         };
         let at = |y: i32| rig.generator.block_at_blocking(0, y, 0, 1);
@@ -705,7 +738,7 @@ fn near_and_far_give_the_same_surface_material_at_every_step() {
     }
     assert!(compared > 2000);
     // The mosaic put every kind of top there to compare.
-    for kind in ["Grass", "Snow", "Lake", "Marsh", "Moss", "Gravel", "Sea"] {
+    for kind in ["Grass", "Snow", "Lake", "Marsh", "Moss", "BuiltUp", "Sea"] {
         assert!(kinds.contains(kind), "no {kind:?} in {kinds:?}");
     }
 }

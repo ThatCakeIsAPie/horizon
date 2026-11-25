@@ -227,12 +227,12 @@ The biome column below is the one without climate; with `climate` on see [Climat
 | shrubland | grass over three dirt | `savanna` under 35°, `plains`, `snowy_plains` from 66° |
 | grassland | grass over three dirt | `meadow` from 1,500 m, `savanna` under 20°, `plains`, `snowy_plains` from 66° |
 | cropland | grass over three dirt (farmland dries out without water, and nothing else fits) | `plains` |
-| built-up | one gravel block (buildings come much later) | `plains` |
+| built-up | a patchwork of 8 by 8 parcels (`earth/cover.rs`, `CITY_MIX`): 25 % grass (parks, yards; sand in a dry climate), the rest grey concrete, light grey concrete, stone, smooth stone, andesite and stone bricks, over stone; street trees on 30 % of the grass parcels' columns. Flat: buildings come much later | `plains` |
 | bare | stone inside the 1,500 m alpine band under the snow line; else stone where steep (a neighbour 30 m away differs by 0.6 of the distance or more); else gravel from 50° latitude; else in a known wet climate basalt rock (70 % basalt, 14 % smooth basalt, 9 % tuff, 7 % blackstone, over stone); else sand | `stony_peaks` from 2,000 m, `desert` under 40°, else `windswept_gravelly_hills` |
 | water | the water rules (see Water): a lake, a river's wide bed, or the sea when at or under the sea level plus 3 m | `river` above sea level, `ocean` at or under it |
 | herbaceous wetland | one block of water at the surface block over mud | `swamp` |
 | mangroves | the same | `mangrove_swamp` |
-| moss and lichen | moss block over three dirt | `snowy_plains` (tundra) |
+| moss and lichen | a mix by column (`MOSS_MIX`): 55 % moss block, 15 % grass block, 12 % stone, 10 % gravel, 8 % coarse dirt; dirt under moss, grass and coarse dirt, stone under stone and gravel | `snowy_plains` (tundra) |
 | no data, or no file | the elevation rule (snow line, alpine band, grass, sand under the sea) | `ocean` under the sea level, else `plains` |
 
 Choices worth knowing:
@@ -282,7 +282,8 @@ cane, pumpkins, mushrooms, lily pads, leaf litter...).
 | grassland | plants and dry plants; trees on a fixed 2 % of the columns |
 | cropland, moss and lichen | plants only |
 | bare | dry plants only (cactus and dead bush in a desert, as vanilla) |
-| built-up, snow and ice | nothing |
+| built-up | trees on 30 % of the columns of grass parcels (`cover::STREET_TREES`) |
+| snow and ice | nothing |
 | water | water plants only |
 | wetland, mangroves | everything (the `swamp` and `mangrove_swamp` features) |
 | no data, or no file | everything the biome has |
@@ -380,7 +381,7 @@ game reads it (500 m of ground):
 | Pacific Northwest, Olympic Peninsula | 9.4 | 2,871 | 8.77 | no |
 
 **Surface** (`SurfaceKind::on_classified`). Snow and the alpine band still win first (steep snow is rock, snow and ice class is a glacier; see the class table); bare gentle ground in a wet climate is basalt, sand stays for the hot dry places and for ground without climate data; tree cover (rim forest),
-cropland, water, wetland, mangroves, moss and built-up ground are unchanged.
+cropland, water, wetland, mangroves and moss are unchanged; a built-up yard is sand instead of grass.
 
 | Class in a dry climate | Steep (`STEEP_GRADIENT`) | Gentle |
 |---|---|---|
@@ -418,8 +419,8 @@ flowers, bushes) on only 30 % of the columns, by a fixed column hash, via the bi
 (`biome_at_quart_blocking`, remembered per 4 by 4 column). It needs a climate source: without one the biomes do not
 say which places are dry.
 
-- **The cache key.** `surface::LAND_RULES` is 3 (steep snow, glaciers, wet bare rock), `biome::CLIMATE_BIOME_RULES` and
-  `vegetation::VEGETATION_RULES` are 2 (the key ends `#landcover<data>.3 ... #vegetation2 ... #climate<data>.2`), so
+- **The cache key.** `surface::LAND_RULES` is 4 (3: steep snow, glaciers, wet bare rock; 4: built-up and moss mixes), `biome::CLIMATE_BIOME_RULES` and
+  `vegetation::VEGETATION_RULES` are 2 (the key ends `#landcover<data>.4 ... #vegetation2 ... #climate<data>.2`), so
   caches made before these rules are rebuilt.
 
 ### Ore richness
@@ -555,8 +556,9 @@ waits. Style, shapes and sizes are in the table of `earth/far_trees.rs`.
 
 - **Which tree.** Each Earth biome has one style (oak, birch, spruce, dark oak, jungle, acacia, mangrove; round,
   cone or flat; height, canopy radius, spacing) or none: deserts, badlands, peaks, slopes, oceans, rivers and ice
-  spikes have no trees. Trees stand on grass, moss and marsh tops only, and the land class thins them as near does
-  (tree cover, wetland, mangrove and no data all, shrub a fifth, grass a fiftieth, the rest none).
+  spikes have no trees. Trees stand on grass, moss, built-up grass parcels and marsh tops only, and the land class thins them as
+  near does (tree cover, wetland, mangrove and no data all, shrub a fifth, grass a fiftieth, built-up 30 % of its
+  grass parcels, the rest none).
 - **Level 0 and 1.** Level 0 nodes are exact cubes: trees of a jittered grid (one candidate per cell of the
   style's spacing at a fixed hash of the cell, no world seed) are drawn as real logs and leaves, only into air, and
   a tree in a neighbouring cube still draws its canopy here (the columns are read 3 blocks beyond the cube). Level 1
@@ -592,6 +594,10 @@ The standing rule for all far-view work, Cubic and Earth:
   once every planned node is drawn (`cubic_lod/refine.rs`, a `LateContent`: up to 48 nodes at a time, nearest first,
   those behind the camera counted at three times their distance). `HORIZON_FAR_TWO_PASS=0` makes nodes whole at
   once, to compare.
+- **Grass sides.** The far mesher (`lod::mesh::far_style`, which the GPU material table shares) draws the side faces
+  of a grass block with its top sprite, grass-tinted: on a far terraced slope a voxel's side stands for slope covered
+  in grass, and the dirt side with its thin green strip made forested and grassy hills read brown. A snowy grass
+  block's side stays snowy; near (section) meshing is unchanged.
 - **Light.** Far terrain has no light propagation: a voxel's sky light is 15 in the open, 4 under a roof, and 13
   under foliage, an opaque voxel light passes (`light_permeable`: leaves, snow layers), about what ground under near
   trees gets. Before this a canopy was a roof and the ground under far trees was drawn near black.

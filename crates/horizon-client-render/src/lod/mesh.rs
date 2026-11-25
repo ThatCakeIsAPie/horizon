@@ -170,11 +170,23 @@ pub(crate) fn far_style(
             break;
         }
     }
+    if grass_side_as_top(name, direction, &faces) {
+        return far_style(context, state, Direction::Up);
+    }
     Styles {
         opaque,
         faces,
         fluid,
     }
+}
+/// Whether a far grass block's `direction` faces draw as its top: the side of a far voxel on a terraced slope
+/// stands for slope covered in grass, and its dirt with a thin green strip turns forested and grassy hills
+/// brown from afar. Only the plain grass side (dirt then a tinted overlay, `faces`); a snowy grass block's side
+/// stays snowy. The near (section) mesher draws grass as it is.
+fn grass_side_as_top(name: &str, direction: Direction, faces: &[Option<Style>; 2]) -> bool {
+    name == "minecraft:grass_block"
+        && !matches!(direction, Direction::Up | Direction::Down)
+        && faces[1].is_some_and(|overlay| overlay.tint == Tint::Grass)
 }
 #[derive(Clone, Copy)]
 struct Paint<L> {
@@ -1647,6 +1659,38 @@ fn emit_quad(mesh: &mut SectionMesh, grouped: (FaceKey, impl Look), rect: Rect, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn far_grass_sides_with_a_tinted_overlay_draw_as_the_top() {
+        let face = |tint| {
+            Some(Style {
+                layer: 1,
+                tint,
+                translucent: false,
+            })
+        };
+        let plain = [face(Tint::None), face(Tint::Grass)];
+        let snowy = [face(Tint::None), None];
+        for d in [
+            Direction::North,
+            Direction::South,
+            Direction::East,
+            Direction::West,
+        ] {
+            assert!(grass_side_as_top("minecraft:grass_block", d, &plain));
+            assert!(!grass_side_as_top("minecraft:grass_block", d, &snowy));
+            assert!(!grass_side_as_top("minecraft:podzol", d, &plain));
+        }
+        assert!(!grass_side_as_top(
+            "minecraft:grass_block",
+            Direction::Up,
+            &plain
+        ));
+        assert!(!grass_side_as_top(
+            "minecraft:grass_block",
+            Direction::Down,
+            &plain
+        ));
+    }
     fn span(min: i16, max: i16, state: u32) -> Span {
         Span {
             min,

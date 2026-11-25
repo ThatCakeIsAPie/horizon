@@ -6633,6 +6633,30 @@ mod tests {
         check(&lod);
         let _ = lod.removed();
     }
+    #[test]
+    #[ignore = "daily"]
+    fn far_grass_sides_draw_the_grass_top_tinted_and_snowy_sides_stay() -> crate::Result<()> {
+        use horizon_assets::model::Direction;
+        let (context, _) = test_context()?;
+        let registry = &context.assets.registry;
+        let grass = registry.default_state("minecraft:grass_block").unwrap();
+        let top = mesh::far_style(&context, grass, Direction::Up);
+        assert_eq!(top.faces[0].unwrap().tint, mesh::Tint::Grass);
+        for d in [
+            Direction::North,
+            Direction::South,
+            Direction::East,
+            Direction::West,
+        ] {
+            assert_eq!(mesh::far_style(&context, grass, d), top, "{d:?}");
+        }
+        let mut state = registry.state(grass).unwrap().clone();
+        state.properties.insert("snowy".into(), "true".into());
+        let snowy = registry.id(&state).unwrap();
+        let side = mesh::far_style(&context, snowy, Direction::North);
+        assert_ne!(side.faces[0].unwrap().layer, top.faces[0].unwrap().layer);
+        Ok(())
+    }
     /// The prepared resources' far-terrain worker context and block facts.
     fn test_context() -> crate::Result<(Arc<WorkerContext>, BlockFacts)> {
         use crate::{assets::Assets, biome::Biomes, light::LightTables, mesher::MeshTables};

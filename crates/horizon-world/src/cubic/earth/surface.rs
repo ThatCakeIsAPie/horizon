@@ -30,8 +30,12 @@
 //! [`GRAVEL_FROM_LATITUDE`] in a known wet climate is [`SurfaceKind::Basalt`] (young volcanic rock: basalt,
 //! smooth basalt, tuff, blackstone), not sand; sand stays for hot dry ground and for ground without climate.
 //!
-//! Snow and the alpine band still win first; tree cover, crops, water, wetland, moss and built-up ground are
-//! unchanged. Under the top of a dry kind the ground is terracotta bands by absolute height down to
+//! Snow and the alpine band still win first; tree cover, crops, water and wetland are unchanged.
+//!
+//! **Built-up ground and moss are mixes** ([`super::cover`]): a built-up column is [`SurfaceKind::BuiltUp`], a
+//! grey and green patchwork of parcels (paving, roofs, parks; sand yards in a dry climate) over stone; a moss
+//! and lichen column is [`SurfaceKind::Moss`], mostly moss block with some grass and bare stone, gravel and
+//! coarse dirt. Under the top of a dry kind the ground is terracotta bands by absolute height down to
 //! [`DRY_ROCK_DEPTH`](super::dry::DRY_ROCK_DEPTH) blocks, then stone.
 //!
 //! **Water is part of the column.** A column is a pair `(s, kind)`. For a water column ([`SurfaceKind::Water`]) `s`
@@ -49,6 +53,7 @@
 
 use horizon_earth::{LandClass, VerticalMap};
 
+use super::cover::{CityTop, MossTop, city_top, moss_top};
 use super::dry::{BARREN_MIX, BASALT_MIX, BasaltTop, DESERT_MIX, DryColumn, DryTop, SCRUB_MIX};
 use super::water::Bed;
 
@@ -67,7 +72,7 @@ pub const SNOW_DEPTH: i64 = 2;
 pub const RULES: u32 = 2;
 /// The version of the land-cover surface rule and of the biome table ([`super::biome`]): it goes up when what a
 /// column with a known class is made of changes. It is in the terrain key only while land cover is on.
-pub const LAND_RULES: u32 = 3;
+pub const LAND_RULES: u32 = 4;
 /// With land cover, the lowest elevation (m) where the latitude snow line still turns a column that is not
 /// snow or ice on the map white. A map made from one summer's imagery misses seasonal snow on high peaks (Everest
 /// stays white), but the line falls to sea level at the poles, where lowland the map calls bare or moss is not
@@ -153,10 +158,13 @@ pub enum SurfaceKind {
     Snow,
     /// Dry sand, four blocks: bare flat ground, even below the sea level.
     Dune,
-    /// A gravel block over stone: built-up ground and cold bare flat ground.
+    /// A gravel block over stone: cold bare flat ground.
     Gravel,
-    /// A moss block over three dirt.
-    Moss,
+    /// Moss and lichen: the given top ([`super::cover::MOSS_MIX`]), over three dirt under moss, grass and coarse
+    /// dirt, over stone under stone and gravel.
+    Moss(MossTop),
+    /// Built-up ground: the given top ([`super::cover::CITY_MIX`]) over stone (over three dirt under grass).
+    BuiltUp(CityTop),
     /// The sea, a lake or a river: `depth` blocks of water (at least 1) ending at the surface block `s`, over a
     /// bed of `bed` whose top block is `s - depth`.
     Water { depth: u32, bed: Bed },
@@ -241,10 +249,11 @@ impl SurfaceKind {
     /// * water: a lake ([`SurfaceKind::Water`], [`LAKE_DEPTH`] blocks over sand), or [`SurfaceKind::SEA`] when the
     ///   surface is under the sea (no data under the sea is the same); the caller turns it into the real sea
     ///   column with [`SurfaceKind::sea_column`];
-    /// * wetland and mangrove: a marsh; moss and lichen: moss; built-up: gravel.
+    /// * wetland and mangrove: a marsh; moss and lichen: [`SurfaceKind::Moss`]; built-up:
+    ///   [`SurfaceKind::BuiltUp`]; both mixes are picked by a hash of the block column `at`.
     ///
     /// `dry` is the climate at the column with its hash; without it (`None`: no climate, or no data there) the
-    /// rules are exactly those without the dry places and without wet bare rock.
+    /// rules are exactly those without the dry places and without wet bare rock (and a built-up yard is grass).
     ///
     /// A known class that is not water stays dry under the sea level.
     pub fn on_classified<E>(
@@ -253,6 +262,7 @@ impl SurfaceKind {
         latitude: f64,
         below_sea: bool,
         dry: Option<DryColumn>,
+        at: [i32; 2],
         slope: impl FnOnce() -> Result<Slope, E>,
     ) -> Result<Self, E> {
         let line = snow_line_m(latitude);
@@ -311,8 +321,10 @@ impl SurfaceKind {
                 bed: Bed::Sand,
             },
             LandClass::Wetland | LandClass::Mangrove => Self::Marsh,
-            LandClass::MossLichen => Self::Moss,
-            LandClass::BuiltUp => Self::Gravel,
+            LandClass::MossLichen => Self::Moss(moss_top(at[0], at[1])),
+            LandClass::BuiltUp => {
+                Self::BuiltUp(city_top(at[0], at[1], dry.is_some_and(|d| d.is_dry())))
+            }
         })
     }
 

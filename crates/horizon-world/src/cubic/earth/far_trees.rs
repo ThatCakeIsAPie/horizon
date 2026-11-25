@@ -28,9 +28,9 @@
 //! | windswept gravelly hills | spruce | cone | 7-10 | 2 | 16 |
 //! | wooded badlands | oak | round | 4-6 | 2 | 10 |
 //!
-//! Trees stand on dry ground only (grass, moss and marsh tops). The land class thins them as it does near
-//! ([`super::vegetation::tree_share`]): tree cover, wetland, mangrove and no data all, shrub a fifth, grass a
-//! fiftieth, the rest none.
+//! Trees stand on dry ground only (grass, moss, built-up grass parcels and marsh tops). The land class thins them
+//! as it does near ([`super::vegetation::tree_share`]): tree cover, wetland, mangrove and no data all, shrub a
+//! fifth, grass a fiftieth, built-up three tenths of its grass parcels, the rest none.
 //!
 //! # Where they are drawn
 //!
@@ -60,8 +60,8 @@
 
 use std::collections::HashMap;
 
-use horizon_core::position::SectionPos;
 use super::biome::{BIOME_SAMPLE_M, Biome};
+use super::cover::CityTop;
 use super::far::NodeColumns;
 use super::generator::{Access, EarthGenerator, Fill, NotReady, Rect};
 use super::surface::SurfaceKind;
@@ -69,6 +69,7 @@ use super::vegetation::{FeatureKind, allowed, tree_share};
 use crate::cubic::custom::replacers::resolve_block;
 use crate::cubic::custom::settings::BlockStateDesc;
 use crate::registry::BlockRegistry;
+use horizon_core::position::SectionPos;
 
 /// Blocks over the ground the highest tree block (and the snow on it) can be: the tallest tree is 28 blocks.
 pub const MAX_TREE_UP: i32 = 32;
@@ -428,7 +429,8 @@ impl EarthGenerator {
                         cols.kind(i),
                         SurfaceKind::Grass
                             | SurfaceKind::Scrub(_)
-                            | SurfaceKind::Moss
+                            | SurfaceKind::Moss(_)
+                            | SurfaceKind::BuiltUp(CityTop::Grass)
                             | SurfaceKind::Marsh
                     ) || !allowed(classes[i], FeatureKind::Tree, x, z)
                     {
@@ -464,11 +466,8 @@ impl EarthGenerator {
         }
         let r = MAX_RADIUS;
         let (x0, y0, z0) = (cube.x * 16, cube.y * 16, cube.z * 16);
-        let fill = self.classify_box_above(
-            [x0 - r, y0, z0 - r],
-            [x0 + 15 + r, y0 + 15, z0 + 15 + r],
-            1,
-        )?;
+        let fill =
+            self.classify_box_above([x0 - r, y0, z0 - r], [x0 + 15 + r, y0 + 15, z0 + 15 + r], 1)?;
         if fill != Fill::Mixed {
             return Ok(false);
         }
@@ -591,7 +590,8 @@ impl EarthGenerator {
                         kind,
                         SurfaceKind::Grass
                             | SurfaceKind::Scrub(_)
-                            | SurfaceKind::Moss
+                            | SurfaceKind::Moss(_)
+                            | SurfaceKind::BuiltUp(CityTop::Grass)
                             | SurfaceKind::Marsh
                     )
             });
