@@ -133,6 +133,16 @@ screen and `THIRD_PARTY_NOTICES.md` show:
 © ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) processed by ESA WorldCover consortium
 ```
 
+Rivers and lakes come from a small atlas **shipped inside the game** (nothing is downloaded for them; see "Water
+atlas" below), a filtered and modified extract of two CC BY 4.0 datasets from HydroSHEDS
+(https://www.hydrosheds.org): **RiverATLAS v1.0** (Linke et al. 2019, doi:10.1038/s41597-019-0300-6), the river
+reaches with long-term discharge from WaterGAP v2.2 and catchment elevation from EarthEnv-DEM90, and **HydroLAKES
+v1.0** (Messager et al. 2016, doi:10.1038/ncomms13603). RiverATLAS rather than HydroRIVERS because HydroRIVERS
+alone is under the HydroSHEDS v1 licence, which asks for an end-user licence agreement that an open-source game
+cannot give. The river lines still derive from HydroSHEDS v1, so the "Data credits..." screen and
+`THIRD_PARTY_NOTICES.md` also carry its publisher's statement word for word (`water_attribution.txt`), with both
+citations and the licence.
+
 ## Land cover
 
 The next data layer is land cover from **ESA WorldCover 2021 v200**: 10 m classes (tree cover, shrubland, grassland,
@@ -462,6 +472,36 @@ waits. Style, shapes and sizes are in the table of `earth/far_trees.rs`.
 - **Off.** With trees and snow off (an old world, or no land cover) the far output is what it was.
 - **The cache key.** `terrain_key()` ends with `#fartrees1` while land cover and vegetation are on, and `#snow1` when
   snow is on too.
+
+### Water atlas
+
+Rivers and lakes come from one small file shipped inside the game, `crates/horizon-earth/data/water_atlas.bin`
+(15.5 MB, embedded with `include_bytes!`; nothing is downloaded for it). `WaterAtlas::embedded()` reads its
+header and index once; each 1-degree cell is inflated and decoded the first time a query meets it, then kept.
+
+- **Rivers.** The RiverATLAS reaches (the HydroRIVERS network) whose long-term average discharge is at least
+  **15 m3/s**: 711,038 of 8,477,883 reaches, with the id of the reach each flows into. The points are the data's
+  own (they step between the cells of a 15-arc-second grid, about 460 m), upstream first, stored to about 1e-4
+  degree (11.6 m). Discharge is kept to 0.07 %.
+- **River levels.** A water surface level for every point, in whole decimetres, from RiverATLAS's `ele_mt_cmn`
+  (the lowest ground of each reach's catchment, from EarthEnv-DEM90), worked over the whole network before any
+  reach is dropped: a median along the main stem takes off one- and two-reach spikes; pits that are left are
+  filled from the outlets up (so a reach is never below the one it flows into); then, from the sources down, a
+  reach starts at the lowest end of its inflows and ends at its own estimate if that is lower. So levels never rise
+  downstream, a reach ends exactly where the next begins, rivers that reach the sea stay at or above 0 m, and
+  inland basins keep their own levels (the Dead Sea's below 0). Between a reach's ends the level is linear in
+  distance.
+- **Lakes.** HydroLAKES lakes and reservoirs of at least **2 km2**: 90,681 of 1,427,688, each as its bounding box
+  (rounded outwards), surface level (`Elevation`), area, mean depth and whether it is a reservoir. Smaller lakes are
+  left to the generator's own rule.
+- **Limits.** The size budget (16 MB for the whole file) sets both thresholds; at 10 m3/s the file would be
+  18.3 MB. The levels come from a 90 m DEM's catchment minima: on the Colorado at Phantom Ranch they say about
+  770 m (the river is at about 735 m), on the Amazon at Manaus about 7 m (its low water is nearer 15 m). The lines
+  can sit a couple of kilometres off a narrow canyon's floor. Lake boxes are boxes, not shores.
+- **Rebuild.** `python3 tools/earth_water.py build --cache DIR` (numpy, pyogrio, pyarrow and shapely; about 12 GB
+  of memory and 25 minutes once the 3.3 GB of downloads are in `DIR`; `--min-discharge` and `--min-lake-area`
+  fix the thresholds). `python3 tools/earth_water.py check FILE` decodes a file and checks every rule; the script's
+  docstring lists the inputs, the rules and the format, which `crates/horizon-earth/src/waterfile.rs` reads.
 
 ### Still missing
 

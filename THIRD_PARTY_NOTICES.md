@@ -486,4 +486,47 @@ H.P., Kessler, M. (2017). Climatologies at high resolution for the earth's land 
 170122. <https://doi.org/10.1038/sdata.2017.122>. Data: Karger, D.N. et al. (2021) CHELSA V2.1, EnviDat,
 <https://doi.org/10.16904/envidat.228.v2.1>
 
+## River and lake data for Earth worlds
+
+Earth worlds draw rivers and lakes from a small atlas that **is shipped inside the game**
+(`crates/horizon-earth/data/water_atlas.bin`, built by `tools/earth_water.py`). It is a filtered and
+modified extract of two datasets, both released under CC BY 4.0 (<https://creativecommons.org/licenses/by/4.0/>):
+
+- **RiverATLAS v1.0**, part of HydroATLAS v1.0 (<https://www.hydrosheds.org/hydroatlas>; data
+  <https://doi.org/10.6084/m9.figshare.9890531>): the river reaches (the HydroRIVERS network), with long-term average
+  discharge from WaterGAP v2.2 and catchment elevation from EarthEnv-DEM90, used in the spatial format provided by
+  RiverATLAS. Citation: Linke, S., Lehner, B., Ouellet Dallaire, C., Ariwi, J., Grill, G., Anand, M., Beames, P.,
+  Burchard-Levine, V., Maxwell, S., Moidu, H., Tan, F., Thieme, M. (2019). Global hydro-environmental sub-basin and
+  river reach characteristics at high spatial resolution. Scientific Data 6: 283.
+  <https://doi.org/10.1038/s41597-019-0300-6>. Sources: Döll, P., Kaspar, F., Lehner, B. (2003), Journal of
+  Hydrology 270, 105-134 (WaterGAP); Robinson, N., Regetz, J., Guralnick, R.P. (2014), ISPRS Journal of
+  Photogrammetry and Remote Sensing 87, 57-67 (EarthEnv-DEM90).
+- **HydroLAKES v1.0** (<https://www.hydrosheds.org/products/hydrolakes>): lake and reservoir outlines (kept as
+  bounding boxes), surface elevation, area and mean depth. © the authors, 2016. Citation: Messager, M.L., Lehner, B.,
+  Grill, G., Nedeva, I., Schmitt, O. (2016). Estimating the volume and age of water stored in global lakes using a
+  geo-statistical approach. Nature Communications 7: 13603. <https://doi.org/10.1038/ncomms13603>. Data is available
+  at www.hydrosheds.org.
+
+Changes made: only reaches of at least 15 m3/s and lakes of at least 2 km2 are kept, points are rounded to about
+1e-4 degree and quantities to 0.07 %, lakes are reduced to their bounding boxes, and the river water levels are
+recomputed from the catchment elevations so that they never rise downstream (see docs/earth.md, "Water atlas").
+The publishers have not checked the extract.
+
+The river network in RiverATLAS derives from HydroSHEDS version 1; its publisher's attribution, which the game also
+shows in Earth's settings ("Data credits..."):
+
+```
+This product Horizon incorporates data from the HydroSHEDS version 1 database which is © World Wildlife Fund, Inc.
+(2006-2022) and has been used herein under license. WWF has not evaluated the data as altered and incorporated within
+Horizon, and therefore gives no warranty regarding its accuracy, completeness, currency or suitability for any
+particular purpose. Portions of the HydroSHEDS v1 database incorporate data which are the intellectual property
+rights of © USGS (2006-2008), NASA (2000-2005), ESRI (1992-1998), CIAT (2004-2006), UNEP-WCMC (1993), WWF (2004),
+Commonwealth of Australia (2007), and Her Royal Majesty and the British Crown and are used under license. The
+HydroSHEDS v1 database and more information are available at https://www.hydrosheds.org.
+```
+
+Citation: Lehner, B., Verdin, K., Jarvis, A. (2008). New global hydrography derived from spaceborne elevation data.
+Eos, Transactions, AGU 89(10): 93-94. Lehner, B., Grill, G. (2013). Global river hydrography and network routing:
+baseline data and new approaches to study the world's large river systems. Hydrological Processes 27(15): 2171-2186.
+
 Earth is inspired by the Terrarium mod by gegy; it shares no code with it.

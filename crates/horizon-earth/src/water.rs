@@ -13,12 +13,19 @@
 //! fail: a place with no feature returns nothing.
 //!
 //! [`WaterAtlas::from_parts`] builds an atlas from features in memory (tests, tools). [`WaterAtlas::embedded`] is
-//! the atlas shipped in the game (see `tools/earth_water.py` and `docs/earth.md`, "Water").
+//! the atlas shipped in the game: `data/water_atlas.bin`, built by `tools/earth_water.py` from RiverATLAS and
+//! HydroLAKES (see `docs/earth.md`, "Water atlas"), embedded in the binary. [`WaterAtlas::decode`] reads such a file
+//! (its format is in [`crate::waterfile`]): it checks the header and the cell index at once, and inflates and
+//! decodes a cell's block only the first time a query meets that cell, then keeps it. A block that does not decode
+//! is logged once and reads as an empty cell; nothing in a bad file can make the game panic.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, OnceLock};
 
 use crate::projection::LatLon;
+use crate::waterfile::{self, Entry};
 
 /// The version of the atlas's data and of what its fields mean. It goes up when the shipped data or its rules
 /// change, so far-view caches made from an older atlas are not used.
@@ -82,6 +89,18 @@ impl Lake {
     }
 }
 
+/// Why an atlas file could not be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaterAtlasError(pub String);
+
+impl fmt::Display for WaterAtlasError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "water atlas: {}", self.0)
+    }
+}
+
+impl std::error::Error for WaterAtlasError {}
+
 /// The features listed in one index cell.
 #[derive(Default, Debug)]
 struct Cell {
@@ -89,15 +108,61 @@ struct Cell {
     lakes: Vec<Arc<Lake>>,
 }
 
+impl Cell {
+    fn from_features(reaches: Vec<RiverReach>, lakes: Vec<Lake>) -> Self {
+        Self {
+            reaches: reaches.into_iter().map(Arc::new).collect(),
+            lakes: lakes.into_iter().map(Arc::new).collect(),
+        }
+    }
+}
+
+/// An atlas file: its bytes, its index, and each cell once decoded.
+struct FileCells {
+    bytes: Cow<'static, [u8]>,
+    units: f64,
+    index: Vec<Entry>,
+    cells: Vec<OnceLock<Cell>>,
+}
+
+impl fmt::Debug for FileCells {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileCells")
+            .field("bytes", &self.bytes.len())
+            .field("cells", &self.index.len())
+            .finish()
+    }
+}
+
+/// Where an atlas's cells come from.
+#[derive(Debug)]
+enum Cells {
+    Memory(HashMap<(i32, i32), Cell>),
+    File(FileCells),
+}
+
+impl Default for Cells {
+    fn default() -> Self {
+        Self::Memory(HashMap::new())
+    }
+}
+
 /// Rivers and lakes, indexed by cell.
 #[derive(Default, Debug)]
 pub struct WaterAtlas {
-    cells: HashMap<(i32, i32), Cell>,
+    cells: Cells,
+    reach_count: usize,
+    lake_count: usize,
 }
+
+/// The atlas shipped in the game (see the module doc).
+static EMBEDDED: &[u8] = include_bytes!("../data/water_atlas.bin");
 
 impl WaterAtlas {
     /// An atlas of `reaches` and `lakes` held in memory.
     pub fn from_parts(reaches: Vec<RiverReach>, lakes: Vec<Lake>) -> Self {
+        let reach_count = reaches.iter().map(|r| r.id).collect::<HashSet<_>>().len();
+        let lake_count = lakes.iter().map(|l| l.id).collect::<HashSet<_>>().len();
         let mut cells: HashMap<(i32, i32), Cell> = HashMap::new();
         for reach in reaches {
             let reach = Arc::new(reach);
@@ -115,18 +180,118 @@ impl WaterAtlas {
                 cells.entry(key).or_default().lakes.push(Arc::clone(&lake));
             }
         }
-        Self { cells }
+        Self {
+            cells: Cells::Memory(cells),
+            reach_count,
+            lake_count,
+        }
     }
 
     /// The atlas shipped in the game, decoded once; `None` when the game has none (or it does not decode, which
     /// is logged once).
     pub fn embedded() -> Option<&'static WaterAtlas> {
-        None
+        static ATLAS: OnceLock<Option<WaterAtlas>> = OnceLock::new();
+        ATLAS
+            .get_or_init(|| match WaterAtlas::decode(EMBEDDED) {
+                Ok(atlas) if !atlas.is_empty() => Some(atlas),
+                Ok(_) => None,
+                Err(e) => {
+                    log::warn!("the embedded water atlas does not decode: {e}");
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    /// An atlas read from a file's bytes (see [`crate::waterfile`]). The header and index are checked now; each
+    /// cell is decoded on the first query that meets it.
+    pub fn decode(bytes: impl Into<Cow<'static, [u8]>>) -> Result<Self, WaterAtlasError> {
+        let bytes = bytes.into();
+        let header = waterfile::read_header(&bytes)?;
+        let cells = (0..header.index.len()).map(|_| OnceLock::new()).collect();
+        Ok(Self {
+            cells: Cells::File(FileCells {
+                bytes,
+                units: header.units,
+                index: header.index,
+                cells,
+            }),
+            reach_count: header.reaches as usize,
+            lake_count: header.lakes as usize,
+        })
+    }
+
+    /// The bytes of a file holding `reaches` and `lakes`, which [`WaterAtlas::decode`] reads back: coordinates
+    /// rounded to the file's units (1/9600 degree), levels to whole decimetres (a level that would rise is written
+    /// flat), quantities to log codes (0.07 %), each id once.
+    pub fn encode(reaches: &[RiverReach], lakes: &[Lake]) -> Vec<u8> {
+        waterfile::write(reaches, lakes)
     }
 
     /// Whether the atlas holds no feature at all.
     pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
+        match &self.cells {
+            Cells::Memory(cells) => cells.is_empty(),
+            Cells::File(file) => file.index.is_empty(),
+        }
+    }
+
+    /// The number of distinct reaches (as the file's header says, for a decoded atlas).
+    pub fn reach_count(&self) -> usize {
+        self.reach_count
+    }
+
+    /// The number of distinct lakes (as the file's header says, for a decoded atlas).
+    pub fn lake_count(&self) -> usize {
+        self.lake_count
+    }
+
+    /// Every non-empty cell, as `(floor(lat), floor(lon))` in degrees, in order.
+    pub fn cell_keys(&self) -> Vec<(i32, i32)> {
+        let mut keys: Vec<(i32, i32)> = match &self.cells {
+            Cells::Memory(cells) => cells.keys().copied().collect(),
+            Cells::File(file) => file.index.iter().map(|e| e.key).collect(),
+        };
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The features of one cell, decoding it on first use.
+    fn cell(&self, key: (i32, i32)) -> Option<&Cell> {
+        match &self.cells {
+            Cells::Memory(cells) => cells.get(&key),
+            Cells::File(file) => {
+                let i = file.index.binary_search_by_key(&key, |e| e.key).ok()?;
+                Some(file.cells[i].get_or_init(|| {
+                    match waterfile::read_cell(&file.bytes, &file.index[i], file.units) {
+                        Ok((reaches, lakes)) => Cell::from_features(reaches, lakes),
+                        Err(e) => {
+                            log::warn!("water atlas cell {key:?} does not decode: {e}");
+                            Cell::default()
+                        }
+                    }
+                }))
+            }
+        }
+    }
+
+    /// The features of one cell of a decoded file, decoded afresh and not kept (whole-atlas checks); `None` for an
+    /// in-memory atlas or a cell not in the file.
+    pub fn read_cell(
+        &self,
+        key: (i32, i32),
+    ) -> Option<Result<(Vec<RiverReach>, Vec<Lake>), WaterAtlasError>> {
+        match &self.cells {
+            Cells::Memory(_) => None,
+            Cells::File(file) => {
+                let i = file.index.binary_search_by_key(&key, |e| e.key).ok()?;
+                Some(waterfile::read_cell(
+                    &file.bytes,
+                    &file.index[i],
+                    file.units,
+                ))
+            }
+        }
     }
 
     /// Every reach listed in a cell the box `south..=north` by `west..=east` (degrees) meets, once each, in id
@@ -135,7 +300,7 @@ impl WaterAtlas {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for key in cells_of((south, west, north, east)) {
-            if let Some(cell) = self.cells.get(&key) {
+            if let Some(cell) = self.cell(key) {
                 for r in &cell.reaches {
                     if seen.insert(r.id) {
                         out.push(Arc::clone(r));
@@ -152,7 +317,7 @@ impl WaterAtlas {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for key in cells_of((south, west, north, east)) {
-            if let Some(cell) = self.cells.get(&key) {
+            if let Some(cell) = self.cell(key) {
                 for l in &cell.lakes {
                     if seen.insert(l.id) {
                         out.push(Arc::clone(l));
@@ -179,7 +344,7 @@ fn bounds_of(points: impl Iterator<Item = LatLon>) -> (f64, f64, f64, f64) {
 
 /// The index cells a box `(south, west, north, east)` meets. A box whose west is east of its east wraps the date
 /// line. Latitudes are clamped to the poles.
-fn cells_of((south, west, north, east): (f64, f64, f64, f64)) -> Vec<(i32, i32)> {
+pub(crate) fn cells_of((south, west, north, east): (f64, f64, f64, f64)) -> Vec<(i32, i32)> {
     if !(south.is_finite() && west.is_finite() && north.is_finite() && east.is_finite())
         || south > north
     {
@@ -203,6 +368,14 @@ fn cells_of((south, west, north, east): (f64, f64, f64, f64)) -> Vec<(i32, i32)>
     }
     out
 }
+
+#[cfg(test)]
+#[path = "water_tests.rs"]
+mod file_tests;
+
+#[cfg(test)]
+#[path = "water_embedded_tests.rs"]
+mod embedded_tests;
 
 #[cfg(test)]
 mod tests {
