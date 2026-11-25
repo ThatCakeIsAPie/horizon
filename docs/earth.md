@@ -219,7 +219,7 @@ The biome column below is the one without climate; with `climate` on see [Climat
 | cropland | grass over three dirt (farmland dries out without water, and nothing else fits) | `plains` |
 | built-up | one gravel block (buildings come much later) | `plains` |
 | bare | stone inside the 1,500 m alpine band under the snow line; else stone where steep (a neighbour 30 m away differs by 0.6 of the distance or more); else sand, or gravel from 50° latitude | `stony_peaks` from 2,000 m, `desert` under 40°, else `windswept_gravelly_hills` |
-| water | a lake or river: three blocks of water ending at the surface block, over a sand bed. Under the sea level: the sea rule (sand, water up to the sea level) | `river` above sea level, `ocean` at or under it |
+| water | the water rules (see Water): a lake, a river's wide bed, or the sea when at or under the sea level plus 3 m | `river` above sea level, `ocean` at or under it |
 | herbaceous wetland | one block of water at the surface block over mud | `swamp` |
 | mangroves | the same | `mangrove_swamp` |
 | moss and lichen | moss block over three dirt | `snowy_plains` (tundra) |
@@ -234,9 +234,9 @@ Choices worth knowing:
   misses seasonal snow on high peaks (Everest is white whatever its pixel says), but at the poles the line falls to
   sea level and lowland the map calls bare or moss is not under permanent snow. A lake above the snow line is frozen
   white.
-- **Lakes.** The elevation data gives a lake's surface, so the water ends at the surface block and the bed is carved
-  below it: the shore stays level with the bank. No flowing water is started; the blocks are placed as they are.
-  The surface height (`surface_y`, the spawn point) is the water surface.
+- **Lakes.** A lake is flat (see Water): at its recorded level when the water atlas has it, else one block under
+  the lowest elevation of its columns nearby. No flowing water is started; the blocks are placed as they are. The
+  surface height (`surface_y`, the spawn point) is still the elevation surface.
 - **Slope.** A bare column reads four neighbours, 30 m of ground away (at least one sampling step), at its own zoom,
   so near and far measure the same distance. Missing neighbours make the read "not ready" like any missing tile.
 - **Biomes** depend on the 4 by 4 block column only, read at a fixed 500 m of ground (a coarse overview and a
@@ -432,6 +432,48 @@ settings in force when there is none. Land cover has no say on it: the biome alo
 - **The far view** draws the same rule (see Far view: trees and snow).
 - **The cache key.** `terrain_key()` also ends with `#snow<rules>` while land cover, vegetation and `snow` are on.
 
+### Water
+
+With land cover on, the generator runs water rules over every column (`cubic/earth/water.rs` holds the rules as
+plain functions, `water_gen.rs` feeds them). The rivers and the lakes' levels come from the water atlas
+(`horizon_earth::WaterAtlas`, handed in with `with_water` when the build embeds one); without it the sea, the
+shelf, the shores and lakes at a level of their own still run.
+
+- **The top of water.** Water at a level of `L` metres has its top block at `block_y(L) - 1`: the sea's top is
+  `seaLevelY - 1`, and a lake whose elevation is at its level sits one block under its shore.
+- **The sea.** Land-cover water, or no data, whose elevation is at most 3 m over the sea level (real coastal water
+  often reads 0 to a few metres) is sea. Its bed is a shelf: 1 block deep next to land, 0.75 block deeper for every
+  block away, at most 6 blocks, never higher than the elevation.
+- **Rivers.** Each atlas reach is a line with a water level at each point that never rises downstream, and a
+  discharge. Width is `7.2 Q^0.5` metres and depth `0.27 Q^0.39` metres (hydraulic geometry, Andreadis et al. 2013),
+  at least 2 m wide and one block deep. Columns within the half width are the channel: water at the level of the
+  nearest point of the line, deepest in the middle, over gravel. Land-cover water within 30 m (or one half width)
+  beyond the channel is the river's wider bed, half as deep. Beyond the channel the bank blends from one block over
+  the water to the elevation over 2 to 16 blocks, so a river over low ground gets raised banks and a river in a
+  canyon sits on its floor. A river more than 32 blocks under the ground is left out.
+- **Lakes.** Land-cover water above the sea is a lake: flat at the level of the atlas lake whose box holds it and
+  whose level is within 20 m of the elevation, else one block under the lowest elevation of its columns within 8
+  samples. It deepens 0.75 block per block from its shore, to its mean depth (2 to 16 blocks), or 3 without a
+  record.
+- **Bounds.** A column's ground is never more than 32 blocks under its elevation and a river or lake top never more
+  than 8 over it, so box classification stays exact with margins of that much.
+- **Nothing hangs.** A dry column next to water whose top is over its ground is raised to that top (at most 8
+  blocks); then water next to lower dry ground is lowered to it, its bed carved to keep a block of water, or it
+  becomes dry. Steps between two water columns stay (a river stepping down).
+- **Shores.** Dry ground within 3 blocks of sea or lake water, and at most 2 blocks over it, and the ground right
+  beside a river channel, is sand, gravel where it is cold (a mean annual temperature under 2 C, or 50 degrees of
+  latitude and more without climate), stone where it is steep. Snow, marsh and built-up ground keep their own top. A
+  cold sea or lake bed is gravel.
+- **Near and far agree.** The rules read a window of 11 samples on every side of what is asked, at the same spacing
+  and zoom, and a column's answer depends only on the samples within 11 of it, so cubes, single blocks and far nodes
+  agree. In the far view a river at least a quarter of a sample wide shows as one sample column at least.
+- **Biomes and plants.** A 4 by 4 column whose middle block is in a river channel is `river` (`frozen_river` when
+  cold), and a channel grows water plants only.
+- **Sky cover.** The far view's sky cover uses the final tops once the land cover is held, so a carved channel is
+  not shaded by the ground it was carved from.
+- **The cache key.** `terrain_key()` also has `#water<atlas rules>.<generator rules>` while land cover is on, with
+  `.noatlas` when the build has no atlas.
+
 ### Far view: trees and snow
 
 With land cover and vegetation on, the far view draws trees from data it already holds, without running vanilla's
@@ -478,6 +520,9 @@ waits. Style, shapes and sizes are in the table of `earth/far_trees.rs`.
 - **Land below sea level floods** unless land cover says otherwise. The sea is at `seaLevelY`: with elevation
   alone any ground lower than 0 m has water over it, so a dry depression such as the Dead Sea shore, or the
   Netherlands, is under water. With land cover on, ground whose class is known and not water stays dry.
+- **Water is a snapshot.** Rivers and lakes are placed, not simulated: water never flows. A marsh is one block of
+  water at its ground and its edges are not held in by the water rules. A river whose atlas line is off from the
+  elevation's valley is still carved where the line says, within 32 blocks of depth.
 - **The data is coarse.** The tiles have about one point per 30 metres in most places (finer in a few). Closer
   than that at 1 block = 1 metre, terrain is smooth.
 - **The projection is local.** Blocks map to the globe by a projection tangent at the origin, so far from it

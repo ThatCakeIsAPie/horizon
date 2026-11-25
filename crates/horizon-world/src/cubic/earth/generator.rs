@@ -54,7 +54,7 @@ use super::dry::{BAND_COUNT, DRY_ROCK_DEPTH, DryColumn, DryTop, band_index, band
 use super::far_trees::MAX_TREE_UP;
 use super::settings::EarthSettings;
 use super::surface::{SLOPE_BASE_M, SNOW_DEPTH, SOIL_DEPTH, STEEP_GRADIENT, SurfaceKind};
-use super::water::{Bed, MAX_CARVE, MAX_RAISE};
+use super::water::{Bed, MAX_CARVE, MAX_RAISE, WINDOW_PAD};
 use crate::cubic::custom::replacers::resolve_block;
 use crate::cubic::custom::settings::BlockStateDesc;
 use crate::registry::BlockRegistry;
@@ -229,6 +229,8 @@ pub struct EarthGenerator {
     climate_on: bool,
     /// The climate the generator was handed, kept only while the settings ask for it (and land cover is on).
     climate: Option<Arc<horizon_earth::ClimateSource>>,
+    /// The water atlas and the river indexes built from it ([`super::water_gen`]).
+    pub(super) water: super::water_gen::WaterState,
 }
 
 impl EarthGenerator {
@@ -256,6 +258,7 @@ impl EarthGenerator {
             land: None,
             climate_on: settings.land_cover && settings.climate,
             climate: None,
+            water: super::water_gen::WaterState::default(),
         })
     }
 
@@ -470,7 +473,7 @@ impl EarthGenerator {
     /// Whether the ground at block `(x, z)` (surface `s`) is steep: a neighbour one [`EarthGenerator::slope_base`]
     /// away north, south, east or west differs in height by [`STEEP_GRADIENT`] of that distance or more, the
     /// heights read at the zoom of `zoom_step`. A neighbour whose tile is missing is a gap, never a guess.
-    fn is_steep(
+    pub(super) fn is_steep(
         &self,
         a: Access,
         x: i32,
@@ -572,18 +575,20 @@ impl EarthGenerator {
                 (columns, None)
             }
             Some(land) => {
-                let classes =
-                    self.classes_core(a, land, [x0, z0], [width, depth], stride, zoom_step)?;
-                let columns = surfaces
+                // The water rules read a padded window around the columns ([`super::water_gen`]).
+                let water =
+                    self.water_columns(a, land, [x0, z0], [width, depth], stride, zoom_step)?;
+                let columns = water
+                    .columns
                     .iter()
-                    .zip(&classes)
+                    .zip(&water.classes)
                     .enumerate()
-                    .map(|(i, (&s0, &class))| {
+                    .map(|(i, (&cw, &class))| {
                         let (x, z) = at(i);
-                        self.land_column(a, [x, z], s0, stride, zoom_step, class)
+                        self.water_column(a, [x, z], cw, class, stride, zoom_step)
                     })
                     .collect::<Result<Vec<_>, Gap>>()?;
-                (columns, Some(classes))
+                (columns, Some(water.classes))
             }
         };
         let mut kinds = Vec::with_capacity(columns.len());
@@ -615,7 +620,7 @@ impl EarthGenerator {
     /// The column `(s, kind)` of a column of known `class` whose elevation surface is `s0`: what the class makes
     /// of it ([`SurfaceKind::on_classified`]), and under the sea level a water class is the sea
     /// ([`SurfaceKind::sea_column`]: its top is the block under the sea level, not `s0`).
-    fn land_column(
+    pub(super) fn land_column(
         &self,
         a: Access,
         [x, z]: [i32; 2],
@@ -673,13 +678,14 @@ impl EarthGenerator {
         Ok(climate.map(|c| DryColumn::new(c, x, z)))
     }
 
-    /// `r` grown by what the kinds of its columns read beyond it (a bare column's neighbours), for the lists of
-    /// tiles a read is not ready for. Unchanged without land cover.
+    /// `r` grown by what the kinds of its columns read beyond it (the water rules' window of
+    /// [`WINDOW_PAD`] samples, and a bare column's neighbours), for the lists of tiles a read is not ready for.
+    /// Unchanged without land cover.
     pub(super) fn kind_rect(&self, r: Rect, stride: i32) -> Rect {
         if self.land.is_none() {
             return r;
         }
-        let d = self.slope_base(stride);
+        let d = Self::window_grow(stride).saturating_add(self.slope_base(stride));
         Rect {
             x0: r.x0.saturating_sub(d),
             z0: r.z0.saturating_sub(d),
@@ -697,7 +703,22 @@ impl EarthGenerator {
             return Vec::new();
         };
         let metres = f64::from(step.max(1)) * self.field.projection().metres_per_block();
-        land.field().needs(x0, z0, x1, z1, metres)
+        // The water rules read the classes of a padded window around what is asked.
+        let g = Self::window_grow(step);
+        let (x0, x1) = (x0.min(x1), x0.max(x1));
+        let (z0, z1) = (z0.min(z1), z0.max(z1));
+        land.field().needs(
+            x0.saturating_sub(g),
+            z0.saturating_sub(g),
+            x1.saturating_add(g),
+            z1.saturating_add(g),
+            metres,
+        )
+    }
+
+    /// The blocks the water rules' window reaches beyond columns `stride` blocks apart.
+    pub(super) fn window_grow(stride: i32) -> i32 {
+        (WINDOW_PAD as i32).saturating_mul(stride.max(1))
     }
 
     /// The block a [`Fill`] stands for; `None` for `Mixed`.

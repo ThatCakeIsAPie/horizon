@@ -73,7 +73,10 @@ impl NodeColumns {
 
 impl EarthGenerator {
     /// The surfaces alone of [`EarthGenerator::columns_at`]: what only the height of the ground decides (sky
-    /// cover), which does not wait for land cover.
+    /// cover), which does not wait for land cover. With land cover the water rules move surfaces (a carved
+    /// channel, a raised bank, the sea's top over a sunken column): when the land cover is already held the final
+    /// surfaces are given, so a channel is not covered by the ground it was carved out of; when it is not, the
+    /// elevation surfaces are (as without land cover).
     pub fn surfaces_at(
         &self,
         x0: i32,
@@ -81,6 +84,11 @@ impl EarthGenerator {
         stride: i32,
         zoom_step: i32,
     ) -> Result<Vec<i32>, NotReady> {
+        if self.land_cover_active()
+            && let Ok(columns) = self.columns_at(x0, z0, stride, zoom_step)
+        {
+            return Ok(columns.surfaces);
+        }
         let stride = stride.max(1);
         let (sx, sz) = (x0.saturating_add(stride / 2), z0.saturating_add(stride / 2));
         let zoom = self.zoom_for_step(zoom_step);

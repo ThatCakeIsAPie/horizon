@@ -402,15 +402,18 @@ fn the_snow_line_still_whitens_peaks_the_map_calls_something_else() {
 
 #[test]
 fn a_lake_above_the_sea_is_water_to_its_surface_over_a_sand_bed() {
+    // With no atlas record the lake is flat one block under the lowest elevation of its columns
+    // ([`super::water`]), here the level ground: its top is `s - 1` of the elevation surface `s`.
     let rig = LandRig::level(45.0, 120.0, 80);
     let b = rig.blocks;
     let bed = LAKE_DEPTH as i32;
     let s = rig.check(0, 0, |y, s| {
-        if y < s - bed - 3 {
+        let top = s - 1;
+        if y < top - bed - 3 {
             b.stone
-        } else if y <= s - bed {
+        } else if y <= top - bed {
             b.sand
-        } else if y <= s {
+        } else if y <= top {
             b.water
         } else {
             b.air
@@ -537,6 +540,11 @@ fn a_file_the_source_does_not_have_is_no_data_asked_for_once_and_never_waited_fo
     let start = std::time::Instant::now();
     for c in area(&rig).into_iter().take(60) {
         let (got, uniform) = blocks_of(&rig.generator, c);
+        // Away from the coast no data is the elevation rule; at the coast the water rules ([`super::water`])
+        // add the sea's tolerance, shelf and shore, which the plain world does not have.
+        if c.x.abs() < 20 {
+            continue;
+        }
         let (want, want_uniform) = blocks_of(&rig.plain, c);
         assert_eq!(&got[..], &want[..], "cube {c:?}");
         assert_eq!(uniform, want_uniform);

@@ -38,6 +38,9 @@ pub mod vegetation;
 #[cfg(test)]
 mod vegetation_tests;
 pub mod water;
+mod water_gen;
+#[cfg(test)]
+mod water_gen_tests;
 #[cfg(test)]
 mod water_tests;
 

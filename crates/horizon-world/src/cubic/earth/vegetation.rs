@@ -225,6 +225,10 @@ impl EarthVegetationMask {
     fn class_at(&self, x: i32, z: i32) -> Option<LandClass> {
         let g = &*self.generator;
         let land = g.land_source()?;
+        // A river channel of the water atlas is water whatever the map says: no trees in a carved channel.
+        if g.river_channel_at(x, z).is_some() {
+            return Some(LandClass::Water);
+        }
         let metres = g.field().projection().metres_per_block();
         let rect = Rect {
             x0: x,
