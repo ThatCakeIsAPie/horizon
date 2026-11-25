@@ -188,19 +188,13 @@ mod tests {
         let dir = TempDir::new();
         let fetcher = Arc::new(MemoryLandCover::new());
         let first = source(fetcher.clone(), &dir);
-        assert_eq!(
-            first.class_at_blocking(0.5, 0.5, 1.0).unwrap(),
-            LandClass::NoData
-        );
+        assert_eq!(first.class_at_blocking(0.5, 0.5, 1.0).unwrap(), LandClass::NoData);
         assert_eq!(fetcher.fetch_count(), 1);
         // A new store over the same folder asks nothing: its plain read already says "no file".
         let again = Arc::new(MemoryLandCover::new());
         let second = source(again.clone(), &dir);
         assert_eq!(second.field().class_at_block(0, 0), Lookup::NoFile);
-        assert_eq!(
-            second.class_at_blocking(0.5, 0.5, 1.0).unwrap(),
-            LandClass::NoData
-        );
+        assert_eq!(second.class_at_blocking(0.5, 0.5, 1.0).unwrap(), LandClass::NoData);
         assert_eq!(again.fetch_count(), 0);
     }
 
@@ -214,10 +208,7 @@ mod tests {
         assert!(fetcher.fetch_count() >= 2);
         let again = Arc::new(MemoryLandCover::new());
         let second = source(again.clone(), &dir);
-        assert_eq!(
-            second.class_grid_blocking(0, 0, 8, 8, 1, 1.0).unwrap(),
-            grid
-        );
+        assert_eq!(second.class_grid_blocking(0, 0, 8, 8, 1, 1.0).unwrap(), grid);
         assert_eq!(again.fetch_count(), 0);
     }
 
@@ -228,20 +219,14 @@ mod tests {
         fetcher.fail_with(Some(FetchError::Refused("not approved".into())));
         let source = source(fetcher.clone(), &dir);
         // The blocking read answers instead of failing or looping: the file's index is "no data".
-        assert_eq!(
-            source.class_at_blocking(0.5, 0.5, 1.0).unwrap(),
-            LandClass::NoData
-        );
+        assert_eq!(source.class_at_blocking(0.5, 0.5, 1.0).unwrap(), LandClass::NoData);
         assert_eq!(fetcher.fetch_count(), 1);
         // The caller that fetches in the background hears the refusal once, then the same answer.
         assert_eq!(source.field().class_at_block(0, 0), Lookup::NoFile);
         // Another run (the player approved meanwhile) asks again: nothing was written.
         fetcher.fail_with(None);
         let next = self::source(fetcher.clone(), &dir);
-        assert_eq!(
-            next.class_at_blocking(0.5, 0.5, 1.0).unwrap(),
-            LandClass::Tree
-        );
+        assert_eq!(next.class_at_blocking(0.5, 0.5, 1.0).unwrap(), LandClass::Tree);
     }
 
     #[test]
@@ -259,9 +244,6 @@ mod tests {
         };
         fetcher.fail_with(Some(FetchError::Refused("no".into())));
         assert!(matches!(source.satisfy(&tile), Err(FetchError::Refused(_))));
-        assert_eq!(
-            source.field().class_at_block(0, 0),
-            Lookup::Class(LandClass::NoData)
-        );
+        assert_eq!(source.field().class_at_block(0, 0), Lookup::Class(LandClass::NoData));
     }
 }
