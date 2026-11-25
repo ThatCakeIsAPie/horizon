@@ -74,6 +74,19 @@ impl CubeKey {
         let size = self.size();
         [self.x * size, self.y * size, self.z * size]
     }
+    /// The node whose extent is exactly the box `min..=max` of blocks, if one is.
+    pub fn of_box(min: [i32; 3], max: [i32; 3]) -> Option<Self> {
+        let size = i64::from(max[0]) - i64::from(min[0]) + 1;
+        let level = (0..=MAX_CUBE_LEVEL).find(|&l| i64::from(16i32 << l) == size)?;
+        let key = Self::new(
+            level,
+            min[0].div_euclid(16 << level),
+            min[1].div_euclid(16 << level),
+            min[2].div_euclid(16 << level),
+        );
+        let end = key.origin().map(|o| i64::from(o) + size - 1);
+        (key.origin() == min && end == max.map(i64::from)).then_some(key)
+    }
     /// The node one level up that holds this one (rounding toward negative
     /// infinity, so negative coordinates nest too).
     pub const fn parent(self) -> Self {
@@ -421,6 +434,10 @@ pub trait LateContent: Send + Sync {
     /// Boxes of blocks (minimum, maximum, inclusive) whose nodes are out of
     /// date, taken.
     fn take_refreshes(&self) -> Vec<([i32; 3], [i32; 3])>;
+    /// The boxes just taken that are no drawn node's own extent (the plan
+    /// dropped that node): nothing is made for them, so whatever waits on them
+    /// can stop waiting. Nothing by default.
+    fn not_drawn(&self, _boxes: &[([i32; 3], [i32; 3])]) {}
 }
 
 /// A sampled node on the GPU path: its voxels, or a slot of the GPU node pool
@@ -3129,6 +3146,21 @@ impl CubeLod {
                 })
             })
         };
+        // A box that is no drawn node's own extent: its node left the plan, and
+        // nothing is made for it.
+        let not_drawn: Vec<([i32; 3], [i32; 3])> = (boxes.iter())
+            .filter(|(min, max)| {
+                let drawn = CubeKey::of_box(*min, *max).is_some_and(|k| {
+                    self.delivered.contains(&k)
+                        && (self.wanted.contains(&k) || self.cover.contains(&k))
+                });
+                !drawn
+            })
+            .copied()
+            .collect();
+        if !not_drawn.is_empty() {
+            late.not_drawn(&not_drawn);
+        }
         let again: Vec<CubeKey> = (self.delivered.iter())
             .filter(|k| self.wanted.contains(k) || self.cover.contains(k))
             .filter(|k| !self.refreshing.contains(k) && touches(k))
@@ -3138,6 +3170,15 @@ impl CubeLod {
             return;
         }
         self.stats.late_refreshed += again.len() as u64;
+        // Made again means asked of the sampler again: the node the workers
+        // keep in memory is the out-of-date one (taking it back left the far
+        // view's coarse Earth nodes coarse, without their trees, for good).
+        {
+            let mut cache = self.shared.cache.lock().unwrap();
+            for key in &again {
+                cache.nodes.remove(key);
+            }
+        }
         self.refreshing.extend(again.iter().copied());
         self.shared.queue.lock().unwrap().later.extend(again);
         self.shared.wake.notify_all();
@@ -4948,6 +4989,24 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// A node key from its box of blocks ([`LateContent::not_drawn`]).
+    #[test]
+    fn a_node_is_found_from_its_own_box_only() {
+        for key in [
+            CubeKey::new(0, 3, -2, 7),
+            CubeKey::new(4, -1, 0, 5),
+            CubeKey::new(9, 0, -3, -1),
+        ] {
+            let (o, size) = (key.origin(), key.size());
+            let max = o.map(|v| v + size - 1);
+            assert_eq!(CubeKey::of_box(o, max), Some(key));
+        }
+        // Not a node's extent: off its grid, or not a cube.
+        assert_eq!(CubeKey::of_box([1, 0, 0], [16, 15, 15]), None);
+        assert_eq!(CubeKey::of_box([0, 0, 0], [15, 31, 15]), None);
+        assert_eq!(CubeKey::of_box([0, 0, 0], [20, 20, 20]), None);
+    }
+
     /// Late content (structures found after the terrain) has the drawn
     /// nodes over its boxes made again once the plan is complete: only those
     /// it touches, after every other job, and not once a plan drops them.
@@ -4994,6 +5053,74 @@ mod tests {
         put(&mut lod, &[other], &[]);
         assert!(lod.refreshing.is_empty());
         assert!(lod.shared.queue.lock().unwrap().later.is_empty());
+    }
+
+    /// Late content hears which of its boxes are no drawn node's own extent
+    /// (the plan dropped the node), so it does not wait on them.
+    #[test]
+    fn late_content_hears_of_boxes_with_no_drawn_node() {
+        type Boxes = Vec<([i32; 3], [i32; 3])>;
+        struct Late(std::sync::Mutex<Boxes>, std::sync::Mutex<Boxes>);
+        impl LateContent for Late {
+            fn view(&self, _: [f64; 3], _: [f64; 3], _: f64, _: bool) {}
+            fn take_refreshes(&self) -> Vec<([i32; 3], [i32; 3])> {
+                std::mem::take(&mut *self.0.lock().unwrap())
+            }
+            fn not_drawn(&self, boxes: &[([i32; 3], [i32; 3])]) {
+                self.1.lock().unwrap().extend_from_slice(boxes);
+            }
+        }
+        let mut lod = lod_for_test();
+        let drawn = key(1, 0, 0, 0);
+        put(&mut lod, &[drawn], &[]);
+        lod.deliver(drawn, false);
+        let box_of = |k: CubeKey| {
+            let (o, size) = (k.origin(), k.size());
+            (o, o.map(|v| v + size - 1))
+        };
+        let dropped = key(1, 7, 0, 0);
+        let late = Arc::new(Late(
+            std::sync::Mutex::new(vec![box_of(drawn), box_of(dropped)]),
+            std::sync::Mutex::new(Vec::new()),
+        ));
+        lod.late = Some(late.clone());
+        lod.shared.queue.lock().unwrap().clear();
+        lod.late_content([0.0; 3], [0.0, 0.0, 1.0], 1e4);
+        assert_eq!(*late.1.lock().unwrap(), [box_of(dropped)]);
+        assert_eq!(lod.refreshing.iter().copied().collect::<Vec<_>>(), [drawn]);
+    }
+
+    /// A node made again is asked of the sampler again, not taken back from
+    /// the workers' memory (where the out-of-date one is).
+    #[test]
+    fn late_content_forgets_the_kept_node_it_makes_again() {
+        struct Late(std::sync::Mutex<Vec<([i32; 3], [i32; 3])>>);
+        impl LateContent for Late {
+            fn view(&self, _: [f64; 3], _: [f64; 3], _: f64, _: bool) {}
+            fn take_refreshes(&self) -> Vec<([i32; 3], [i32; 3])> {
+                std::mem::take(&mut *self.0.lock().unwrap())
+            }
+        }
+        let mut lod = lod_for_test();
+        let drawn = key(0, 2, 0, 0);
+        put(&mut lod, &[drawn], &[]);
+        lod.deliver(drawn, false);
+        let air = BlockStateId(0);
+        let node = CubeNode::from_fn(drawn, |_, _, _| Voxel {
+            state: air,
+            biome: 0,
+        });
+        lod.shared.cache.lock().unwrap().insert(Arc::new(node));
+        assert!(lod.shared.cache.lock().unwrap().get(drawn).is_some());
+        let (o, size) = (drawn.origin(), drawn.size());
+        lod.late = Some(Arc::new(Late(std::sync::Mutex::new(vec![(
+            o,
+            o.map(|v| v + size - 1),
+        )]))));
+        lod.shared.queue.lock().unwrap().clear();
+        lod.late_content([0.0; 3], [0.0, 0.0, 1.0], 1e4);
+        assert_eq!(lod.refreshing.iter().copied().collect::<Vec<_>>(), [drawn]);
+        assert!(lod.shared.cache.lock().unwrap().get(drawn).is_none());
     }
 
     fn lod_for_test() -> CubeLod {

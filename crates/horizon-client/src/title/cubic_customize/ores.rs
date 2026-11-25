@@ -53,7 +53,8 @@ const DIAMETER: (i32, i32) = (3, 25);
 const FREQUENCY_MAX: f64 = 32.0;
 const BURIED_DEPTH: (i32, i32) = (0, 128);
 const MIX_MAX: f64 = 0.5;
-const KIND_WEIGHT_MAX: f64 = 10.0;
+/// The meteor kind weight slider's top: above the heaviest default kind (iron, 30).
+const KIND_WEIGHT_MAX: f64 = 50.0;
 /// The ores a meteor kind picks from (short names, as `MeteorKind` has them).
 const METEOR_ORES: [&str; 8] = [
     "iron", "copper", "coal", "gold", "redstone", "lapis", "diamond", "emerald",
