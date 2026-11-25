@@ -426,17 +426,24 @@ cropland, water, wetland, mangroves and moss are unchanged.
 | Class in a dry climate | Steep (`STEEP_GRADIENT`) | Gentle |
 |---|---|---|
 | bare | `Banded`: terracotta bands | `T` of 18 °C or more: sand (dunes); else `Barren`: red sand 55 %, coarse dirt 45 % |
-| shrubland, grassland | `Banded` | `Scrub`: a mix by a fixed hash of the block column: desert (`r` < 0.5) 15 % grass block, 45 % coarse dirt, 40 % red sand; dry scrub (0.5 to 1.3) 40 %, 40 %, 20 % |
+| shrubland | `Banded` | `Scrub`: a mix by a fixed hash of the block column (so block by block, never in patches): desert (`r` < 0.5) 15 % grass block, 45 % coarse dirt, 40 % red sand; dry scrub (0.5 to 1.3) 40 %, 40 %, 20 % |
+| grassland | `Banded` | grass over three dirt, as in a wet climate: the map says the ground is covered |
 
-Bare ground from 50° latitude stays gravel. The mix is carried in the kind (`Scrub(DryTop)`), so the far view, which
-calls `block_for` with the kind alone, shows the same tops as the near terrain; far trees may stand on `Scrub`.
+Bare ground from 50° latitude stays gravel. Grassland and tree cover never take dry tops: the red sand and coarse
+dirt of the dry places are only where the map says the cover is sparse (shrub) or bare, so a grass or forest pixel
+next to a shrub one does not turn into a 30 m orange square. The mix is carried in the kind (`Scrub(DryTop)`). A far
+voxel stands for many columns, so it does not show one column's pick: the top voxel of `Scrub` is coarse dirt and
+of `Barren` red sand, each mix's main block (`dry::SCRUB_FAR`, `dry::BARREN_FAR`); far trees may stand on `Scrub`.
 
 **Bands.** Under the top of a `Banded`, `Scrub` or `Barren` column the blocks are terracotta down to 32 blocks under
 the surface, stone below (the section fill shortcut uses the same depth while climate is on, and today's depth
 with it off). The band at height `y` is entry `(y div 4) mod 192` of Horizon's port of vanilla's clay bands
 (`worldgen/material_surface.rs`, `ClayBands::generate`: terracotta, orange, yellow, brown, red, white and light gray)
 made once from a fixed seed (not the world's, so every world and every far cache agree) and indexed by **absolute**
-height with no noise offset, so the strata run level across canyon walls whatever the surface. One band spans 4
+height with no noise offset, so the strata run level across canyon walls whatever the surface. A far voxel of
+banded rock (`step` blocks tall, from `lo`) is the band at its middle height, `lo + step / 2`, for every column,
+the surface voxel too: its colour depends on the height alone, so a row of far voxels is one level band at every
+far level, and where a voxel lies within one band it is the near band. One band spans 4
 blocks, not vanilla's 1: real strata are tens of metres thick, and a 1,000 m wall of 1-block bands would be
 pin-stripes. The pattern repeats every 768 blocks.
 
@@ -459,8 +466,8 @@ flowers, bushes) on only 30 % of the columns, by a fixed column hash, via the bi
 (`biome_at_quart_blocking`, remembered per 4 by 4 column). It needs a climate source: without one the biomes do not
 say which places are dry.
 
-- **The cache key.** `surface::LAND_RULES` is 7 (3: steep snow, glaciers, wet bare rock; 4: moss mix; 7: built-up land is natural land, no built-up kind), `biome::CLIMATE_BIOME_RULES` and
-  `vegetation::VEGETATION_RULES` are 2 (the key ends `#landcover<data>.7 ... #vegetation2 ... #climate<data>.2`), so
+- **The cache key.** `surface::LAND_RULES` is 8 (3: steep snow, glaciers, wet bare rock; 4: moss mix; 7: built-up land is natural land, no built-up kind; 8: dry grassland stays grass, far dry voxels level), `biome::CLIMATE_BIOME_RULES` and
+  `vegetation::VEGETATION_RULES` are 2 (the key ends `#landcover<data>.8 ... #vegetation2 ... #climate<data>.2`), so
   caches made before these rules are rebuilt.
 
 ### Ore richness
@@ -703,6 +710,9 @@ header and index once; each 1-degree cell is inflated and decoded the first time
 - **The projection is local.** Blocks map to the globe by a projection tangent at the origin, so far from it
   (hundreds of kilometres at a large scale) distances and directions drift from the real ones.
 - Seas are not charted in detail: ETOPO1 is coarse.
+- **Dry ground follows the map's pixels.** Shrubland in a dry climate is a block-by-block mix, but where it borders
+  grassland or forest the edge is the land-cover pixel's (about 10 m) square edge. Far away a dry top is one block
+  per voxel (coarse dirt for scrub, red sand for barren ground), not the mix.
 - **Data cleaning.** The source stitches 1°×1° cells, and along those lines (28°N, for one) whole rows or columns
   of pixels are thousands of metres off, which showed up as a straight trench. When a tile is decoded, a pixel
   (or a run of up to two) that differs from its neighbours on both sides along a row or column by more than 32

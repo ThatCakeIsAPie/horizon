@@ -69,7 +69,7 @@ fn the_cache_keys_know_the_dry_rules() {
     settings.climate = true;
     let key = settings.terrain_key();
     assert!(key.contains("#landcover"), "{key}");
-    assert_eq!(surface::LAND_RULES, 7);
+    assert_eq!(surface::LAND_RULES, 8);
     assert_eq!(biome::CLIMATE_BIOME_RULES, 4);
     assert_eq!(vegetation::VEGETATION_RULES, 2);
     assert!(key.contains(&format!(".{}", surface::LAND_RULES)), "{key}");
@@ -114,15 +114,19 @@ fn dry_bare_steep_ground_is_banded_and_gentle_ground_depends_on_the_heat() {
 }
 
 #[test]
-fn dry_shrub_and_grass_are_banded_where_steep_and_scrub_where_gentle() {
+fn dry_shrub_is_scrub_where_gentle_and_dry_grass_stays_grass_both_banded_where_steep() {
     let dry = col(12.0, 0.7, 0);
     for class in [LandClass::Shrub, LandClass::Grass] {
         assert_eq!(kind(class, 36.0, dry, SLOPE), SurfaceKind::Banded);
-        assert!(matches!(
-            kind(class, 36.0, dry, NO_SLOPE),
-            SurfaceKind::Scrub(_)
-        ));
     }
+    assert!(matches!(
+        kind(LandClass::Shrub, 36.0, dry, NO_SLOPE),
+        SurfaceKind::Scrub(_)
+    ));
+    assert_eq!(
+        kind(LandClass::Grass, 36.0, dry, NO_SLOPE),
+        SurfaceKind::Grass
+    );
 }
 
 #[test]
@@ -139,7 +143,7 @@ fn the_scrub_mix_follows_the_stated_shares_per_column() {
                     x,
                     z,
                 );
-                match kind(LandClass::Grass, 36.0, Some(c), NO_SLOPE) {
+                match kind(LandClass::Shrub, 36.0, Some(c), NO_SLOPE) {
                     SurfaceKind::Scrub(DryTop::GrassBlock) => grass += 1,
                     SurfaceKind::Scrub(DryTop::CoarseDirt) => coarse += 1,
                     SurfaceKind::Scrub(DryTop::RedSand) => sand += 1,
@@ -389,14 +393,18 @@ fn banded_ground_has_the_same_band_at_the_same_height_whatever_the_surface() {
         g.block_for(77, 77, SurfaceKind::Barren(DryTop::RedSand)),
         b.red_sand
     );
-    // Far voxels: the voxel holding the surface is the surface, one below is the band at its top.
+    // Far voxels: the voxel holding a mixed top is the mix's main block, one below is the band at its middle.
     assert_eq!(
         g.voxel_block(72, 8, 77, SurfaceKind::Scrub(DryTop::RedSand)),
+        b.coarse_dirt
+    );
+    assert_eq!(
+        g.voxel_block(72, 8, 77, SurfaceKind::Barren(DryTop::CoarseDirt)),
         b.red_sand
     );
     assert_eq!(
         g.voxel_block(48, 8, 77, SurfaceKind::Banded),
-        table[band_index(55)]
+        table[band_index(52)]
     );
     // Other kinds keep their three blocks of soil.
     assert_eq!(
@@ -736,7 +744,7 @@ fn the_section_fill_shortcut_does_not_hide_the_bands_under_dry_ground() {
 
 #[test]
 fn a_dry_scrub_ground_is_sparse_and_its_columns_are_what_the_far_view_shows() {
-    let (rig, g, _dir) = dry_rig(36.0, |_, _| 1500.0, 30, 12.0, 100.0);
+    let (rig, g, _dir) = dry_rig(36.0, |_, _| 1500.0, 20, 12.0, 100.0);
     let b = rig.blocks;
     let mut tops = std::collections::BTreeSet::new();
     for x in 0..40 {
@@ -771,6 +779,11 @@ fn a_dry_scrub_ground_is_sparse_and_its_columns_are_what_the_far_view_shows() {
     for i in [0, 5, 17, 100, 255] {
         assert!(matches!(cols.kind(i), SurfaceKind::Scrub(_)));
         let (x, z) = cols.block_of(i);
+        assert_eq!(
+            cols.kind(i),
+            kind_at(&g, x, z).1,
+            "near and far kinds of column {i}"
+        );
         let s = cols.surfaces[i];
         for lo in [s - 40, s - 12, s - 3, s, s + 4] {
             let lo = EarthGenerator::voxel_floor(lo, 4);
@@ -866,5 +879,171 @@ fn the_far_view_is_ready_for_dry_biomes_only_when_the_neighbours_are_loaded() {
     assert_eq!(
         g.biome_core(Access::Local, 0, 0).ok(),
         Some(Biome::ErodedBadlands)
+    );
+}
+
+/// The columns of the far read at `(x, z)` with `step`, fetching what it lacks.
+fn far_columns(
+    rig: &LandRig,
+    g: &EarthGenerator,
+    x: i32,
+    z: i32,
+    step: i32,
+) -> super::far::NodeColumns {
+    loop {
+        match g.columns_at(x, z, step, step) {
+            Ok(cols) => return cols,
+            Err(missing) => {
+                for &id in &missing.tiles {
+                    rig.store.load(id).unwrap();
+                }
+                for fetch in g.take_land_requests() {
+                    rig.source.satisfy(&fetch).unwrap();
+                }
+                for fetch in g.take_climate_requests() {
+                    g.climate_source().unwrap().satisfy(&fetch).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn grass_and_forest_never_get_dry_patch_blocks_near_or_far() {
+    // Every dry climate the rules tell apart: desert and scrub, hot and cool.
+    for (t, r) in [(10.0, 1.2), (10.0, 0.3), (25.0, 0.9), (25.0, 0.1)] {
+        for bucket in [0, 100, 450, 700, 999] {
+            let dry = col(t, r, bucket);
+            for class in [LandClass::Grass, LandClass::Tree] {
+                assert_eq!(
+                    kind(class, 36.0, dry, NO_SLOPE),
+                    SurfaceKind::Grass,
+                    "{class:?} {t} {r}"
+                );
+            }
+        }
+    }
+    // Through the generator: grassland (30) and forest (10) in the South Rim's climate, near and at far steps.
+    for code in [30, 10] {
+        let (rig, g, _dir) = dry_rig(36.0, |_, _| 2100.0, code, 10.0, 430.0);
+        let b = rig.blocks;
+        for x in 0..24 {
+            for z in 0..8 {
+                let (s, k) = kind_at(&g, x, z);
+                assert_eq!(k, SurfaceKind::Grass, "class {code} at {x},{z}");
+                assert_eq!(g.block_at_blocking(x, s, z, 1), b.grass_block);
+            }
+        }
+        for step in [2, 8, 32] {
+            let cols = far_columns(&rig, &g, 0, 0, step);
+            for i in [0, 9, 77, 200, 255] {
+                assert_eq!(cols.kind(i), SurfaceKind::Grass, "class {code} step {step}");
+                let s = cols.surfaces[i];
+                let lo = EarthGenerator::voxel_floor(s, step);
+                assert_eq!(g.far_voxel(&cols, i, lo), b.grass_block);
+            }
+        }
+    }
+}
+
+#[test]
+fn dry_shrub_is_a_fine_mix_block_by_block_not_patches() {
+    let climate = climate(10.0, 430.0).unwrap();
+    let top = |x: i32, z: i32| match kind_of(LandClass::Shrub, climate, x, z) {
+        SurfaceKind::Scrub(t) => t,
+        other => panic!("{other:?}"),
+    };
+    // Neighbouring blocks differ about as often as three shares mixed at random do (1 - 0.4² - 0.4² - 0.2² =
+    // 0.64): no run of the same block over a land-cover pixel.
+    let (mut pairs, mut differ) = (0, 0);
+    for x in 0..120 {
+        for z in 0..120 {
+            pairs += 2;
+            differ +=
+                usize::from(top(x, z) != top(x + 1, z)) + usize::from(top(x, z) != top(x, z + 1));
+        }
+    }
+    let share = differ as f64 / pairs as f64;
+    assert!((share - 0.64).abs() < 0.03, "{share}");
+    // Every 4 by 4 square of blocks, wherever it is, holds more than one block, and no 30-block pixel is one colour.
+    for x0 in (-64..64).step_by(4) {
+        for z0 in (-64..64).step_by(4) {
+            let first = top(x0, z0);
+            assert!(
+                (0..4).any(|dx| (0..4).any(|dz| top(x0 + dx, z0 + dz) != first)),
+                "square at {x0},{z0}"
+            );
+        }
+    }
+}
+
+/// The kind of a gentle column of `class` at block `(x, z)` with `climate`.
+fn kind_of(class: LandClass, climate: Climate, x: i32, z: i32) -> SurfaceKind {
+    SurfaceKind::on_classified(
+        class,
+        1200.0,
+        36.0,
+        false,
+        Some(DryColumn::new(climate, x, z)),
+        [x, z],
+        NO_SLOPE,
+    )
+    .unwrap()
+}
+
+#[test]
+fn far_band_colour_depends_on_the_height_alone_and_stays_level_at_every_step() {
+    let rig = LandRig::level(36.0, 1500.0, 60);
+    let g = &rig.generator;
+    let b = rig.blocks;
+    let table = band_table(&b);
+    let kinds = [
+        SurfaceKind::Banded,
+        SurfaceKind::Scrub(DryTop::GrassBlock),
+        SurfaceKind::Scrub(DryTop::RedSand),
+        SurfaceKind::Barren(DryTop::CoarseDirt),
+    ];
+    for level in 1..=6 {
+        let step = 1 << level;
+        for lo in (-256..256).step_by(step as usize) {
+            let want = table[band_index(i64::from(lo) + i64::from(step / 2))];
+            // Columns whose surfaces lie anywhere in this voxel or up to the rock depth over it (a wall seen from
+            // the side): the banded voxel is the same block for each, so a row of voxels is one level band.
+            for s in lo..lo + step + DRY_ROCK_DEPTH as i32 - step {
+                for kind in kinds {
+                    if s < lo + step && !matches!(kind, SurfaceKind::Banded) {
+                        continue;
+                    }
+                    assert_eq!(
+                        g.voxel_block(lo, step, s, kind),
+                        want,
+                        "step {step} voxel {lo} surface {s} {kind:?}"
+                    );
+                }
+            }
+            // Where a voxel lies within one band, it is the band the near blocks have.
+            if step <= BAND_BLOCKS as i32 {
+                for y in lo..lo + step {
+                    assert_eq!(want, g.block_for(y, lo + step + 1, SurfaceKind::Banded));
+                }
+            }
+        }
+        // The top voxel of a mixed dry top is the mix's main block whichever block the column picked.
+        for t in [DryTop::GrassBlock, DryTop::CoarseDirt, DryTop::RedSand] {
+            let s = 100;
+            let lo = EarthGenerator::voxel_floor(s, step);
+            assert_eq!(
+                g.voxel_block(lo, step, s, SurfaceKind::Scrub(t)),
+                b.coarse_dirt
+            );
+            assert_eq!(
+                g.voxel_block(lo, step, s, SurfaceKind::Barren(t)),
+                b.red_sand
+            );
+        }
+    }
+    assert_eq!(
+        (super::dry::SCRUB_FAR, super::dry::BARREN_FAR),
+        (DryTop::CoarseDirt, DryTop::RedSand)
     );
 }

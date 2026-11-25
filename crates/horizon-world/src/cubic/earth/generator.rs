@@ -52,7 +52,8 @@ use horizon_earth::{
 use super::biome::BIOME_SAMPLE_M;
 use super::cover::MossTop;
 use super::dry::{
-    BAND_COUNT, BasaltTop, DRY_ROCK_DEPTH, DryColumn, DryTop, band_index, band_table,
+    BAND_COUNT, BARREN_FAR, BasaltTop, DRY_ROCK_DEPTH, DryColumn, DryTop, SCRUB_FAR, band_index,
+    band_table,
 };
 use super::far_trees::MAX_TREE_UP;
 use super::settings::EarthSettings;
@@ -440,11 +441,9 @@ impl EarthGenerator {
             SurfaceKind::Moss(MossTop::Stone | MossTop::Gravel) => b.stone,
             SurfaceKind::Moss(_) => b.dirt,
             SurfaceKind::Marsh => b.mud,
-            SurfaceKind::Scrub(top) | SurfaceKind::Barren(top) if y == ground => match top {
-                DryTop::GrassBlock => b.grass_block,
-                DryTop::CoarseDirt => b.coarse_dirt,
-                DryTop::RedSand => b.red_sand,
-            },
+            SurfaceKind::Scrub(top) | SurfaceKind::Barren(top) if y == ground => {
+                self.dry_top_block(top)
+            }
             SurfaceKind::Banded | SurfaceKind::Scrub(_) | SurfaceKind::Barren(_) => {
                 self.bands[band_index(y)]
             }
@@ -455,18 +454,39 @@ impl EarthGenerator {
     /// surface is `s` and top of `kind`. A voxel holding the surface block is the surface block; one wholly
     /// below it is what its top block is, one wholly above it is what its bottom block is (air, `s` being the
     /// top of the water too). `step` 1 is [`EarthGenerator::block_for`].
+    ///
+    /// The dry kinds differ: their terracotta is the band of the voxel's middle height (a function of the height
+    /// alone, so the bands stay level whatever the surfaces of the columns), and a mixed top is the mix's main
+    /// block ([`SCRUB_FAR`], [`BARREN_FAR`]), not one column's pick standing for the whole voxel.
     pub fn voxel_block(&self, lo: i32, step: i32, s: i32, kind: SurfaceKind) -> u32 {
         if step <= 1 {
             return self.block_for(lo, s, kind);
         }
         let top = i64::from(lo) + i64::from(step) - 1;
         let surface = i64::from(s);
-        if i64::from(lo) <= surface && surface <= top {
-            self.block_for(s, s, kind)
+        let y = if i64::from(lo) <= surface && surface <= top {
+            s
         } else if top < surface {
-            self.block_for(top as i32, s, kind)
+            top as i32
         } else {
-            self.block_for(lo, s, kind)
+            lo
+        };
+        if kind.is_dry() && y <= s && i64::from(y) >= surface - DRY_ROCK_DEPTH {
+            return match kind {
+                SurfaceKind::Scrub(_) if y == s => self.dry_top_block(SCRUB_FAR),
+                SurfaceKind::Barren(_) if y == s => self.dry_top_block(BARREN_FAR),
+                _ => self.bands[band_index(i64::from(lo) + i64::from(step / 2))],
+            };
+        }
+        self.block_for(y, s, kind)
+    }
+
+    /// The block of a dry top.
+    fn dry_top_block(&self, top: DryTop) -> u32 {
+        match top {
+            DryTop::GrassBlock => self.blocks.grass_block,
+            DryTop::CoarseDirt => self.blocks.coarse_dirt,
+            DryTop::RedSand => self.blocks.red_sand,
         }
     }
 

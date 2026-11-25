@@ -20,7 +20,8 @@
 //! | Class, in a dry climate | Steep | Gentle |
 //! |---|---|---|
 //! | bare | [`SurfaceKind::Banded`] (terracotta bands) | hot (from 18 C): sand dunes; else [`SurfaceKind::Barren`] (red sand, coarse dirt) |
-//! | shrub, grass | [`SurfaceKind::Banded`] | [`SurfaceKind::Scrub`] (grass block, coarse dirt, red sand mixed) |
+//! | shrub | [`SurfaceKind::Banded`] | [`SurfaceKind::Scrub`] (grass block, coarse dirt, red sand mixed block by block) |
+//! | grass | [`SurfaceKind::Banded`] | grass over dirt, as in a wet climate |
 //!
 //! **Steep snow is rock, snow/ice is a glacier, wet bare ground is basalt.** Ground that would be snow (land cover
 //! snow/ice, or at or above the snow line) whose slope is [`SNOW_STEEP_GRADIENT`] or more is bare stone
@@ -34,8 +35,6 @@
 //! whose biome snows and whose still water the snow pass freezes) is grass over dirt, not a marsh: one block of
 //! water over every wetland column of the Arctic coastal plain froze into a single sheet of ice. The tundra's
 //! open water is mapped as water (its thaw lakes) and stays lakes.
-//!
-//! Snow and the alpine band still win first; tree cover, crops, water and wetland are unchanged.
 //!
 //! Snow and the alpine band still win first; tree cover, crops, water and wetland are unchanged.
 //!
@@ -80,7 +79,7 @@ pub const SNOW_DEPTH: i64 = 2;
 pub const RULES: u32 = 2;
 /// The version of the land-cover surface rule and of the biome table ([`super::biome`]): it goes up when what a
 /// column with a known class is made of changes. It is in the terrain key only while land cover is on.
-pub const LAND_RULES: u32 = 7;
+pub const LAND_RULES: u32 = 8;
 /// With land cover, the lowest elevation (m) where the latitude snow line still turns a column that is not
 /// snow or ice on the map white. A map made from one summer's imagery misses seasonal snow on high peaks (Everest
 /// stays white), but the line falls to sea level at the poles, where lowland the map calls bare or moss is not
@@ -179,7 +178,7 @@ pub enum SurfaceKind {
     /// Steep rock in a dry climate: terracotta bands by absolute height ([`super::dry`]), down to
     /// [`DRY_ROCK_DEPTH`](super::dry::DRY_ROCK_DEPTH) blocks under the surface, stone below.
     Banded,
-    /// Sparse ground of a dry climate under shrub and grass: the top is the given block (a fixed hash of the
+    /// Sparse ground of a dry climate under shrub: the top is the given block (a fixed hash of the
     /// column picks it), terracotta bands under it.
     Scrub(DryTop),
     /// Bare flat ground of a dry climate that is not hot: red sand or coarse dirt over terracotta bands.
@@ -247,7 +246,7 @@ impl SurfaceKind {
     ///   steep ground;
     /// * tree and crop: grass over dirt (no block fits crops better: farmland dries out without water);
     /// * shrub and grass: grass over dirt, but in a dry climate ([`DryColumn::is_dry`]): steep ground is
-    ///   [`SurfaceKind::Banded`], gentle ground [`SurfaceKind::Scrub`];
+    ///   [`SurfaceKind::Banded`], gentle shrub [`SurfaceKind::Scrub`] (gentle grass stays grass);
     /// * bare: stone within the alpine band under the snow line, else (steep) stone, or in a dry climate
     ///   [`SurfaceKind::Banded`], else sand, or gravel from [`GRAVEL_FROM_LATITUDE`]; gentle dry bare ground
     ///   is sand (dunes) when hot ([`HOT_C`](super::dry::HOT_C)), else [`SurfaceKind::Barren`]; gentle bare
@@ -291,17 +290,17 @@ impl SurfaceKind {
             LandClass::Tree | LandClass::Crop => Self::Grass,
             // Decoded land cover never holds built-up land (it is the natural land around it); if one is named, it is
             // plain grassland, as no town is.
+            // Grassland keeps its grass in a dry climate (only a wall too steep for soil is rock); shrubland is the
+            // sparse ground, a mix picked block by block.
             LandClass::Shrub | LandClass::Grass | LandClass::BuiltUp => {
                 match dry.filter(DryColumn::is_dry) {
                     None => Self::Grass,
-                    Some(d) => {
-                        if slope()?.is_steep() {
-                            Self::Banded
-                        } else {
-                            let mix = if d.is_desert() { DESERT_MIX } else { SCRUB_MIX };
-                            Self::Scrub(mix.pick(d.bucket))
-                        }
+                    Some(_) if slope()?.is_steep() => Self::Banded,
+                    Some(d) if class == LandClass::Shrub => {
+                        let mix = if d.is_desert() { DESERT_MIX } else { SCRUB_MIX };
+                        Self::Scrub(mix.pick(d.bucket))
                     }
+                    Some(_) => Self::Grass,
                 }
             }
             LandClass::Bare => {
