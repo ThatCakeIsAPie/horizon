@@ -12,6 +12,9 @@
 //! With land cover and the `vegetation` setting, vanilla trees, grass and flowers grow, their density following
 //! the class of each column ([`vegetation`]).
 //!
+//! With the `structures` setting (on by default) vanilla's structures generate through Cubic's structure code,
+//! standing on the real ground ([`structure_ground`]).
+//!
 //! Missing tiles are never guessed: the generator's plain queries give [`NotReady`] naming the tiles to fetch,
 //! and its `*_blocking` forms ([`blocking`]) fetch and wait. The far view reads whole nodes in one batch without
 //! waiting ([`far`]).
@@ -37,6 +40,9 @@ mod ores_tests;
 #[cfg(test)]
 mod rules_tests;
 pub mod settings;
+pub mod structure_ground;
+#[cfg(test)]
+mod structure_ground_tests;
 pub mod surface;
 #[cfg(test)]
 mod tests;

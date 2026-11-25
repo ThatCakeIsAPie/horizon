@@ -98,7 +98,7 @@ impl CubicGeneration {
 }
 
 /// Whether the population of cube `p` runs in a world of `kind`: always in
-/// Custom, never in Flat or Earth (an Earth world with vegetation populates:
+/// Custom, never in Flat or Earth (an Earth world with vegetation, ores or structures populates:
 /// [`Generation::needs_population`]), and in Hybrid when neither `p` nor the cube above
 /// it (its region) is in vanilla's range.
 pub fn needs_population(kind: CubicKind, p: SectionPos) -> bool {
@@ -127,8 +127,9 @@ pub struct Generation {
     /// data: what the far terrain's biome pass is built from.
     pub climate: Option<Arc<ClimateBiomes>>,
     pub vegetation: Option<Arc<Vegetation>>,
-    /// Custom Cubic's structures (none in Hybrid, whose vanilla band has
-    /// vanilla's, or in Flat, or without the generator data).
+    /// Custom Cubic's and Earth's structures (none in Hybrid, whose vanilla band has
+    /// vanilla's, or in Flat, or without the generator data; Earth's also none with
+    /// `structures` off).
     pub structures: Option<Arc<CubicStructures>>,
     /// An Earth world's settings and tiles; `None` for the other types.
     pub earth: Option<EarthParts>,
@@ -186,8 +187,8 @@ impl Generation {
         }
         if choice.kind == CubicKind::Earth {
             // The settings name the place and the tiles. The generator data
-            // gives only the vegetation (with land cover and `vegetation` on);
-            // no structures.
+            // gives the vegetation (with land cover and `vegetation` on) and
+            // the structures (with `structures` on).
             let mut settings = EarthSettings::from_json(&text)?;
             let tiles = tiles.unwrap_or_else(|| {
                 Arc::new(crate::earth_net::open(
@@ -242,14 +243,38 @@ impl Generation {
             let columns = generator
                 .earth_biomes()
                 .unwrap_or_else(|| Arc::new(FixedBiome::new(horizon_world::cubic::earth::BIOME)));
+            // Cubic's structures stand on the generator's real ground and read the biomes it gives; the
+            // population places them. Without the generator data there are none, and the settings say so.
+            let generator = Arc::new(generator);
+            let structures = match (settings.structures, data) {
+                (true, Some(data)) => CubicStructures::new(
+                    data,
+                    seed,
+                    &CustomGeneratorSettings::default(),
+                    generator.clone(),
+                    columns.clone(),
+                )
+                .map(Arc::new),
+                _ => None,
+            };
+            match &structures {
+                Some(s) => log::info!("Horizon: Earth structures: {}", s.set_names().join(", ")),
+                None if settings.structures => {
+                    log::info!(
+                        "Horizon: this Earth world has no structures (they need the generator data)"
+                    );
+                    settings.structures = false;
+                }
+                None => {}
+            }
             return Ok(Self {
                 kind: choice.kind,
-                generator: Arc::new(generator),
+                generator,
                 settings: None,
                 columns,
                 climate: None,
                 vegetation,
-                structures: None,
+                structures,
                 earth: Some(EarthParts { settings, tiles }),
                 seed,
             });
@@ -321,10 +346,15 @@ impl Generation {
     }
 
     /// Whether the population of cube `p` runs: [`needs_population`] for the
-    /// world's kind, and in an Earth world whenever it has vegetation or ores.
+    /// world's kind, and in an Earth world whenever it has vegetation, ores or
+    /// structures.
     pub fn needs_population(&self, p: SectionPos) -> bool {
         match self.kind {
-            CubicKind::Earth => self.vegetation.is_some() || self.generator.has_earth_ores(),
+            CubicKind::Earth => {
+                self.vegetation.is_some()
+                    || self.generator.has_earth_ores()
+                    || self.structures.is_some()
+            }
             kind => needs_population(kind, p),
         }
     }
@@ -797,11 +827,25 @@ mod tests {
     fn earth_generation(
         ore_gen: Option<horizon_world::cubic::ores::OreGenSettings>,
     ) -> (Generation, horizon_earth::testing::TempDir) {
+        let registry = horizon_world::cubic::custom::testing::registry_of(
+            &horizon_world::cubic::custom::testing::default_block_names(),
+        );
+        earth_generation_with(ore_gen, false, registry, None)
+    }
+
+    /// [`earth_generation`] with the `structures` setting and 26.3's generator `data`.
+    fn earth_generation_with(
+        ore_gen: Option<horizon_world::cubic::ores::OreGenSettings>,
+        structures: bool,
+        registry: &'static BlockRegistry,
+        data: Option<&Arc<GeneratorData>>,
+    ) -> (Generation, horizon_earth::testing::TempDir) {
         let dir = horizon_earth::testing::TempDir::new();
         let mut settings = EarthSettings::at(46.0, 7.5);
         settings.land_cover = false;
         settings.climate = false;
         settings.vegetation = false;
+        settings.structures = structures;
         settings.ore_gen = ore_gen;
         let tiles = Arc::new(crate::earth_net::EarthTiles {
             store: Arc::new(horizon_earth::TileStore::new(
@@ -818,11 +862,55 @@ mod tests {
             kind: CubicKind::Earth,
             settings_json: settings.to_json_pretty(),
         };
-        let registry = horizon_world::cubic::custom::testing::registry_of(
-            &horizon_world::cubic::custom::testing::default_block_names(),
-        );
-        let generation = Generation::with_tiles(&choice, 1, registry, None, Some(tiles)).unwrap();
+        let generation = Generation::with_tiles(&choice, 1, registry, data, Some(tiles)).unwrap();
         (generation, dir)
+    }
+
+    /// The game's registry and 26.3's generator data, when `HORIZON_TEST_RESOURCES` names the resources.
+    fn test_data() -> Option<(&'static BlockRegistry, Arc<GeneratorData>)> {
+        static DATA: OnceLock<(&'static BlockRegistry, Arc<GeneratorData>)> = OnceLock::new();
+        let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES")?);
+        let (registry, data) = DATA.get_or_init(|| {
+            let assets = crate::assets::Assets::load(&root).expect("assets");
+            let data = GeneratorData::load(&root.join("worldgen"), assets.registry)
+                .expect("worldgen data");
+            (assets.registry, data)
+        });
+        Some((registry, data.clone()))
+    }
+
+    #[test]
+    fn an_earth_world_has_structures_by_default_and_populates_for_them() {
+        let Some((registry, data)) = test_data() else {
+            return;
+        };
+        // No `structures` in the file: the default is on.
+        assert!(EarthSettings::at(46.0, 7.5).structures);
+        let (with, _dir) = earth_generation_with(None, true, registry, Some(&data));
+        let structures = with.structures.as_ref().expect("Earth structures");
+        assert!(!structures.set_names().is_empty());
+        assert!(with.vegetation.is_none() && !with.generator.has_earth_ores());
+        for p in [SectionPos::new(0, -3, 0), SectionPos::new(5, 20, -7)] {
+            assert!(with.needs_population(p), "{p:?}");
+        }
+        assert!(with.earth.as_ref().unwrap().settings.structures);
+        // Without the generator data there are none, and the settings say so.
+        let (without, _dir) = earth_generation_with(None, true, registry, None);
+        assert!(
+            without.structures.is_none() && !without.needs_population(SectionPos::new(0, -3, 0))
+        );
+        assert!(!without.earth.as_ref().unwrap().settings.structures);
+    }
+
+    #[test]
+    fn an_earth_world_with_structures_off_has_none() {
+        let Some((registry, data)) = test_data() else {
+            return;
+        };
+        let (off, _dir) = earth_generation_with(None, false, registry, Some(&data));
+        assert!(off.structures.is_none());
+        assert!(!off.needs_population(SectionPos::new(0, -3, 0)));
+        assert!(!off.earth.as_ref().unwrap().settings.structures);
     }
 
     #[test]

@@ -273,24 +273,26 @@ fn trees_stand_on_tree_cover_with_their_canopy_across_cube_borders_and_not_on_fa
             assert_eq!(scan.at(x, s - 1, z), bare.at(x, s - 1, z));
         }
     }
-    // Farmland, bare ground, ice and open water grow none (a city's street trees: `rules_tests`).
+    // Farmland, bare ground, ice and open water grow none.
     for class in [CROP, BARE, SNOW_ICE, WATER] {
         let rig = LandRig::level(45.0, 100.0, class);
         let scan = Scan::ground(&plain(&rig), 3, TREES);
         assert_eq!(scan.count_of(&all_leaves(&rig)), 0, "class {class}");
         assert_eq!(scan.count_of(&rig.blocks.far.logs), 0, "class {class}");
     }
-    // A city's street trees stand on its grass parcels only.
-    let rig = LandRig::level(45.0, 100.0, BUILT);
-    let w = plain(&rig);
-    let scan = Scan::ground(&w, 8, TREES);
-    let s = w.ground();
-    assert!(scan.trunks(s) > 0);
-    for z in 0..scan.side() {
-        for x in 0..scan.side() {
-            if rig.blocks.far.logs.contains(&scan.at(x, s + 1, z)) {
-                assert_eq!(scan.at(x, s, z), rig.blocks.grass_block, "{x},{z}");
+    // Built-up land is read as grassland (a tile of nothing else), trees and ground alike: no town, no street trees.
+    let town = LandRig::level(45.0, 100.0, BUILT);
+    let grass = LandRig::level(45.0, 100.0, GRASS);
+    let (wt, wg) = (plain(&town), plain(&grass));
+    let (a, b) = (Scan::ground(&wt, 8, TREES), Scan::ground(&wg, 8, TREES));
+    let s = wt.ground();
+    assert_eq!(s, wg.ground());
+    for z in 0..a.side() {
+        for x in 0..a.side() {
+            for y in s - 4..=a.top_y() {
+                assert_eq!(a.at(x, y, z), b.at(x, y, z), "{x},{y},{z}");
             }
+            assert_eq!(a.at(x, s, z), town.blocks.grass_block, "{x},{z}");
         }
     }
 }

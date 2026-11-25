@@ -32,7 +32,7 @@ type into it, Escape lets go of it, and Done and Cancel are in the footer.
 | Tile server address | A template with `{z}`, `{x}` and `{y}` for the tile. With Horizon's official game it starts as AWS Terrain Tiles (below); the game built alone starts with the box empty. `https://` only (`http://` only to this computer, for testing). |
 
 The Presets overlay shows the same settings as JSON, with four that have no box: `seaLevelY` (the block height of
-sea level, 0 by default), `verticalExaggeration` (1), `maxZoom` (the finest tile zoom, 15) and `structures`.
+sea level, 0 by default), `verticalExaggeration` (1), `maxZoom` (the finest tile zoom, 15) and `structures` (on by default, see [Structures](#structures)).
 Everything is saved in the world's `cubicgen.json`. There are no switches for downloads or land cover: a new Earth
 world is always saved with `allowDownloads: true` and, when the game has a land cover source, `landCover: true` and
 `vegetation: true` (plants and trees, see [Plants and trees](#plants-and-trees)). A world made before this keeps
@@ -227,7 +227,7 @@ The biome column below is the one without climate; with `climate` on see [Climat
 | shrubland | grass over three dirt | `savanna` under 35°, `plains`, `snowy_plains` from 66° |
 | grassland | grass over three dirt | `meadow` from 1,500 m, `savanna` under 20°, `plains`, `snowy_plains` from 66° |
 | cropland | grass over three dirt (farmland dries out without water, and nothing else fits) | `plains` |
-| built-up | a patchwork of 8 by 8 parcels (`earth/cover.rs`, `CITY_MIX`): 25 % grass (parks, yards; sand in a dry climate), the rest grey concrete, light grey concrete, stone, smooth stone, andesite and stone bricks, over stone; street trees on 30 % of the grass parcels' columns. Flat: buildings come much later | `plains` |
+| built-up | the land around it (see "Built-up land" under Choices worth knowing below): never a class of its own once decoded, so it is whichever row above its nearest natural land is | that row's |
 | bare | stone inside the 1,500 m alpine band under the snow line; else stone where steep (a neighbour 30 m away differs by 0.6 of the distance or more); else gravel from 50° latitude; else in a known wet climate basalt rock (70 % basalt, 14 % smooth basalt, 9 % tuff, 7 % blackstone, over stone); else sand | `stony_peaks` from 2,000 m, `desert` under 40°, else `windswept_gravelly_hills` |
 | water | the water rules (see Water): a lake, a river's wide bed, or the sea when at or under the sea level plus 3 m | `river` above sea level, `ocean` at or under it |
 | herbaceous wetland | one block of water at the surface block over mud; in a frozen climate (climate on, mean annual temperature under 0 C) grass over three dirt (tundra: its open water is mapped as water) | `swamp`; `snowy_plains` in a frozen climate |
@@ -240,6 +240,17 @@ Choices worth knowing:
 - **Dry below sea level.** The sea fills a column under `seaLevelY` only when its class is water or unknown. Grass,
   bare ground and the rest stay dry there (Death Valley, the Dead Sea shore, polders). With land cover on no box is
   proven all water from the heights, so deep sea costs per-column work like any other terrain.
+- **Built-up land** is natural land: as if no one ever lived there. Each decoded land-cover tile has its built-up
+  pixels (code 50) given the class of the nearest natural land (tree, shrub, grass, crop, bare, moss; 8-neighbour
+  steps through the town, within 64 pixels, the first in scan order on a tie); one beyond that takes the tile's most
+  common natural class, else grassland (`landcover::unbuild`, called as each tile is decoded in `landfield.rs`).
+  Water, wetland, mangrove and snow never spread into a town: a town on a shore is dry ground. Every read (near
+  ground, far view, biome, vegetation, water rules, far trees, the probe) gets its classes from those decoded tiles,
+  so none of them ever sees a built-up class: the ground, biome and tree density of a town are those of the land
+  around it, near and far alike, and there are no parcels, grey tops, roads or street trees. The class stays in
+  `LandClass` for the decoder only; a `match` in `horizon-world` that must name it treats it as grassland. The raw
+  tiles on disk are unchanged (the rule runs on decode), and `surface::LAND_RULES` went up so far-view nodes built
+  with grey patches are not reused.
 - **Snow.** Elevation snow stays everywhere except below 2,500 m: the map comes from a few summers of imagery and
   misses seasonal snow on high peaks (Everest is white whatever its pixel says), but at the poles the line falls to
   sea level and lowland the map calls bare or moss is not under permanent snow. A lake above the snow line is frozen
@@ -265,8 +276,8 @@ Choices worth knowing:
 With `"vegetation": true` and land cover on, an Earth world grows 26.3's own vegetation: the vegetal-step features of
 each biome (trees, grass, ferns, flowers, bushes, cacti, dead bushes, kelp and seagrass in water, swamp and mangrove
 trees), run by the same code as Custom Cubic (`custom/vegetation.rs`) in each cube's population. Earth's population
-does nothing else: no ores, lakes or springs. Without land cover the world has one biome and grows nothing, and the
-settings in force say `vegetation` is off (`cubic_gen.rs`).
+also places ores and structures (see [Structures](#structures)), but no lakes or springs. Without land cover the
+world has one biome and grows nothing, and the settings in force say `vegetation` is off (`cubic_gen.rs`).
 
 The biomes are read at 500 m, too coarse to place a forest's edge, so the density follows the 10 m land class of
 the exact column (`earth/vegetation.rs`, `EarthVegetationMask`). Each feature is sorted by its name into a kind:
@@ -282,7 +293,6 @@ cane, pumpkins, mushrooms, lily pads, leaf litter...).
 | grassland | plants and dry plants; trees on a fixed 2 % of the columns |
 | cropland, moss and lichen | plants only |
 | bare | dry plants only (cactus and dead bush in a desert, as vanilla) |
-| built-up | trees on 30 % of the columns of grass parcels (`cover::STREET_TREES`) |
 | snow and ice | nothing |
 | water | water plants only |
 | wetland, mangroves | everything (the `swamp` and `mangrove_swamp` features) |
@@ -299,6 +309,36 @@ a tree stands and the share thins its density. Lily pads count as plants, so the
 - **The cache key.** `terrain_key()` also ends with `#vegetation<rules>` (now `#vegetation2`) while land cover and
   vegetation are on, so old far-view caches are rebuilt. The far view draws its own simple trees
   (see Far view: trees and snow); the key also ends with `#fartrees2` then.
+
+### Structures
+
+With `"structures": true` (the default, also for a file that leaves it out) an Earth world builds Cubic's vanilla
+structures: villages, temples, mineshafts, strongholds, ocean monuments, woodland mansions, shipwrecks, ruins and the
+rest of 26.3's overworld sets, all on as in Custom Cubic's defaults. The client runs the same code as Custom Cubic
+(`cubic/custom/structures.rs`, built in `cubic_gen.rs`) in each cube's population, so Earth populates a cube whenever
+it has structures, vegetation or ores.
+
+- **The real ground.** A structure start reads the generator's own surface (`earth/structure_ground.rs`,
+  `chunk_ground`): the topmost solid block of each column and the water over it. A village or temple stands on the
+  ground top, wherever it is (a plain, a pass at 1,500 m, a coast); shipwrecks and ocean ruins lie on the sea floor;
+  dry land below `seaLevelY` (land cover on) is ground, not sea; a lake above sea level is water.
+- **The terrain is adapted** around a structure as in vanilla (the beard: ground filled under a house, cut away over
+  it); away from structures every block is the plain generator's.
+- **Biomes** come from Earth's biome source, so a structure's biome rules follow the land cover and climate; without
+  land cover the world has one biome and every structure that biome allows can start anywhere.
+- **Needs the generator data.** Without 26.3's generator data the world has no structures and its settings in
+  force say `structures` is false (`cubic_gen.rs`). The world option "generate structures" is not read for Cubic
+  worlds (Custom Cubic ignores it too); `structures` is the switch.
+- **Far view shows none.** The distant terrain has no structures (Custom Cubic's far villages are Custom-only), so
+  they appear as the cubes around the player are made.
+- **Underground structures keep vanilla's depths.** Mineshafts, strongholds, ancient cities and trial chambers are
+  placed against vanilla's bottom (y -64), not against the local ground: under a high mountain they are deep below
+  the surface, and nothing moves them for the sea or for a trench.
+- **Ground moves only where it joins.** The adaptation moves each column's top up or down through the blocks joined
+  to the ground; a lump the beard would make under a piece floating far over the ground is left out, and a buried
+  piece's carving under the ground does not open it.
+- A world made before structures were made keeps what its terrain was: a cube populated without them is never
+  given any later, and its starts are left out of `/locate`.
 
 ### Climate
 
@@ -381,22 +421,29 @@ game reads it (500 m of ground):
 | Pacific Northwest, Olympic Peninsula | 9.4 | 2,871 | 8.77 | no |
 
 **Surface** (`SurfaceKind::on_classified`). Snow and the alpine band still win first (steep snow is rock, snow and ice class is a glacier; see the class table); bare gentle ground in a wet climate is basalt, sand stays for the hot dry places and for ground without climate data; tree cover (rim forest),
-cropland, water, wetland, mangroves and moss are unchanged; a built-up yard is sand instead of grass.
+cropland, water, wetland, mangroves and moss are unchanged.
 
 | Class in a dry climate | Steep (`STEEP_GRADIENT`) | Gentle |
 |---|---|---|
 | bare | `Banded`: terracotta bands | `T` of 18 °C or more: sand (dunes); else `Barren`: red sand 55 %, coarse dirt 45 % |
-| shrubland, grassland | `Banded` | `Scrub`: a mix by a fixed hash of the block column: desert (`r` < 0.5) 15 % grass block, 45 % coarse dirt, 40 % red sand; dry scrub (0.5 to 1.3) 40 %, 40 %, 20 % |
+| shrubland | `Banded` | `Scrub`: a mix by a fixed hash of the block column (so block by block, never in patches): desert (`r` < 0.5) 15 % grass block, 45 % coarse dirt, 40 % red sand; dry scrub (0.5 to 1.3) 40 %, 40 %, 20 % |
+| grassland | `Banded` | grass over three dirt, as in a wet climate: the map says the ground is covered |
 
-Bare ground from 50° latitude stays gravel. The mix is carried in the kind (`Scrub(DryTop)`), so the far view, which
-calls `block_for` with the kind alone, shows the same tops as the near terrain; far trees may stand on `Scrub`.
+Bare ground from 50° latitude stays gravel. Grassland and tree cover never take dry tops: the red sand and coarse
+dirt of the dry places are only where the map says the cover is sparse (shrub) or bare, so a grass or forest pixel
+next to a shrub one does not turn into a 30 m orange square. The mix is carried in the kind (`Scrub(DryTop)`). A far
+voxel stands for many columns, so it does not show one column's pick: the top voxel of `Scrub` is coarse dirt and
+of `Barren` red sand, each mix's main block (`dry::SCRUB_FAR`, `dry::BARREN_FAR`); far trees may stand on `Scrub`.
 
 **Bands.** Under the top of a `Banded`, `Scrub` or `Barren` column the blocks are terracotta down to 32 blocks under
 the surface, stone below (the section fill shortcut uses the same depth while climate is on, and today's depth
 with it off). The band at height `y` is entry `(y div 4) mod 192` of Horizon's port of vanilla's clay bands
 (`worldgen/material_surface.rs`, `ClayBands::generate`: terracotta, orange, yellow, brown, red, white and light gray)
 made once from a fixed seed (not the world's, so every world and every far cache agree) and indexed by **absolute**
-height with no noise offset, so the strata run level across canyon walls whatever the surface. One band spans 4
+height with no noise offset, so the strata run level across canyon walls whatever the surface. A far voxel of
+banded rock (`step` blocks tall, from `lo`) is the band at its middle height, `lo + step / 2`, for every column,
+the surface voxel too: its colour depends on the height alone, so a row of far voxels is one level band at every
+far level, and where a voxel lies within one band it is the near band. One band spans 4
 blocks, not vanilla's 1: real strata are tens of metres thick, and a 1,000 m wall of 1-block bands would be
 pin-stripes. The pattern repeats every 768 blocks.
 
@@ -419,8 +466,8 @@ flowers, bushes) on only 30 % of the columns, by a fixed column hash, via the bi
 (`biome_at_quart_blocking`, remembered per 4 by 4 column). It needs a climate source: without one the biomes do not
 say which places are dry.
 
-- **The cache key.** `surface::LAND_RULES` is 4 (3: steep snow, glaciers, wet bare rock; 4: built-up and moss mixes), `biome::CLIMATE_BIOME_RULES` and
-  `vegetation::VEGETATION_RULES` are 2 (the key ends `#landcover<data>.4 ... #vegetation2 ... #climate<data>.2`), so
+- **The cache key.** `surface::LAND_RULES` is 8 (3: steep snow, glaciers, wet bare rock; 4: moss mix; 7: built-up land is natural land, no built-up kind; 8: dry grassland stays grass, far dry voxels level), `biome::CLIMATE_BIOME_RULES` and
+  `vegetation::VEGETATION_RULES` are 2 (the key ends `#landcover<data>.8 ... #vegetation2 ... #climate<data>.2`), so
   caches made before these rules are rebuilt.
 
 ### Ore richness
@@ -534,7 +581,7 @@ shelf, the shores and lakes at a level of their own still run.
   becomes dry. Steps between two water columns stay (a river stepping down).
 - **Shores.** Dry ground within 3 blocks of sea or lake water, and at most 2 blocks over it, and the ground right
   beside a river channel, is sand, gravel where it is cold (a mean annual temperature under 2 C, or 50 degrees of
-  latitude and more without climate), stone where it is steep. Snow, marsh and built-up ground keep their own top. A
+  latitude and more without climate), stone where it is steep. Snow and marsh keep their own top. A
   cold sea or lake bed is gravel.
 - **Near and far agree.** The rules read a window of 11 samples on every side of what is asked, at the same spacing
   and zoom, and a column's answer depends only on the samples within 11 of it, so cubes, single blocks and far nodes
@@ -561,9 +608,8 @@ waits. Style, shapes and sizes are in the table of `earth/far_trees.rs`.
 
 - **Which tree.** Each Earth biome has one style (oak, birch, spruce, dark oak, jungle, acacia, mangrove; round,
   cone or flat; height, canopy radius, spacing) or none: deserts, badlands, peaks, slopes, oceans, rivers and ice
-  spikes have no trees. Trees stand on grass, moss, built-up grass parcels and marsh tops only, and the land class thins them as
-  near does (tree cover, wetland, mangrove and no data all, shrub a fifth, grass a fiftieth, built-up 30 % of its
-  grass parcels, the rest none).
+  spikes have no trees. Trees stand on grass, moss and marsh tops only, and the land class thins them as
+  near does (tree cover, wetland, mangrove and no data all, shrub a fifth, grass a fiftieth, the rest none).
 - **Level 0 and 1.** Level 0 nodes are exact cubes: trees of a jittered grid (one candidate per cell of the
   style's spacing at a fixed hash of the cell, no world seed) are drawn as real logs and leaves, only into air, and
   a tree in a neighbouring cube still draws its canopy here (the columns are read 3 blocks beyond the cube). Level 1
@@ -639,7 +685,7 @@ header and index once; each 1-degree cell is inflated and decoded the first time
 
 ### Still missing
 
-- Buildings, roads, farmland. Far trees are simple stand-ins (no mangrove roots, no vines, no thick trunks).
+- Farmland as farmland (cropland is grass ground). Far trees are simple stand-ins (no mangrove roots, no vines, no thick trunks).
 - Climate is the yearly mean only: no seasons, no snow that comes and goes.
 - Not checked against a real file by the tests (they use synthetic data only): the half-pixel convention (the reader
   treats a pixel as the area it covers), and whether overview levels keep class boundaries well (they are taken as
@@ -647,8 +693,12 @@ header and index once; each 1-degree cell is inflated and decoded the first time
 
 ## Known limits
 
-- **Elevation only, one biome (land cover off).** Without land cover there are no rivers or roads, no buildings. The surface is grass, bare stone or snow by height and
-  latitude; every column has the same biome, and vanilla structures are off (`structures` stays false).
+- **Elevation only, one biome (land cover off).** Without land cover there are no rivers. The surface is grass, bare stone or snow by height and
+  latitude; every column has the same biome. Vanilla structures are on (see [Structures](#structures)); their biome rules
+  see that one biome everywhere.
+- **No towns.** Earth has no buildings, roads or towns, with or without land cover: where the map says built-up the
+  world is the natural land around it (see "Built-up land" under Land cover), so cities look like the
+  countryside around them. Vanilla structures are separate from this.
 - **Land below sea level floods** unless land cover says otherwise. The sea is at `seaLevelY`: with elevation
   alone any ground lower than 0 m has water over it, so a dry depression such as the Dead Sea shore, or the
   Netherlands, is under water. With land cover on, ground whose class is known and not water stays dry.
@@ -660,6 +710,9 @@ header and index once; each 1-degree cell is inflated and decoded the first time
 - **The projection is local.** Blocks map to the globe by a projection tangent at the origin, so far from it
   (hundreds of kilometres at a large scale) distances and directions drift from the real ones.
 - Seas are not charted in detail: ETOPO1 is coarse.
+- **Dry ground follows the map's pixels.** Shrubland in a dry climate is a block-by-block mix, but where it borders
+  grassland or forest the edge is the land-cover pixel's (about 10 m) square edge. Far away a dry top is one block
+  per voxel (coarse dirt for scrub, red sand for barren ground), not the mix.
 - **Data cleaning.** The source stitches 1°×1° cells, and along those lines (28°N, for one) whole rows or columns
   of pixels are thousands of metres off, which showed up as a straight trench. When a tile is decoded, a pixel
   (or a run of up to two) that differs from its neighbours on both sides along a row or column by more than 32

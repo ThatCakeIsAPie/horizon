@@ -232,6 +232,92 @@ pub fn level_for(levels: &[Level], metres_per_sample: f64) -> usize {
         .unwrap_or(0)
 }
 
+/// How far, in pixels of the level read (8-neighbour steps), built-up land looks for the natural land whose
+/// class it takes ([`unbuild`]): 64 pixels is 640 m at full resolution.
+pub const NATURAL_REACH_PIXELS: usize = 64;
+
+impl LandClass {
+    /// Whether this is land as nature left it, which built-up land takes the class of ([`unbuild`]): tree,
+    /// shrub, grass, crop (farmland is grass ground in the worlds), bare, moss. Water, wetland, mangrove, snow
+    /// and no data are not: a town on a shore or by a marsh is dry ground, not more of the water.
+    pub fn is_natural_land(self) -> bool {
+        matches!(
+            self,
+            Self::Tree | Self::Shrub | Self::Grass | Self::Crop | Self::Bare | Self::MossLichen
+        )
+    }
+}
+
+/// The land as if no one ever lived there: every built-up pixel of a decoded tile (`pixels`, class codes,
+/// `width` by `height` row by row) takes the class of the nearest natural land pixel ([`LandClass::is_natural_land`])
+/// reached through built-up pixels within [`NATURAL_REACH_PIXELS`] (8-neighbour steps, the first reached in
+/// scan order on a tie); one beyond that takes the tile's most common natural class, and grassland when the
+/// tile has none. Each tile is done once, as it is decoded, so every read (near ground, far view, biome,
+/// vegetation) sees the same classes and no built-up class at all.
+pub fn unbuild(pixels: &mut [u8], width: usize, height: usize) {
+    let built = LandClass::BuiltUp.code();
+    let n = width.saturating_mul(height).min(pixels.len());
+    let pixels = &mut pixels[..n];
+    if !pixels.contains(&built) {
+        return;
+    }
+    let natural = |code: u8| LandClass::from_code(code).is_some_and(LandClass::is_natural_land);
+    let neighbours = |i: usize, f: &mut dyn FnMut(usize)| {
+        let (x, y) = (i % width, i / width);
+        for dy in -1_isize..=1 {
+            for dx in -1_isize..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (x as isize + dx, y as isize + dy);
+                if nx >= 0 && ny >= 0 && (nx as usize) < width && (ny as usize) < height {
+                    f(ny as usize * width + nx as usize);
+                }
+            }
+        }
+    };
+    let mut counts = [0_usize; 256];
+    let mut frontier = Vec::new();
+    for i in 0..n {
+        let code = pixels[i];
+        if !natural(code) {
+            continue;
+        }
+        counts[usize::from(code)] += 1;
+        let mut next_to_town = false;
+        neighbours(i, &mut |j| next_to_town |= pixels[j] == built);
+        if next_to_town {
+            frontier.push(i);
+        }
+    }
+    for _ in 0..NATURAL_REACH_PIXELS {
+        let mut next = Vec::new();
+        for &i in &frontier {
+            let code = pixels[i];
+            neighbours(i, &mut |j| {
+                if pixels[j] == built {
+                    pixels[j] = code;
+                    next.push(j);
+                }
+            });
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    // Beyond the reach: the land of the tile around the town.
+    let most = (0..256)
+        .filter(|&c| counts[c] > 0)
+        .max_by_key(|&c| (counts[c], std::cmp::Reverse(c)))
+        .map_or(LandClass::Grass.code(), |c| c as u8);
+    for p in pixels.iter_mut() {
+        if *p == built {
+            *p = most;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +504,53 @@ mod tests {
         assert!(key.starts_with("worldcover-2021-v200"), "{key}");
         assert!(key.ends_with(&format!("rules{LAND_COVER_RULES}")), "{key}");
         assert!(!key.contains(['/', '#', ' ']));
+    }
+
+    /// A tile from rows of class letters: `T` tree, `G` grass, `B` bare, `U` built-up, `W` water.
+    fn tile(rows: &[&str]) -> (Vec<u8>, usize, usize) {
+        let code = |c: char| {
+            match c {
+                'T' => LandClass::Tree,
+                'G' => LandClass::Grass,
+                'B' => LandClass::Bare,
+                'U' => LandClass::BuiltUp,
+                'W' => LandClass::Water,
+                _ => LandClass::NoData,
+            }
+            .code()
+        };
+        let pixels = rows.iter().flat_map(|r| r.chars().map(code)).collect();
+        (pixels, rows[0].len(), rows.len())
+    }
+
+    #[test]
+    fn built_up_land_takes_the_class_of_the_nearest_natural_land() {
+        let (mut p, w, h) = tile(&["TTUUUUGG", "TTUUUUGG", "WWUUUUWW"]);
+        unbuild(&mut p, w, h);
+        let (want, _, _) = tile(&["TTTTGGGG", "TTTTGGGG", "WWTTGGWW"]);
+        assert_eq!(p, want);
+        // Water never spreads into a town, and no built-up class is left.
+        assert!(!p.contains(&LandClass::BuiltUp.code()));
+    }
+
+    #[test]
+    fn built_up_land_out_of_reach_is_the_tiles_most_common_natural_land_else_grass() {
+        // A town on a shore wider than twice the reach: two forest pixels at one end, three bare at the other.
+        let w = 2 * NATURAL_REACH_PIXELS + 10;
+        let mut row = vec!['U'; w];
+        row[..2].fill('T');
+        row[w - 3..].fill('B');
+        let line: String = row.iter().collect();
+        let (mut p, w, h) = tile(&[&line, &"W".repeat(w)]);
+        unbuild(&mut p, w, h);
+        let (tree, bare) = (LandClass::Tree.code(), LandClass::Bare.code());
+        // Forest reaches its 64 pixels; past that the middle is the tile's most common natural land (bare).
+        assert!(p[..2 + NATURAL_REACH_PIXELS].iter().all(|&c| c == tree));
+        assert!(p[2 + NATURAL_REACH_PIXELS..w].iter().all(|&c| c == bare));
+        // Only water and town: grassland.
+        let (mut p, w, h) = tile(&["WUU", "UUW"]);
+        unbuild(&mut p, w, h);
+        let (want, _, _) = tile(&["WGG", "GGW"]);
+        assert_eq!(p, want);
     }
 }

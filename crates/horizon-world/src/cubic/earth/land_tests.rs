@@ -466,8 +466,8 @@ fn water_under_the_sea_level_is_the_sea_rule_and_wetland_is_one_block_of_water_o
 }
 
 #[test]
-fn moss_and_built_up_ground_take_their_mixed_tops() {
-    use super::cover::{CityTop, MossTop, city_top, moss_top};
+fn moss_takes_its_mixed_top() {
+    use super::cover::{MossTop, moss_top};
     let moss = LandRig::level(45.0, 120.0, 100);
     let b = moss.blocks;
     let top = match moss_top(0, 0) {
@@ -488,44 +488,95 @@ fn moss_and_built_up_ground_take_their_mixed_tops() {
         std::cmp::Ordering::Equal => top,
         std::cmp::Ordering::Greater => b.air,
     });
-    let built = LandRig::level(45.0, 120.0, 50);
-    let top = match city_top(0, 0, false) {
-        CityTop::Grass => b.grass_block,
-        CityTop::Stone => b.stone,
-        CityTop::SmoothStone => b.smooth_stone,
-        CityTop::Andesite => b.andesite,
-        CityTop::GrayConcrete => b.gray_concrete,
-        CityTop::LightGrayConcrete => b.light_gray_concrete,
-        CityTop::StoneBricks => b.stone_bricks,
-        CityTop::Sand => b.sand,
-    };
-    let soil = if top == b.grass_block {
-        b.dirt
-    } else {
-        b.stone
-    };
-    built.check(0, 0, |y, s| match y.cmp(&s) {
-        _ if y < s - 3 => b.stone,
-        std::cmp::Ordering::Less => soil,
-        std::cmp::Ordering::Equal => top,
-        std::cmp::Ordering::Greater => b.air,
-    });
+}
+
+// --- Built-up land is the land around it ---------------------------------------------------------------------
+
+/// Level ground whose land cover is `around` (a code) everywhere, but for a town of built-up land (code 50)
+/// about 2.6 km across at the origin when `town` is set. Without the town it is the control.
+fn town_rig(around: u8, town: bool) -> LandRig {
+    LandRig::new(
+        EarthSettings::at(LAT0, LON0),
+        |_, _| 100.0,
+        move |lat, lon| {
+            let inside = (lat - LAT0).abs() < 0.012 && (lon - LON0).abs() < 0.012;
+            if town && inside { 50 } else { around }
+        },
+    )
+}
+
+#[test]
+fn built_up_land_reads_as_the_natural_land_around_it_near_and_far() {
+    // Moss, grass, forest, shrub, bare ground: the town is whichever it is surrounded by.
+    for around in [100_u8, 30, 10, 20, 60] {
+        let (town, control) = (town_rig(around, true), town_rig(around, false));
+        // The land cover under the town: no built-up class anywhere, the same class as the control.
+        for stride in [1, 4, 16, 64, 256] {
+            let side = 16 * stride;
+            let align = |v: i32| v.div_euclid(side) * side;
+            for x0 in [align(-1500), align(-400), align(0), align(900)] {
+                for z0 in [align(-1500), align(-400), align(0), align(900)] {
+                    let a = town.loaded(|g| g.columns_at(x0, z0, stride, stride));
+                    let b = control.loaded(|g| g.columns_at(x0, z0, stride, stride));
+                    for i in 0..256 {
+                        let at = format!("class {around}, stride {stride}, {x0},{z0} column {i}");
+                        assert_ne!(a.class(i), Some(LandClass::BuiltUp), "{at}");
+                        assert_eq!(a.class(i), b.class(i), "{at}");
+                        assert_eq!(a.kind(i), b.kind(i), "{at}");
+                        assert_eq!(a.surfaces[i], b.surfaces[i], "{at}");
+                    }
+                }
+            }
+        }
+        // The biome of the town is the biome around it.
+        for q in [-300, -100, -20, 0, 1, 30, 120, 300] {
+            assert_eq!(
+                town.generator.biome_at_quart_blocking(q, -q / 2),
+                control.generator.biome_at_quart_blocking(q, -q / 2),
+                "class {around}, quart {q}"
+            );
+        }
+        // The blocks of the ground, at the middle of the town and beside it.
+        let b = town.blocks;
+        for (x, z) in [(0, 0), (40, -30), (-600, 250), (900, 900), (1800, -1800)] {
+            let (s, got) = town.column(x, z);
+            let (want_s, want) = control.column(x, z);
+            assert_eq!((s, &got), (want_s, &want), "class {around} at {x},{z}");
+            // Grassland is grass over dirt over stone: no paving, roofs, bricks or concrete.
+            if around == 30 || around == 10 {
+                let natural = [b.air, b.stone, b.dirt, b.grass_block];
+                assert!(got.iter().all(|id| natural.contains(id)), "{x},{z} {got:?}");
+                assert_eq!(got[8], b.grass_block);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_town_with_no_natural_land_around_it_is_grassland() {
+    // Only built-up land in the tile: the climate default, grass over dirt, and no built-up class.
+    let rig = LandRig::level(45.0, 100.0, 50);
+    let b = rig.blocks;
+    let (_, blocks) = rig.column(0, 0);
+    assert_eq!(blocks[8], b.grass_block);
+    assert_eq!(blocks[7], b.dirt);
+    assert_eq!(blocks[9], b.air);
+    let cols = rig.loaded(|g| g.columns_at(-400, -400, 4, 4));
+    for i in 0..256 {
+        assert_eq!(cols.class(i), Some(LandClass::Grass));
+        assert_eq!(cols.kind(i), SurfaceKind::Grass);
+    }
 }
 
 #[test]
 fn land_under_the_sea_level_stays_dry_where_the_map_says_it_is_not_water() {
     // 86 m below the sea: Death Valley, the Dead Sea shore, a polder.
-    for (code, top) in [(60, "sand"), (30, "grass"), (50, "city"), (70, "snow")] {
+    for (code, top) in [(60, "sand"), (30, "grass"), (50, "grass"), (70, "snow")] {
         let rig = LandRig::level(45.0, -86.0, code);
         let b = rig.blocks;
         let top = match top {
             "sand" => b.sand,
             "grass" => b.grass_block,
-            "city" => rig.generator.block_for(
-                0,
-                0,
-                SurfaceKind::BuiltUp(super::cover::city_top(0, 0, false)),
-            ),
             _ => b.snow_block,
         };
         let at = |y: i32| rig.generator.block_at_blocking(0, y, 0, 1);
@@ -738,7 +789,7 @@ fn near_and_far_give_the_same_surface_material_at_every_step() {
     }
     assert!(compared > 2000);
     // The mosaic put every kind of top there to compare.
-    for kind in ["Grass", "Snow", "Lake", "Marsh", "Moss", "BuiltUp", "Sea"] {
+    for kind in ["Grass", "Snow", "Lake", "Marsh", "Moss", "Sea"] {
         assert!(kinds.contains(kind), "no {kind:?} in {kinds:?}");
     }
 }

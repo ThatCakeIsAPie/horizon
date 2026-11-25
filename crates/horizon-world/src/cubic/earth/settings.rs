@@ -35,8 +35,9 @@ pub struct EarthSettings {
     /// Whether the client may download tiles it does not have.
     #[serde(default)]
     pub allow_downloads: bool,
-    /// Whether structures (villages and the like) generate.
-    #[serde(default)]
+    /// Whether Cubic's vanilla structures (villages and the like) generate, standing on the real ground. On by
+    /// default; the client needs 26.3's generator data to build them and turns this off in its copy without it.
+    #[serde(default = "default_structures")]
     pub structures: bool,
     /// Whether the surface and the biomes follow land cover (ESA WorldCover classes) where the generator is
     /// given a source of it ([`crate::cubic::earth::EarthGenerator::with_land_cover`]). Off by default, and
@@ -82,6 +83,10 @@ fn default_exaggeration() -> f64 {
     1.0
 }
 
+fn default_structures() -> bool {
+    true
+}
+
 fn default_max_zoom() -> u8 {
     15
 }
@@ -98,7 +103,7 @@ impl EarthSettings {
             max_zoom: default_max_zoom(),
             tile_url: String::new(),
             allow_downloads: false,
-            structures: false,
+            structures: default_structures(),
             land_cover: false,
             vegetation: false,
             climate: false,
@@ -314,7 +319,7 @@ mod tests {
         assert_eq!(s.vertical_exaggeration, 1.0);
         assert_eq!(s.max_zoom, 15);
         assert_eq!(s.tile_url, "");
-        assert!(!s.allow_downloads && !s.structures && !s.land_cover);
+        assert!(!s.allow_downloads && s.structures && !s.land_cover);
         assert_eq!(s, EarthSettings::at(46.0, 7.5));
     }
 

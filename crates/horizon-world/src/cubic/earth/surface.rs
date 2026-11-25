@@ -20,7 +20,8 @@
 //! | Class, in a dry climate | Steep | Gentle |
 //! |---|---|---|
 //! | bare | [`SurfaceKind::Banded`] (terracotta bands) | hot (from 18 C): sand dunes; else [`SurfaceKind::Barren`] (red sand, coarse dirt) |
-//! | shrub, grass | [`SurfaceKind::Banded`] | [`SurfaceKind::Scrub`] (grass block, coarse dirt, red sand mixed) |
+//! | shrub | [`SurfaceKind::Banded`] | [`SurfaceKind::Scrub`] (grass block, coarse dirt, red sand mixed block by block) |
+//! | grass | [`SurfaceKind::Banded`] | grass over dirt, as in a wet climate |
 //!
 //! **Steep snow is rock, snow/ice is a glacier, wet bare ground is basalt.** Ground that would be snow (land cover
 //! snow/ice, or at or above the snow line) whose slope is [`SNOW_STEEP_GRADIENT`] or more is bare stone
@@ -37,12 +38,10 @@
 //!
 //! Snow and the alpine band still win first; tree cover, crops, water and wetland are unchanged.
 //!
-//! Snow and the alpine band still win first; tree cover, crops, water and wetland are unchanged.
-//!
-//! **Built-up ground and moss are mixes** ([`super::cover`]): a built-up column is [`SurfaceKind::BuiltUp`], a
-//! grey and green patchwork of parcels (paving, roofs, parks; sand yards in a dry climate) over stone; a moss
-//! and lichen column is [`SurfaceKind::Moss`], mostly moss block with some grass and bare stone, gravel and
-//! coarse dirt. Under the top of a dry kind the ground is terracotta bands by absolute height down to
+//! **Moss is a mix** ([`super::cover`]): a moss and lichen column is [`SurfaceKind::Moss`], mostly moss block
+//! with some grass and bare stone, gravel and coarse dirt. Built-up land has no kind of its own: the decoded
+//! land cover has no built-up class (the land around a town takes its place, `horizon_earth::unbuild`).
+//! Under the top of a dry kind the ground is terracotta bands by absolute height down to
 //! [`DRY_ROCK_DEPTH`](super::dry::DRY_ROCK_DEPTH) blocks, then stone.
 //!
 //! **Water is part of the column.** A column is a pair `(s, kind)`. For a water column ([`SurfaceKind::Water`]) `s`
@@ -61,7 +60,7 @@
 use horizon_earth::{LandClass, VerticalMap};
 
 use super::biome::FROZEN_BELOW_C;
-use super::cover::{CityTop, MossTop, city_top, moss_top};
+use super::cover::{MossTop, moss_top};
 use super::dry::{BARREN_MIX, BASALT_MIX, BasaltTop, DESERT_MIX, DryColumn, DryTop, SCRUB_MIX};
 use super::water::Bed;
 
@@ -80,7 +79,7 @@ pub const SNOW_DEPTH: i64 = 2;
 pub const RULES: u32 = 2;
 /// The version of the land-cover surface rule and of the biome table ([`super::biome`]): it goes up when what a
 /// column with a known class is made of changes. It is in the terrain key only while land cover is on.
-pub const LAND_RULES: u32 = 6;
+pub const LAND_RULES: u32 = 8;
 /// With land cover, the lowest elevation (m) where the latitude snow line still turns a column that is not
 /// snow or ice on the map white. A map made from one summer's imagery misses seasonal snow on high peaks (Everest
 /// stays white), but the line falls to sea level at the poles, where lowland the map calls bare or moss is not
@@ -171,8 +170,6 @@ pub enum SurfaceKind {
     /// Moss and lichen: the given top ([`super::cover::MOSS_MIX`]), over three dirt under moss, grass and coarse
     /// dirt, over stone under stone and gravel.
     Moss(MossTop),
-    /// Built-up ground: the given top ([`super::cover::CITY_MIX`]) over stone (over three dirt under grass).
-    BuiltUp(CityTop),
     /// The sea, a lake or a river: `depth` blocks of water (at least 1) ending at the surface block `s`, over a
     /// bed of `bed` whose top block is `s - depth`.
     Water { depth: u32, bed: Bed },
@@ -181,7 +178,7 @@ pub enum SurfaceKind {
     /// Steep rock in a dry climate: terracotta bands by absolute height ([`super::dry`]), down to
     /// [`DRY_ROCK_DEPTH`](super::dry::DRY_ROCK_DEPTH) blocks under the surface, stone below.
     Banded,
-    /// Sparse ground of a dry climate under shrub and grass: the top is the given block (a fixed hash of the
+    /// Sparse ground of a dry climate under shrub: the top is the given block (a fixed hash of the
     /// column picks it), terracotta bands under it.
     Scrub(DryTop),
     /// Bare flat ground of a dry climate that is not hot: red sand or coarse dirt over terracotta bands.
@@ -249,7 +246,7 @@ impl SurfaceKind {
     ///   steep ground;
     /// * tree and crop: grass over dirt (no block fits crops better: farmland dries out without water);
     /// * shrub and grass: grass over dirt, but in a dry climate ([`DryColumn::is_dry`]): steep ground is
-    ///   [`SurfaceKind::Banded`], gentle ground [`SurfaceKind::Scrub`];
+    ///   [`SurfaceKind::Banded`], gentle shrub [`SurfaceKind::Scrub`] (gentle grass stays grass);
     /// * bare: stone within the alpine band under the snow line, else (steep) stone, or in a dry climate
     ///   [`SurfaceKind::Banded`], else sand, or gravel from [`GRAVEL_FROM_LATITUDE`]; gentle dry bare ground
     ///   is sand (dunes) when hot ([`HOT_C`](super::dry::HOT_C)), else [`SurfaceKind::Barren`]; gentle bare
@@ -259,12 +256,10 @@ impl SurfaceKind {
     ///   column with [`SurfaceKind::sea_column`];
     /// * wetland and mangrove: a marsh, except wetland in a frozen climate (a known mean annual temperature under
     ///   [`FROZEN_BELOW_C`]): grass over dirt;
-    /// * moss and lichen: [`SurfaceKind::Moss`]; built-up: [`SurfaceKind::BuiltUp`]; both mixes are picked by a
-    ///   hash of the block column `at`.
+    /// * moss and lichen: [`SurfaceKind::Moss`], its mix picked by a hash of the block column `at`.
     ///
     /// `dry` is the climate at the column with its hash; without it (`None`: no climate, or no data there) the
-    /// rules are exactly those without the dry places, without wet bare rock and without frozen wetland (and a
-    /// built-up yard is grass).
+    /// rules are exactly those without the dry places, without wet bare rock and without frozen wetland.
     ///
     /// A known class that is not water stays dry under the sea level.
     pub fn on_classified<E>(
@@ -293,17 +288,21 @@ impl SurfaceKind {
             LandClass::NoData if below_sea => Self::SEA,
             LandClass::NoData => Self::on_land(elevation_m, latitude),
             LandClass::Tree | LandClass::Crop => Self::Grass,
-            LandClass::Shrub | LandClass::Grass => match dry.filter(DryColumn::is_dry) {
-                None => Self::Grass,
-                Some(d) => {
-                    if slope()?.is_steep() {
-                        Self::Banded
-                    } else {
+            // Decoded land cover never holds built-up land (it is the natural land around it); if one is named, it is
+            // plain grassland, as no town is.
+            // Grassland keeps its grass in a dry climate (only a wall too steep for soil is rock); shrubland is the
+            // sparse ground, a mix picked block by block.
+            LandClass::Shrub | LandClass::Grass | LandClass::BuiltUp => {
+                match dry.filter(DryColumn::is_dry) {
+                    None => Self::Grass,
+                    Some(_) if slope()?.is_steep() => Self::Banded,
+                    Some(d) if class == LandClass::Shrub => {
                         let mix = if d.is_desert() { DESERT_MIX } else { SCRUB_MIX };
                         Self::Scrub(mix.pick(d.bucket))
                     }
+                    Some(_) => Self::Grass,
                 }
-            },
+            }
             LandClass::Bare => {
                 let climate = dry;
                 let dry = dry.filter(DryColumn::is_dry);
@@ -338,9 +337,6 @@ impl SurfaceKind {
             }
             LandClass::Wetland | LandClass::Mangrove => Self::Marsh,
             LandClass::MossLichen => Self::Moss(moss_top(at[0], at[1])),
-            LandClass::BuiltUp => {
-                Self::BuiltUp(city_top(at[0], at[1], dry.is_some_and(|d| d.is_dry())))
-            }
         })
     }
 

@@ -69,6 +69,11 @@ pub const BARREN_MIX: Mix = Mix {
     grass_block: 0,
     coarse_dirt: 450,
 };
+/// The top a far voxel of scrub shows: one voxel stands for many columns, so it is the mix's main block (the
+/// largest share of the desert mix, an equal largest of the scrub mix), not one column's pick.
+pub const SCRUB_FAR: DryTop = DryTop::CoarseDirt;
+/// The top a far voxel of barren ground shows: red sand, the larger share of [`BARREN_MIX`].
+pub const BARREN_FAR: DryTop = DryTop::RedSand;
 
 /// The shares (out of 1,000) of the tops of wet bare rock ([`BasaltTop`]): basalt, smooth basalt and tuff; the
 /// rest is blackstone.

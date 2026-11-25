@@ -9,12 +9,14 @@
 //! sets' placements, as the settings tune them, and each structure's own
 //! generation), asked through a [`StartContext`] over the terrain generator:
 //!
-//! * Heightmaps are the terrain's surface: the topmost solid block of the
-//!   density and replacers ([`CustomCubicGenerator::chunk_tops`]; carvers and
-//!   population ignored, as vanilla's generation heightmaps come from the
-//!   noise), with the sea filling up to sea level. A column has one surface,
-//!   however high: a village stands on a mountain top 9,000 blocks up as on a
-//!   plain.
+//! * Heightmaps are the terrain's surface: each column's ground (its
+//!   topmost solid block) and the water over it ([`CustomCubicGenerator::chunk_ground`];
+//!   carvers and population ignored, as vanilla's generation heightmaps come
+//!   from the noise). Ocean floor is the ground; the world surface is the
+//!   higher of ground and water. Custom's water is the sea up to sea level;
+//!   Earth's is its own, so a lake above sea level is water and dry land under
+//!   it is ground. A column has one surface, however high: a village stands on
+//!   a mountain top 9,000 blocks up as on a plain.
 //! * The level's height for the structures is vanilla's bottom (-64), so
 //!   mineshafts, strongholds, trial chambers and ancient cities lie at
 //!   vanilla's depths, and no top: a start is never refused for being high.
@@ -119,16 +121,17 @@ pub struct CubicStructures {
     stone: u32,
     /// The data's biome id of each source biome id the source names.
     biome_ids: HashMap<u32, BiomeId>,
-    /// Topmost solid block of each column of a chunk, by shard.
-    tops: Box<[Mutex<HashMap<(i32, i32), Arc<[i32; 256]>>>]>,
+    /// `[ground, water]` of each column of a chunk (see
+    /// [`CustomCubicGenerator::chunk_ground`]), by shard.
+    tops: Box<[Mutex<HashMap<(i32, i32), Arc<[[i32; 2]; 256]>>>]>,
     /// The starts over each cube column's areas (every cube of a column
     /// populates the same columns), by shard.
     areas: Box<[Mutex<HashMap<(i32, i32), AreaStarts>>]>,
     /// Each chunk's terrain adaptation, by shard.
     beards: Box<[Mutex<HashMap<(i32, i32), Beard>>]>,
-    /// Each chunk's column tops with the terrain adapted (chunks the beard
-    /// reaches only), by shard.
-    adapted: Box<[Mutex<HashMap<(i32, i32), Arc<[i32; 256]>>>]>,
+    /// Each chunk's `[ground, water]` with the terrain adapted (chunks the
+    /// beard reaches only), by shard.
+    adapted: Box<[Mutex<HashMap<(i32, i32), Arc<[[i32; 2]; 256]>>>]>,
 }
 
 /// A chunk's terrain adaptation (`None`: no structure adapts it).
@@ -327,18 +330,23 @@ impl CubicStructures {
     }
 
     /// The topmost solid block of column (`x`, `z`), or [`NO_SURFACE`]
-    /// (found a chunk at a time: [`CustomCubicGenerator::chunk_tops`]).
+    /// (found a chunk at a time: [`CustomCubicGenerator::chunk_ground`]).
     pub fn column_top(&self, x: i32, z: i32) -> i32 {
+        self.column(x, z)[0]
+    }
+
+    /// `[ground, water]` of column (`x`, `z`).
+    fn column(&self, x: i32, z: i32) -> [i32; 2] {
         self.chunk_tops((x >> 4, z >> 4))[((z & 15) << 4 | (x & 15)) as usize]
     }
 
-    /// [`CustomCubicGenerator::chunk_tops`] of chunk `key`, kept.
-    fn chunk_tops(&self, key: (i32, i32)) -> Arc<[i32; 256]> {
+    /// [`CustomCubicGenerator::chunk_ground`] of chunk `key`, kept.
+    fn chunk_tops(&self, key: (i32, i32)) -> Arc<[[i32; 2]; 256]> {
         let shard = &self.tops[shard_of(key.0, key.1)];
         if let Some(tops) = shard.lock().unwrap().get(&key) {
             return tops.clone();
         }
-        let found: Arc<[i32; 256]> = Arc::from(self.generator.chunk_tops(key.0, key.1));
+        let found: Arc<[[i32; 2]; 256]> = Arc::from(self.generator.chunk_ground(key.0, key.1));
         let mut tops = shard.lock().unwrap();
         if tops.len() >= TOPS_PER_SHARD {
             tops.clear();
@@ -375,17 +383,25 @@ impl CubicStructures {
     /// The topmost solid block of column (`x`, `z`) once the structures
     /// have adapted the terrain: the ground their pieces are placed on.
     pub fn adapted_top(&self, x: i32, z: i32) -> i32 {
+        self.adapted_column(x, z)[0]
+    }
+
+    /// [`Self::column`] with the ground adapted (the water as it was).
+    fn adapted_column(&self, x: i32, z: i32) -> [i32; 2] {
         let key = (x >> 4, z >> 4);
         let i = ((z & 15) << 4 | (x & 15)) as usize;
         let Some(beard) = self.beard(ChunkPos::new(key.0, key.1)) else {
-            return self.column_top(x, z);
+            return self.column(x, z);
         };
         let shard = &self.adapted[shard_of(key.0, key.1)];
         if let Some(tops) = shard.lock().unwrap().get(&key) {
             return tops[i];
         }
-        let mut tops = Box::new(*self.chunk_tops(key));
-        self.generator.adapt_tops(key.0, key.1, &mut tops, &beard);
+        let ground = self.chunk_tops(key);
+        let mut grounds: [i32; 256] = std::array::from_fn(|i| ground[i][0]);
+        self.generator.adapt_tops(key.0, key.1, &mut grounds, &beard);
+        let tops: Box<[[i32; 2]; 256]> =
+            Box::new(std::array::from_fn(|i| [grounds[i], ground[i][1]]));
         let top = tops[i];
         let mut adapted = shard.lock().unwrap();
         if adapted.len() >= TOPS_PER_SHARD {
@@ -398,27 +414,30 @@ impl CubicStructures {
     /// [`Self::height`] on the adapted terrain ([`Self::adapted_top`]): what
     /// the pieces see when they are placed.
     pub fn placed_height(&self, kind: HeightmapType, x: i32, z: i32) -> i32 {
-        self.height_of(kind, self.adapted_top(x, z))
+        self.height_of(kind, self.adapted_column(x, z))
     }
 
     /// Generation's heightmap `kind` at column (`x`, `z`): one above the
-    /// highest block of its kind, the sea filling to sea level.
+    /// highest block of its kind ([`Self::height_of`]).
     pub fn height(&self, kind: HeightmapType, x: i32, z: i32) -> i32 {
-        self.height_of(kind, self.column_top(x, z))
+        self.height_of(kind, self.column(x, z))
     }
 
-    fn height_of(&self, kind: HeightmapType, top: i32) -> i32 {
-        let solid = if top == NO_SURFACE { MIN_Y } else { top + 1 };
-        match kind {
-            HeightmapType::OceanFloor | HeightmapType::OceanFloorWg => solid,
-            _ => solid.max(self.sea_level),
-        }
+    /// One above the column's highest block of `kind`: the ground for the
+    /// ocean floor, the higher of ground and water for the rest.
+    fn height_of(&self, kind: HeightmapType, [ground, water]: [i32; 2]) -> i32 {
+        let top = match kind {
+            HeightmapType::OceanFloor | HeightmapType::OceanFloorWg => ground,
+            _ => ground.max(water),
+        };
+        if top == NO_SURFACE { MIN_Y } else { top + 1 }
     }
 
     /// The column's blocks from [`MIN_Y`] up to its surface, by what
     /// structures ask of them (air past the end).
     fn noise_blocks(&self, x: i32, z: i32) -> NoiseColumn {
-        let top = self.column_top(x, z).max(self.sea_level - 1);
+        let [ground, water] = self.column(x, z);
+        let top = ground.max(water);
         if top < MIN_Y {
             return NoiseColumn {
                 min: MIN_Y,
