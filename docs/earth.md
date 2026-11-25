@@ -297,7 +297,7 @@ a tree stands and the share thins its density. Lily pads count as plants, so the
 
 - **The cache key.** `terrain_key()` also ends with `#vegetation<rules>` (now `#vegetation2`) while land cover and
   vegetation are on, so old far-view caches are rebuilt. The far view draws its own simple trees
-  (see Far view: trees and snow); the key also ends with `#fartrees1` then.
+  (see Far view: trees and snow); the key also ends with `#fartrees2` then.
 
 ### Climate
 
@@ -509,11 +509,31 @@ waits. Style, shapes and sizes are in the table of `earth/far_trees.rs`.
 - **Snow.** With snow on, a column is cold when its biome snows (snowy taiga, snowy plains, snowy slopes, frozen
   peaks, ice spikes, frozen river and frozen ocean; the same rule as near, no height drop). Level 0 puts a snow
   layer on top of the ground or a tree, makes the grass under it snowy and freezes the top water block. Level 2 and
-  up make the top voxel a snow block, the top water voxel ice, and the top of a canopy a snow block on about half the
-  columns (speckled like snowy spruce).
+  up make the top voxel a snow block, the top water voxel ice, and the top of a canopy a snow layer on about half
+  the columns (speckled like snowy spruce; a layer lets the light through as leaves do, so the ground under it stays
+  lit, see Far view below).
 - **Off.** With trees and snow off (an old world, or no land cover) the far output is what it was.
-- **The cache key.** `terrain_key()` ends with `#fartrees1` while land cover and vegetation are on, and `#snow1` when
-  snow is on too.
+- **The cache key.** `terrain_key()` ends with `#fartrees2` (`far_trees::FAR_TREE_RULES`) while land cover and
+  vegetation are on, and `#snow1` when snow is on too.
+
+### Far view
+
+The standing rule for all far-view work, Cubic and Earth:
+
+- **Coarse first, refine later.** The distance is never empty. A far node is first drawn coarse, as fast as the
+  far view was before the detail; the detail comes later on the same low-priority background builder, nearest and in
+  view first, and each refined node replaces its coarse one in place (the old one stays drawn until then). Only
+  refined nodes are kept in the far cache, so a revisit draws them refined straight away.
+- **As much as possible on the GPU.** Generation, meshing, culling and drawing already run there where they can
+  (`gfx/cube_gen`, `cube_mesh`, `cube_far`); new far work goes through the same material stage and inputs shader
+  packs hook (real block states, normals and light), never a private pass.
+- **Earth now.** With far trees on, a node is made first without its trees (ground, colour and snow) and again whole
+  once every planned node is drawn (`cubic_lod/refine.rs`, a `LateContent`: up to 48 nodes at a time, nearest first,
+  those behind the camera counted at three times their distance). `HORIZON_FAR_TWO_PASS=0` makes nodes whole at
+  once, to compare.
+- **Light.** Far terrain has no light propagation: a voxel's sky light is 15 in the open, 4 under a roof, and 13
+  under foliage, an opaque voxel light passes (`light_permeable`: leaves, snow layers), about what ground under near
+  trees gets. Before this a canopy was a roof and the ground under far trees was drawn near black.
 
 ### Water atlas
 

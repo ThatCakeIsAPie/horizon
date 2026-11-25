@@ -539,11 +539,12 @@ fn coarse_snow_whitens_cold_tops_speckles_canopies_and_freezes_cold_water() {
         let top = *col.iter().rev().find(|&&v| v != b.air).unwrap();
         let canopy = col.iter().any(|v| leaves.contains(v));
         match (canopy, top) {
+            // A snow layer (light passes it), not a block; on a one-voxel tip it is the column's only canopy.
+            (_, t) if t == b.far.snow => white_canopy += 1,
             (false, t) => {
                 assert_eq!(t, b.snow_block);
                 white_ground += 1;
             }
-            (true, t) if t == b.snow_block => white_canopy += 1,
             (true, t) => {
                 assert!(leaves.contains(&t));
                 green_canopy += 1;
@@ -556,13 +557,16 @@ fn coarse_snow_whitens_cold_tops_speckles_canopies_and_freezes_cold_water() {
     );
     // Without snow nothing is white, and warm ground has none anywhere.
     assert_eq!(
-        columns_with(&node_tops(&w, 2, 0, 0, TREES), &[b.snow_block]),
+        columns_with(&node_tops(&w, 2, 0, 0, TREES), &[b.snow_block, b.far.snow]),
         0
     );
     let warm = LandRig::level(45.0, 100.0, TREE);
     let ww = plain(&warm);
     assert_eq!(
-        columns_with(&node_tops(&ww, 2, 0, 0, SNOWY), &[b.snow_block, b.far.ice]),
+        columns_with(
+            &node_tops(&ww, 2, 0, 0, SNOWY),
+            &[b.snow_block, b.far.snow, b.far.ice]
+        ),
         0
     );
     // Cold water: the top water voxel is ice.

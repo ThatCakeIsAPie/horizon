@@ -229,7 +229,7 @@ impl EarthSettings {
     /// ([`super::surface::LAND_RULES`]), so a world made with land cover never shares a cache with one made
     /// without; with it off the text is what it was before land cover existed. With land cover and vegetation
     /// both on it continues with the version of the vegetation rules ([`super::vegetation::VEGETATION_RULES`])
-    /// and of the far-view tree rules ([`super::vegetation::FAR_TREE_RULES`]), and with `snow` also on, the
+    /// and of the far-view tree rules ([`super::far_trees::FAR_TREE_RULES`]), and with `snow` also on, the
     /// version of the snow rules ([`super::vegetation::SNOW_RULES`]); vegetation without land cover does
     /// nothing and is not in the key, nor is snow without vegetation. With land cover and climate both on it
     /// ends with the climate data rules ([`horizon_earth::CLIMATE_RULES`]) and the climate biome rules
@@ -262,7 +262,7 @@ impl EarthSettings {
                 key.push_str(&format!(
                     "#vegetation{}#fartrees{}",
                     super::vegetation::VEGETATION_RULES,
-                    super::vegetation::FAR_TREE_RULES
+                    super::far_trees::FAR_TREE_RULES
                 ));
                 if self.snow {
                     key.push_str(&format!("#snow{}", super::vegetation::SNOW_RULES));
@@ -424,7 +424,7 @@ mod tests {
         let rules = format!(
             "#vegetation{}#fartrees{}",
             super::super::vegetation::VEGETATION_RULES,
-            super::super::vegetation::FAR_TREE_RULES
+            super::super::far_trees::FAR_TREE_RULES
         );
         // With land cover, vegetation adds its rules after the land-cover part.
         let with = key(true, true);
@@ -489,7 +489,7 @@ mod tests {
         let without = key(true, true, false);
         assert!(with.contains(&format!(
             "fartrees{}{snow}",
-            super::super::vegetation::FAR_TREE_RULES
+            super::super::far_trees::FAR_TREE_RULES
         )));
         assert_ne!(with, without);
         // Snow without vegetation or without land cover does nothing: only the file's own text differs.

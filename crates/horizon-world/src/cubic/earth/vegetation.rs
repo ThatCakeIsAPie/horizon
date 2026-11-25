@@ -63,9 +63,6 @@ use crate::cubic::custom::vegetation::VegetationMask;
 /// The version of the vegetation rules above. It goes up when what grows where changes, and is in the terrain
 /// key while land cover and vegetation are on.
 pub const VEGETATION_RULES: u32 = 2;
-/// The version of the far view's trees (`far_trees`). It is in the terrain key while vegetation is on, so far
-/// caches made before trees were drawn far away are rebuilt.
-pub const FAR_TREE_RULES: u32 = 1;
 /// The version of the snow rules (snow on cold ground and trees, ice on cold still water), near and far. It is
 /// in the terrain key while vegetation and `snow` are on.
 pub const SNOW_RULES: u32 = 1;
