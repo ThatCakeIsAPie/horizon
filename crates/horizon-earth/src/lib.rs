@@ -30,6 +30,7 @@ pub mod height;
 pub mod landcover;
 pub mod landfield;
 pub mod landsource;
+pub mod ore_richness;
 pub mod projection;
 pub mod source;
 #[cfg(any(test, feature = "testing"))]

@@ -98,6 +98,8 @@ struct Terrain {
     replacers: Replacers,
     carvers: carvers::Carvers,
     populator: populate::Populator,
+    /// [`Terrain::ground`]'s chunk columns of [`Terrain::chunk_tops`].
+    ground_cache: std::sync::Mutex<std::collections::HashMap<(i32, i32), Box<[i32; 256]>>>,
     sea_level: i32,
     biome_scale: f64,
 }
@@ -115,6 +117,8 @@ pub struct CustomCubicGenerator {
     areas: Vec<(IntAabb, CustomCubicGenerator)>,
     /// The world seed of an Earth world's population random (see [`Self::with_seed`]); unused by the others.
     earth_seed: i64,
+    /// An Earth world's ores, deepslate and ore meteors ([`Self::with_earth_ores`]).
+    earth_ores: Option<Box<earth::ores::EarthOres>>,
 }
 
 impl CustomCubicGenerator {
@@ -170,11 +174,13 @@ impl CustomCubicGenerator {
                 replacers: Replacers::new(seed, &settings.replacers, registry)?,
                 carvers: carvers::Carvers::new(seed, settings, registry)?,
                 populator: populate::Populator::new(seed, settings, registry)?,
+                ground_cache: Default::default(),
                 sea_level,
                 biome_scale: settings.biome_scale(),
             })),
             areas,
             earth_seed: 0,
+            earth_ores: None,
         })
     }
 
@@ -187,6 +193,7 @@ impl CustomCubicGenerator {
             kind: Kind::Flat(flat::FlatGenerator::new(settings, registry)?),
             areas: Vec::new(),
             earth_seed: 0,
+            earth_ores: None,
         })
     }
 
@@ -238,6 +245,7 @@ impl CustomCubicGenerator {
             kind: Kind::Heightmap(Arc::new(generator)),
             areas: Vec::new(),
             earth_seed: 0,
+            earth_ores: None,
         })
     }
 
@@ -247,6 +255,21 @@ impl CustomCubicGenerator {
     pub fn with_seed(mut self, seed: i64) -> Self {
         self.earth_seed = seed;
         self
+    }
+
+    /// The same Earth generator with ores: deepslate under the ground, stone patches and ores by depth, and ore
+    /// meteors ([`earth::ores`]), for an Earth world whose settings have `oreGen`. Build `ores` with the same
+    /// world seed as [`Self::with_seed`]. No effect on the other kinds.
+    pub fn with_earth_ores(mut self, ores: earth::ores::EarthOres) -> Self {
+        if matches!(self.kind, Kind::Heightmap(_)) {
+            self.earth_ores = Some(Box::new(ores));
+        }
+        self
+    }
+
+    /// Whether population places Earth ores ([`Self::with_earth_ores`]).
+    pub fn has_earth_ores(&self) -> bool {
+        self.earth_ores.is_some()
     }
 
     /// The vegetation mask of an Earth world whose generator reads land cover: features grow by the class of
@@ -409,12 +432,23 @@ impl CustomCubicGenerator {
             return g.populate(cube, world);
         }
         match &self.kind {
-            Kind::Terrain(t) => t.populator.populate(cube, world, &t.blend),
-            // Earth has only vegetation: no ores, lakes or springs.
-            Kind::Heightmap(_) => world.decorate_surface(
-                cube,
-                &mut coords_seed_random(self.earth_seed, cube.x, cube.y, cube.z),
-            ),
+            Kind::Terrain(t) => t
+                .populator
+                .populate(cube, world, &t.blend, &|x, z| t.ground(x, z)),
+            // Earth: no lakes or springs; ores (when on) before the vegetation, meteors after it.
+            Kind::Heightmap(e) => {
+                let ground = earth::ores::EarthGround::new(e);
+                if let Some(ores) = &self.earth_ores {
+                    ores.place_ores(e, cube, world, &ground);
+                }
+                world.decorate_surface(
+                    cube,
+                    &mut coords_seed_random(self.earth_seed, cube.x, cube.y, cube.z),
+                );
+                if let Some(ores) = &self.earth_ores {
+                    ores.place_meteors(cube, world, &ground);
+                }
+            }
             Kind::Flat(_) => {}
         }
     }
@@ -1141,6 +1175,34 @@ impl Terrain {
             }
         }
         tops
+    }
+
+    /// The local ground estimate population hands to below-ground ores and
+    /// meteors: the Y of the column's topmost solid block of the terrain
+    /// ([`Self::chunk_tops`], carvers ignored; [`NO_TOP`] when none). Computed
+    /// per chunk column on first use and kept in a small cache (cleared when
+    /// it grows past 1,024 columns), so a world without below-ground ores
+    /// never pays for it.
+    fn ground(&self, x: i32, z: i32) -> i32 {
+        const MAX_COLUMNS: usize = 1024;
+        let key = (x >> 4, z >> 4);
+        let i = ((z & 15) << 4 | (x & 15)) as usize;
+        let lock = || {
+            self.ground_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some(tops) = lock().get(&key) {
+            return tops[i];
+        }
+        let tops = self.chunk_tops(key.0, key.1);
+        let y = tops[i];
+        let mut cache = lock();
+        if cache.len() >= MAX_COLUMNS {
+            cache.clear();
+        }
+        cache.insert(key, tops);
+        y
     }
 
     fn surface_y(&self, x: i32, z: i32, from_y: i32) -> Option<i32> {

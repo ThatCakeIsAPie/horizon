@@ -3276,7 +3276,7 @@ fn an_earth_world_has_its_own_settings_that_no_other_type_keeps() {
     let Mode::CreateCubic { cubic, .. } = &f.title.mode else {
         panic!("the Customize screen is open")
     };
-    assert_eq!((cubic.kind(), cubic.page_count()), (Earth, 1));
+    assert_eq!((cubic.kind(), cubic.page_count()), (Earth, 2));
     // Done writes Earth's JSON, not Custom's.
     press_id(&mut f, size, 100);
     let Mode::Create { options, .. } = &f.title.mode else {

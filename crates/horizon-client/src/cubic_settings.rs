@@ -12,6 +12,7 @@
 //!   World page starts from).
 use horizon_world::cubic::custom::{CustomGeneratorSettings, FlatGeneratorSettings};
 use horizon_world::cubic::earth::EarthSettings;
+use horizon_world::cubic::ores::OreGenSettings;
 use std::path::Path;
 
 /// The file a world's cubic generator settings are kept in.
@@ -91,7 +92,9 @@ pub fn default_json(kind: CubicKind) -> String {
 /// Where a new Earth world starts: the Create World page's first values (in the
 /// Swiss Alps, for relief to look at), no tile address and downloads off.
 pub fn default_earth() -> EarthSettings {
-    EarthSettings::at(46.0, 7.5)
+    let mut settings = EarthSettings::at(46.0, 7.5);
+    settings.ore_gen = Some(OreGenSettings::earth_defaults());
+    settings
 }
 
 /// `text` read as the settings of `kind` (an empty text is the preset) and
@@ -316,6 +319,11 @@ mod tests {
         let (_, text) = load_world_generation(&dir).unwrap();
         assert_eq!(EarthSettings::from_json(&text).unwrap(), default_earth());
         assert!(!default_earth().allow_downloads && default_earth().tile_url.is_empty());
+        // New Earth worlds have ores, stone patches and deepslate by depth.
+        assert_eq!(
+            default_earth().ore_gen,
+            Some(OreGenSettings::earth_defaults())
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

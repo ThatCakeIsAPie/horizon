@@ -44,6 +44,15 @@ pub fn default_block_names() -> Vec<String> {
         "lily_pad",
         "bedrock",
         "moss_block",
+        // Ore meteor cores.
+        "raw_iron_block",
+        "raw_copper_block",
+        "raw_gold_block",
+        "diamond_block",
+        "emerald_block",
+        "lapis_block",
+        "redstone_block",
+        "coal_block",
     ]
     .iter()
     .map(|n| format!("minecraft:{n}"))

@@ -422,6 +422,67 @@ say which places are dry.
   (the key ends `#landcover<data>.2 ... #vegetation2 ... #climate<data>.2`), so caches made before the dry rules are
   rebuilt.
 
+### Ore richness
+
+Where an Earth world has ores, some places are richer in an ore than others, following real geology: the Pilbara is
+rich in iron, Chile's copper belt in copper, the Witwatersrand in gold, coal basins in coal, kimberlite fields in
+diamond. The map is an Earth setting (`richnessMap` in `oreGen`, on by default) with a strength slider
+(`richnessStrength`) on the Ores page; ore meteors ignore it (they bring ores a place lacks). See
+[cubic-ores.md](cubic-ores.md) for the ores themselves.
+
+- **What it is.** `horizon_earth::ore_richness::richness(ore, latitude, longitude)`: a multiplier per ore, 1 for an
+  average piece of land, clamped to 0.3 ..= 5. It is 1 over the ocean, for ores the map does not know (anything but
+  `iron`, `copper`, `coal`, `gold`, `redstone`, `lapis`, `diamond`, `emerald`) and for a place that is not a number.
+  The engine raises it to the strength (`richness^strength`) and clamps again to 0.3 ..= 5, so strength 0 turns the
+  map off and 1 uses it as it is.
+- **The asset.** `crates/horizon-earth/data/ore_richness.bin` (600,646 bytes), built into the game with
+  `include_bytes!`: no download, no extra host, no question. A 0.25° grid (1440 by 720 cells, about 28 km at the
+  equator) per ore, one byte per cell holding `32 log2(richness) + 128`, rows delta coded and zlib compressed. It is
+  decoded once, on first use (about 8 MB in memory), and a lookup is a Catmull-Rom bicubic mix of the 4 by 4 nearest
+  cells in log space over a field that was already smoothed, so there are no grid edges. `ORE_RICHNESS_RULES` (1)
+  goes into the cache key of a world whose ores follow the map.
+- **The data** (all public domain except GLiM, CC BY 3.0; `THIRD_PARTY_NOTICES.md` and the "Data credits..."
+  screen credit them):
+  - USGS Mineral Resources Data System (MRDS, about 300,000 worldwide records, https://mrdata.usgs.gov/mrds/);
+  - USGS Major mineral deposits of the world (OFR 2005-1294, about 3,200 deposits,
+    https://mrdata.usgs.gov/major-deposits/);
+  - USGS Mineral operations outside the United States (mines only, https://mrdata.usgs.gov/mineral-operations/);
+  - USGS World Coal Quality Inventory (OFR 2010-1196, https://pubs.usgs.gov/of/2010/1196/) and Coal fields of the
+    conterminous United States (OFR 2012-1205, https://pubs.usgs.gov/of/2012/1205/);
+  - GLiM, the Global Lithological Map at 0.5° (Hartmann & Moosdorf 2012, doi:10.1594/PANGAEA.788537), for the rock
+    type where deposit records are thin;
+  - Natural Earth 1:50m land (public domain) for the coast.
+- **Which ore is which commodity.** Iron: iron ore, hematite, magnetite, siderite. Copper, gold, diamond: the same.
+  Coal: coal, lignite, anthracite, coal fields and coal sample sites. Emerald: emerald, beryl, aquamarine (beryllium
+  at a quarter weight). Redstone has no real ore, so it follows mercury and cinnabar (rare earths at 0.3 weight).
+  Lapis: lapis lazuli, with other semi-precious gemstones at 0.15 weight as a proxy for the metamorphic terrains it
+  comes from.
+- **Survey bias.** Some countries are surveyed far more closely than others (MRDS is mostly the United States), so
+  the raw count of deposits would make them look rich in everything. Instead a place's richness in an ore is the
+  ore's share of all the records near it against its share worldwide (a 1.25° kernel for the ore, 2.5° for all
+  records). Where there are few records of anything the share falls back to a prior learned from the rock type
+  (0.6 to 1.8), not to barren. Records count by weight (a major deposit 10, a mine 4, a producer 3, a prospect 1.5,
+  an occurrence 1), and the ratio from the globally compiled major deposits alone is blended in at 35%, so
+  world-class districts stand out everywhere. The result is centred so the median piece of land is 1.
+- **What it looks like** (observations, not rules; the code knows no places): Pilbara iron 3.2, Mesabi iron 3.5,
+  Escondida copper 2.8, Witwatersrand gold 2.7, Hunter Valley coal 3.2, Powder River Basin coal 1.8, Kimberley diamond
+  3.8, Muzo emerald 3.6, Almadén redstone 2.5, Sar-e-Sang lapis 2.7; the US Great Plains iron, copper and gold about
+  0.4; the Greenland ice and the open sea about 1.
+- **Rebuilding it.** `tools/earth_ore_richness.py` downloads the sources into a cache outside the repository, builds
+  the grid and writes the asset; the run is deterministic. From the repository root, with a venv in the cache (its docstring lists the
+  packages: numpy, scipy, pyshp, xlrd, pillow):
+
+  ```
+  ../horizon-ores-data-cache/venv/bin/python tools/earth_ore_richness.py \
+      --cache ../horizon-ores-data-cache --out crates/horizon-earth/data/ore_richness.bin
+  ```
+
+  A new asset changes the size the tests expect and should bump `ORE_RICHNESS_RULES`.
+- **Thin.** Coal outside the United States rests on mine records and coal sample sites, not basin outlines. Lapis
+  and emerald have few records, so they are mostly flat; some places come out rich in an ore for a neighbour's sake
+  (beryl pegmatites a couple of degrees from a coal basin). The deposit data is not current (MRDS stopped being
+  updated in 2011).
+
 ### Snow
 
 With `"snow": true` (new worlds get it with land cover; an old world's file leaves it out and keeps its look) the

@@ -30,6 +30,9 @@ mod far_trees_tests;
 pub mod generator;
 #[cfg(test)]
 mod land_tests;
+pub mod ores;
+#[cfg(test)]
+mod ores_tests;
 pub mod settings;
 pub mod surface;
 #[cfg(test)]

@@ -56,6 +56,12 @@ pub struct EarthSettings {
     /// and left out of the file while off, so an older world keeps its biomes, its text and its cache key.
     #[serde(default, skip_serializing_if = "is_false")]
     pub climate: bool,
+    /// Cubic's ores, stone patches, deepslate and ore meteors
+    /// ([`crate::cubic::ores`]). Left out of an older world's file, which then
+    /// has none (its text and cache key unchanged); `at` leaves it out too
+    /// (the client gives new worlds [`crate::cubic::ores::OreGenSettings::earth_defaults`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ore_gen: Option<crate::cubic::ores::OreGenSettings>,
     /// Whether snow lies on cold ground and on trees, and still water freezes, where the biome is cold enough
     /// (`docs/earth.md`, "Snow"), near and in the far view. It needs `vegetation` (it runs in the same
     /// population); off by default, in `at` too (the client turns it on for new worlds), and left out of the
@@ -96,6 +102,7 @@ impl EarthSettings {
             land_cover: false,
             vegetation: false,
             climate: false,
+            ore_gen: None,
             snow: false,
         }
     }
@@ -138,6 +145,9 @@ impl EarthSettings {
                 horizon_earth::tile::MAX_ZOOM,
                 self.max_zoom
             ));
+        }
+        if let Some(o) = &self.ore_gen {
+            o.validate()?;
         }
         Ok(())
     }
@@ -323,6 +333,7 @@ mod tests {
             land_cover: true,
             vegetation: true,
             climate: true,
+            ore_gen: None,
             snow: true,
         };
         for text in [s.to_json_pretty(), s.to_json_compact()] {
