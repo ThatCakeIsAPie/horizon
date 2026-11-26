@@ -462,13 +462,28 @@ impl CubicLodSampler {
     }
 
     /// A node of the finest levels made of the saved cubes it holds (the
-    /// others sampled as usual), or `None` when none of them was saved. The
-    /// flag says whether it is worth keeping (see [`Self::keep`]).
-    fn of_saved_cubes(&mut self, key: CubeKey) -> Option<(CubeNode, bool)> {
+    /// others sampled as usual), or [`Saved::No`] when none of them was saved.
+    /// The flag says whether it is worth keeping (see [`Self::keep`]).
+    ///
+    /// In an Earth world the node gets its sky cover and its columns' water
+    /// tops the way a generated one does ([`Self::earth_covered`]): without
+    /// the tops the mesher takes water ending on a node's top (the sea, a
+    /// bay) to go on in the node above and draws the sand bed instead. When
+    /// the tiles those read are missing the node is [`Saved::Later`] (they
+    /// are asked for), never drawn without them.
+    fn of_saved_cubes(&mut self, key: CubeKey) -> Saved {
         match key.level {
             0 => {
-                let node = self.saved_cube(SectionPos::new(key.x, key.y, key.z))?;
-                Some((self.covered(node), false))
+                let Some(node) = self.saved_cube(SectionPos::new(key.x, key.y, key.z)) else {
+                    return Saved::No;
+                };
+                if self.is_earth() {
+                    return match self.earth_covered(key, node) {
+                        Some(node) => Saved::Node(node, false),
+                        None => Saved::Later,
+                    };
+                }
+                Saved::Node(self.covered(node), false)
             }
             1 => {
                 let children = key.children();
@@ -477,26 +492,39 @@ impl CubicLodSampler {
                     .map(|c| self.saved_cube(SectionPos::new(c.x, c.y, c.z)))
                     .collect();
                 if saved.iter().all(Option::is_none) {
-                    return None;
+                    return Saved::No;
                 }
                 let all_saved = saved.iter().all(Option::is_some);
                 let mut nodes = Vec::with_capacity(8);
                 for (child, saved) in children.iter().zip(saved) {
                     nodes.push(match saved {
                         Some(node) => node,
-                        None => self.sampled_plain(*child)?,
+                        None => match self.sampled_plain(*child) {
+                            Some(node) => node,
+                            // An Earth child waits for its tiles; the saved ones are not
+                            // replaced by a node of generated terrain meanwhile.
+                            None if self.is_earth() => return Saved::Later,
+                            None => return Saved::No,
+                        },
                     });
                 }
                 let air = BlockStateId(self.air);
                 let refs: [&CubeNode; 8] = std::array::from_fn(|i| &nodes[i]);
                 let node = downsample(refs, air, |s| self.kind(s));
+                if self.is_earth() {
+                    // Exact whenever the surfaces are known (else it is later).
+                    return match self.earth_covered(key, node) {
+                        Some(node) => Saved::Node(node, all_saved || !self.in_band(key)),
+                        None => Saved::Later,
+                    };
+                }
                 let (cover, exact) = self.cover_of(key);
                 // Inside vanilla's range, cubes not saved yet are the far
                 // columns' guess: the node waits until they are.
                 let keep = exact && (all_saved || !self.in_band(key));
-                Some((node.with_covered(cover), keep))
+                Saved::Node(node.with_covered(cover), keep)
             }
-            _ => None,
+            _ => Saved::No,
         }
     }
 
@@ -698,6 +726,16 @@ impl CubicLodSampler {
         let node = self.cache.as_ref()?.get(key)?;
         Some(stored_class(&node, self.air))
     }
+}
+
+/// What [`CubicLodSampler::of_saved_cubes`] made of node `key`.
+enum Saved {
+    /// None of its cubes was saved.
+    No,
+    /// Some were, but what it still needs (an Earth world's tiles) is not in.
+    Later,
+    /// The node, and whether it is worth keeping.
+    Node(CubeNode, bool),
 }
 
 /// [`CubicLodSampler::cached_class`]'s rule for a stored `node`.
@@ -937,16 +975,22 @@ impl CubeSampler for CubicLodSampler {
             self.made_whole(key);
             return Some(node);
         }
-        if key.level <= 1
-            && let Some((node, keep)) = self.of_saved_cubes(key)
-        {
-            if keep {
-                self.keep(&node, since);
+        if key.level <= 1 {
+            match self.of_saved_cubes(key) {
+                Saved::Node(node, keep) => {
+                    if keep {
+                        self.keep(&node, since);
+                    }
+                    // The world's own cubes, trees and all: whole. Without this a node
+                    // handed out to be refined waited out its time in the batch.
+                    self.made_whole(key);
+                    return Some(node);
+                }
+                // Saved cubes under it, and the tiles its cover and water tops read are not in:
+                // later, not a generated node in place of them.
+                Saved::Later => return None,
+                Saved::No => {}
             }
-            // The world's own cubes, trees and all: whole. Without this a node
-            // handed out to be refined waited out its time in the batch.
-            self.made_whole(key);
-            return Some(node);
         }
         let node = self.sampled(key)?;
         // An Earth node made after the level shut down is built of air in

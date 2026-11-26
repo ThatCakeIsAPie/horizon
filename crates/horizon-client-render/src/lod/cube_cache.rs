@@ -746,6 +746,7 @@ fn decode(key: CubeKey, body: &[u8]) -> Option<CubeNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lod::cube::{Kind, downsample};
     use std::time::Duration;
 
     fn scratch(name: &str) -> PathBuf {
@@ -846,6 +847,56 @@ mod tests {
         }
         same(&cache.get(uniform_key).unwrap(), &uniform);
         assert!(cache.get(CubeKey::new(2, -3, 5, 8)).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An Earth sea node (all water, its tops on the node's top) round-trips, and a parent of eight stored
+    /// children keeps the tops, as `of_cached_children` / the writer's `keep_into` build it.
+    #[test]
+    fn a_sea_node_keeps_its_water_tops_in_the_cache_and_so_does_a_parent_of_cached_children() {
+        let dir = scratch("sea-tops");
+        let water = Voxel {
+            state: BlockStateId(9),
+            biome: 4,
+        };
+        let sea_top = |key: CubeKey, wet: bool| {
+            let mut tops = Box::new([NO_FLUID_TOP; 256]);
+            if wet {
+                tops.iter_mut().for_each(|t| *t = 4096);
+            }
+            CubeNode::uniform(key, water).with_fluid_tops(Some(tops))
+        };
+        let parent = CubeKey::new(3, -4, -1, 2);
+        // The upper four end the water on their tops, the lower four are water going on.
+        let children: Vec<CubeNode> = parent
+            .children()
+            .iter()
+            .map(|&c| sea_top(c, c.y > 2 * parent.y))
+            .collect();
+        {
+            let cache = CubeLodCache::open(&dir, "a").unwrap();
+            for child in &children {
+                cache.put(child);
+            }
+        }
+        let cache = CubeLodCache::open(&dir, "a").unwrap();
+        let mut got = Vec::new();
+        for child in &children {
+            let node = cache.get(child.key).unwrap();
+            same(&node, child);
+            assert_eq!(node.fluid_tops().is_some(), child.key.y > 2 * parent.y);
+            got.push(node);
+        }
+        let refs: [&CubeNode; 8] = std::array::from_fn(|i| &got[i]);
+        let air = BlockStateId(0);
+        let merged = downsample(refs, air, |s| {
+            if s == air { Kind::Air } else { Kind::Fluid }
+        });
+        let tops = merged.fluid_tops().expect("the parent of cached children has tops");
+        assert!(tops.iter().all(|&h| h == 4096));
+        // And the parent put and read back keeps them.
+        cache.put(&merged);
+        same(&cache.get(parent).unwrap(), &merged);
         let _ = fs::remove_dir_all(&dir);
     }
 

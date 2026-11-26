@@ -1881,6 +1881,13 @@ pub struct GpuNode {
     pub content: GpuContent,
     /// The columns the sky is blocked over (`CubeNode::covered_mask`).
     pub cover: Option<Box<CoverMask>>,
+    /// Where each column's fluid ends inside the node (`CubeNode::fluid_tops`:
+    /// `z << 4 | x`, [`FLUID_TOP_SCALE`] units per node side over the node's
+    /// bottom, [`NO_FLUID_TOP`] for none). Filled from a CPU node; `None` for
+    /// a generated slot. The GPU mesher does not read it yet (it knows the sea
+    /// surface only): a node that has them is meshed on the CPU, see
+    /// [`needs_cpu_mesh`].
+    pub fluid_tops: Option<Box<FluidTops>>,
     /// The distinct block states of a CPU node (empty for a generated one:
     /// the generator's states are known from the start).
     pub states: Vec<u32>,
@@ -4853,6 +4860,15 @@ const CPU_PER_BATCH: usize = 2;
 const POOL_WAIT: Duration = Duration::from_millis(2);
 const POOL_WAITS: u32 = 250;
 
+/// Whether a CPU node cannot go through the GPU mesher: one with per-column
+/// fluid tops, which only the CPU mesher (`mesh::mesh_cube`) draws (the GPU's
+/// knows the sea surface alone). Today only an Earth world has such nodes and
+/// it has no GPU path; the workers do not route on this yet (the two
+/// renderers' swaps are separate, see `GpuNode::fluid_tops`).
+pub fn needs_cpu_mesh(node: &CubeNode) -> bool {
+    node.fluid_tops().is_some()
+}
+
 /// A CPU node as a [`GpuNode`]: uniform and uncovered ones need no slot, the
 /// rest are uploaded into one. `None` when the pool is full.
 fn gpu_from_node(node: &CubeNode, air: BlockStateId, backend: &GpuBackend) -> Option<GpuNode> {
@@ -4884,6 +4900,7 @@ fn gpu_from_node(node: &CubeNode, air: BlockStateId, backend: &GpuBackend) -> Op
         key: node.key,
         content,
         cover,
+        fluid_tops: node.fluid_tops().map(|tops| Box::new(*tops)),
         states,
     })
 }
@@ -4924,6 +4941,7 @@ fn gpu_node(
             key,
             content: GpuContent::Slot(slot),
             cover: None,
+            fluid_tops: None,
             states: Vec::new(),
         }),
         Some(Resident::Node(node)) => {
@@ -4976,6 +4994,75 @@ fn node(
 
 #[cfg(test)]
 mod tests {
+    /// Eight stored children with water tops (the sea's, on the top of the node
+    /// at every level) make a parent with them: downsampling merges them, the
+    /// way `keep_into` / `of_cached_children` / the fallback downsample build it.
+    #[test]
+    fn a_parent_of_eight_children_with_water_tops_has_them_merged() {
+        use super::{CubeKey, CubeNode, FLUID_TOP_SCALE, Kind, NO_FLUID_TOP, Voxel, downsample};
+        use horizon_world::registry::BlockStateId;
+        let (air, water) = (BlockStateId(0), BlockStateId(9));
+        let kind = |s: BlockStateId| if s == air { Kind::Air } else { Kind::Fluid };
+        let parent = CubeKey::new(3, -4, -1, 2);
+        let tops_of = |h: u16| {
+            let mut tops = Box::new([NO_FLUID_TOP; 256]);
+            tops.iter_mut().for_each(|t| *t = h);
+            tops
+        };
+        let sea = |key: CubeKey, tops: Option<u16>| {
+            CubeNode::uniform(key, Voxel { state: water, biome: 1 })
+                .with_fluid_tops(tops.map(tops_of))
+        };
+        // The sea: water on the top of the upper children (tops at their tops),
+        // water going on through the lower ones (none).
+        let children = parent.children();
+        let nodes: Vec<CubeNode> = children
+            .iter()
+            .map(|&c| sea(c, (c.y > 2 * parent.y).then_some(FLUID_TOP_SCALE)))
+            .collect();
+        let refs = std::array::from_fn(|i| &nodes[i]);
+        let merged = downsample(refs, air, kind);
+        assert_eq!(merged.key, parent);
+        let tops = merged.fluid_tops().expect("the parent keeps the sea's tops");
+        assert!(tops.iter().all(|&h| h == FLUID_TOP_SCALE));
+        assert_eq!(merged.fluid_top(3, 4), Some(parent.size() as f32));
+        // A lake halfway up the upper children: halfway up the upper half.
+        let nodes: Vec<CubeNode> = children
+            .iter()
+            .map(|&c| sea(c, (c.y > 2 * parent.y).then_some(FLUID_TOP_SCALE / 2)))
+            .collect();
+        let refs = std::array::from_fn(|i| &nodes[i]);
+        let merged = downsample(refs, air, kind);
+        let want = (FLUID_TOP_SCALE / 2 + FLUID_TOP_SCALE) / 2;
+        assert!(merged.fluid_tops().unwrap().iter().all(|&h| h == want));
+        // No child with tops: none (the old rule).
+        let nodes: Vec<CubeNode> = children.iter().map(|&c| sea(c, None)).collect();
+        let refs = std::array::from_fn(|i| &nodes[i]);
+        assert!(downsample(refs, air, kind).fluid_tops().is_none());
+    }
+
+    /// 6. The GPU path: a CPU node's tops ride in [`super::GpuNode::fluid_tops`]
+    /// (the same units), and a node with them is meshed on the CPU.
+    #[test]
+    fn a_node_with_water_tops_is_not_for_the_gpu_mesher() {
+        use super::{CubeKey, CubeNode, FLUID_TOP_SCALE, NO_FLUID_TOP, Voxel, needs_cpu_mesh};
+        use horizon_world::registry::BlockStateId;
+        let key = CubeKey::new(4, 0, -1, 0);
+        let voxel = |s| Voxel { state: BlockStateId(s), biome: 0 };
+        let dry = CubeNode::from_fn(key, |x, _, _| voxel(u32::from(x > 7)));
+        assert!(!needs_cpu_mesh(&dry));
+        let mut tops = Box::new([NO_FLUID_TOP; 256]);
+        tops[16 * 5 + 3] = FLUID_TOP_SCALE;
+        let wet = dry.with_fluid_tops(Some(tops));
+        assert!(needs_cpu_mesh(&wet));
+        // An all-none set is no tops.
+        let none = wet.clone().with_fluid_tops(Some(Box::new([NO_FLUID_TOP; 256])));
+        assert!(!needs_cpu_mesh(&none));
+        // What `gpu_from_node` copies into the GpuNode.
+        let copy = wet.fluid_tops().map(|t| Box::new(*t)).unwrap();
+        assert_eq!(copy[16 * 5 + 3], FLUID_TOP_SCALE);
+    }
+
     #[test]
     fn known_classes_keep_the_last_answers_whole() {
         use super::{CubeKey, KnownClasses, NodeClass};
