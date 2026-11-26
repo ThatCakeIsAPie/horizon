@@ -53,9 +53,28 @@ struct State {
 }
 
 /// The coarse nodes and the order they are refined in, shared by every fork of the sampler.
-#[derive(Default)]
 pub struct Refine {
     state: Mutex<State>,
+    /// Make a node whole at once where something is drawn over its place ([`Refine::pass`]).
+    whole_when_covered: bool,
+}
+
+/// Whether [`Refine::pass`] makes nodes whole at once where something is drawn over their place
+/// (`HORIZON_FAR_WHOLE_WHEN_COVERED`). Off: measured on a 60 s forest walk (6 workers) it cut the far jobs
+/// from 28.5k to 20.4k but each whole build costs more, so the workers stayed as busy, the far view fell
+/// 3.7k nodes behind the walk (219 with it off) and the first fill took 220 s instead of 109 s.
+pub const WHOLE_WHEN_COVERED: u64 = 0;
+
+impl Default for Refine {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            whole_when_covered: crate::lod::cube::far_knob(
+                "HORIZON_FAR_WHOLE_WHEN_COVERED",
+                WHOLE_WHEN_COVERED,
+            ) != 0,
+        }
+    }
 }
 
 /// How node `key` should be made now.
@@ -72,19 +91,15 @@ impl Refine {
     /// Distance is never empty, so where there is a hole a node comes coarse first (the producer lists those:
     /// `urgent`, or everything with `all`). Elsewhere a drawn piece is swapped only when its replacement is
     /// ready, so the node being made now replaces one that stays drawn until it is done: making it whole at
-    /// once costs no blank frame and saves the second build. (`HORIZON_FAR_WHOLE_WHEN_COVERED`, default on;
-    /// `0`: coarse first always, as before.) Before the producer has said anything, nothing is known to be
-    /// drawn, so it is coarse.
+    /// once costs no blank frame and saves the second build. (`HORIZON_FAR_WHOLE_WHEN_COVERED`, default off,
+    /// see [`WHOLE_WHEN_COVERED`]; off: coarse first always, as before.) Before the producer has said
+    /// anything, nothing is known to be drawn, so it is coarse.
     pub fn pass(&self, key: CubeKey) -> Pass {
         let s = self.state.lock().unwrap();
         if s.handed.contains_key(&key) || s.whole.contains(&key) {
             return Pass::Whole;
         }
-        if crate::lod::cube::far_knob("HORIZON_FAR_WHOLE_WHEN_COVERED", 1) != 0
-            && s.heard
-            && !s.all
-            && !s.urgent.contains(&key)
-        {
+        if self.whole_when_covered && s.heard && !s.all && !s.urgent.contains(&key) {
             Pass::Whole
         } else {
             Pass::Coarse
@@ -218,6 +233,10 @@ impl LateContent for Refine {
         true
     }
 
+    fn wants_coarse_first(&self) -> bool {
+        self.whole_when_covered
+    }
+
     /// Nodes with nothing drawn over their place (or every node: `all`) are made coarse first, the rest whole
     /// at once (see [`Refine::pass`]).
     fn coarse_first(&self, keys: &[CubeKey], all: bool) {
@@ -325,9 +344,31 @@ mod tests {
     }
 
     #[test]
+    fn whole_when_covered_is_off_by_default_so_every_node_comes_coarse_first() {
+        assert_eq!(WHOLE_WHEN_COVERED, 0);
+        let refine = Refine {
+            whole_when_covered: false,
+            ..Refine::default()
+        };
+        assert!(!refine.wants_coarse_first());
+        let (hole, other) = (CubeKey::new(2, 0, 0, 0), CubeKey::new(2, 1, 0, 0));
+        refine.coarse_first(&[hole], false);
+        assert_eq!(refine.pass(hole), Pass::Coarse);
+        assert_eq!(
+            refine.pass(other),
+            Pass::Coarse,
+            "coarse first though covered"
+        );
+    }
+
+    #[test]
     fn nodes_are_coarse_first_only_where_the_producer_says_nothing_is_drawn() {
-        let refine = Refine::default();
+        let refine = Refine {
+            whole_when_covered: true,
+            ..Refine::default()
+        };
         assert!(refine.exact());
+        assert!(refine.wants_coarse_first());
         let (hole, other, third) = (
             CubeKey::new(2, 0, 0, 0),
             CubeKey::new(2, 1, 0, 0),

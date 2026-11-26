@@ -526,9 +526,15 @@ pub trait LateContent: Send + Sync {
     /// place yet (the plan's holes and the coverage nodes over them); `all`:
     /// every node (a big fill: a join, a teleport, the coverage phase). Any
     /// other node replaces one still drawn, so it may be made whole at once
-    /// (`HORIZON_FAR_WHOLE_WHEN_COVERED`). Told when it changes; nothing by
-    /// default.
+    /// (`HORIZON_FAR_WHOLE_WHEN_COVERED`). Told when it changes, and only
+    /// when [`LateContent::wants_coarse_first`]; nothing by default.
     fn coarse_first(&self, _keys: &[CubeKey], _all: bool) {}
+    /// Whether [`LateContent::coarse_first`] is wanted at all (the list costs
+    /// a pass over the holes and the coverage layer on the game thread).
+    /// False by default.
+    fn wants_coarse_first(&self) -> bool {
+        false
+    }
     /// Boxes just taken whose nodes are not made now (they are about to split
     /// a level: their children replace them): handed out again later, if
     /// still drawn. Nothing by default.
@@ -4470,9 +4476,7 @@ impl CubeLod {
     /// drawn over their place: the holes and the coverage layer over them),
     /// when that changed since it was told (`HORIZON_FAR_WHOLE_WHEN_COVERED`).
     fn tell_coarse_first(&mut self, late: &Arc<dyn LateContent>) {
-        if self.holes_told == self.holes_version
-            || far_knob("HORIZON_FAR_WHOLE_WHEN_COVERED", 1) == 0
-        {
+        if self.holes_told == self.holes_version || !late.wants_coarse_first() {
             return;
         }
         self.holes_told = self.holes_version;
@@ -8310,8 +8314,8 @@ mod whole_world_tests {
 }
 
 /// The far view's waste counters, and the late-refresh fixes that stop work
-/// being made for nothing (`HORIZON_FAR_LATE_EXACT`, `_SKIP_HELD`, `_DROP` and
-/// `HORIZON_FAR_WHOLE_WHEN_COVERED`, all on by default).
+/// being made for nothing (`HORIZON_FAR_LATE_EXACT`, `_SKIP_HELD`, `_DROP`,
+/// on by default, and `HORIZON_FAR_WHOLE_WHEN_COVERED`, off by default).
 #[cfg(test)]
 mod waste_tests {
     use super::*;
@@ -8401,6 +8405,9 @@ mod waste_tests {
         }
         fn exact(&self) -> bool {
             self.exact
+        }
+        fn wants_coarse_first(&self) -> bool {
+            true
         }
         fn coarse_first(&self, keys: &[CubeKey], all: bool) {
             let mut keys = keys.to_vec();
