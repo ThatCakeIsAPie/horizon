@@ -509,6 +509,76 @@ fn far_back() -> bool {
     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_DEFAULT, 0) == 0 }
 }
 
+/// How many nice levels a far view thread goes below the nice it started with.
+const FAR_BELOW: i32 = 10;
+
+/// The lowest priority a nice value gives.
+const NICE_LOWEST: i32 = 19;
+
+/// The nice value a far view thread takes when it now has `current`: 10
+/// levels more, at most 19; `None` when it is at 19 already (nothing lower
+/// exists, and the idle class would starve the thread under load, so it stays).
+pub fn far_nice(current: i32) -> Option<i32> {
+    (current < NICE_LOWEST).then(|| (current + FAR_BELOW).min(NICE_LOWEST))
+}
+
+std::thread_local! {
+    /// Set once this thread went below the main thread ([`far_below_main`]).
+    static FAR_BELOW_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Called once by every far view thread (workers, planner, classifier,
+/// descent, the cache writer) as it starts, whatever `put_helpers_behind` did:
+/// the thread stays below the main and render threads for good, so a walk's
+/// far rebuilds never take a core from the frame. Linux and Android: this
+/// thread's nice value (its own tid, the process's others are unchanged) goes
+/// up 10, to 19 at most ([`far_nice`]). Windows: below-normal priority.
+/// macOS: utility quality of service. Elsewhere nothing. Calling it again on
+/// the same thread changes nothing and answers true. False when the OS did not
+/// take it, or on Linux when the thread was at nice 19 already (the game was
+/// started that low: nothing lower is used, the idle class starves under load).
+pub fn far_below_main() -> bool {
+    if FAR_BELOW_DONE.with(|done| done.get()) {
+        return true;
+    }
+    server_core::leave_reserved();
+    let took = far_below();
+    if took {
+        FAR_BELOW_DONE.with(|done| done.set(true));
+    }
+    took
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn far_below() -> bool {
+    // SAFETY: gettid has no arguments; getpriority/setpriority read and set the
+    // nice value of the calling thread (a tid, which on Linux is a "process"
+    // for PRIO_PROCESS).
+    unsafe {
+        let tid = libc::gettid() as libc::id_t;
+        let nice = libc::getpriority(libc::PRIO_PROCESS as _, tid);
+        match far_nice(nice) {
+            Some(to) => libc::setpriority(libc::PRIO_PROCESS as _, tid, to) == 0,
+            None => false,
+        }
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+)))]
+fn far_below() -> bool {
+    false
+}
+
+#[cfg(any(target_vendor = "apple", windows))]
+fn far_below() -> bool {
+    far()
+}
+
 /// Run the calling thread only on a core nothing else wants: work that may
 /// take seconds and that nothing waits for yet (the stronghold rings while a
 /// world opens). The idle class on Linux, background quality of service on
@@ -1097,6 +1167,61 @@ mod tests {
         .unwrap();
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         assert!(!std::thread::spawn(super::behind_server).join().unwrap());
+    }
+
+    /// The nice a far thread takes: 10 more, capped at 19, nothing at 19.
+    #[test]
+    fn far_nice_goes_ten_down_to_nineteen() {
+        assert_eq!(super::far_nice(-5), Some(5));
+        assert_eq!(super::far_nice(0), Some(10));
+        assert_eq!(super::far_nice(9), Some(19));
+        assert_eq!(super::far_nice(10), Some(19));
+        assert_eq!(super::far_nice(18), Some(19));
+        assert_eq!(super::far_nice(19), None);
+        assert_eq!(super::far_nice(20), None);
+    }
+
+    /// A spawned far thread ends with a higher nice than its parent's (without
+    /// `put_helpers_behind`), only its own tid changes, and asking twice does
+    /// not lower it twice. At nice 19 already nothing changes and it says so.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_far_thread_goes_below_its_parent() {
+        let nice_of = |tid: libc::id_t| {
+            // SAFETY: reads the nice value of the thread `tid`.
+            unsafe { libc::getpriority(libc::PRIO_PROCESS as _, tid) }
+        };
+        // SAFETY: gettid has no arguments.
+        let parent_tid = unsafe { libc::gettid() } as libc::id_t;
+        let parent = nice_of(parent_tid);
+        let (took, first, second, again) = std::thread::spawn(|| {
+            let took = super::far_below_main();
+            // SAFETY: gettid has no arguments.
+            let tid = unsafe { libc::gettid() } as libc::id_t;
+            // SAFETY: reads this thread's nice value.
+            let first = unsafe { libc::getpriority(libc::PRIO_PROCESS as _, tid) };
+            let again = super::far_below_main();
+            // SAFETY: reads this thread's nice value.
+            let second = unsafe { libc::getpriority(libc::PRIO_PROCESS as _, tid) };
+            (took, first, second, again)
+        })
+        .join()
+        .unwrap();
+        if parent >= 19 {
+            assert!(!took);
+            assert_eq!(first, parent);
+        } else {
+            assert!(took);
+            assert!(first > parent);
+            assert_eq!(Some(first), super::far_nice(parent));
+            assert!(again);
+        }
+        assert_eq!(second, first);
+        assert_eq!(
+            nice_of(parent_tid),
+            parent,
+            "the parent thread is unchanged"
+        );
     }
 
     /// The idle hint holds on the three platforms.

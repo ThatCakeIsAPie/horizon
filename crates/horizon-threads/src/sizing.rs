@@ -39,6 +39,19 @@ pub fn sizing(battery: bool, cores: usize, pool: Pool) -> usize {
     if battery { auto.div_ceil(2) } else { auto }
 }
 
+/// How many far view workers (`Cube far terrain`) a machine of `threads` hardware
+/// threads gets: all but two, so the main/render thread and the near terrain keep
+/// a core each, from 1 to 8. On 8 threads: 6. (`HORIZON_FAR_WORKERS` overrides.)
+pub fn far_workers(threads: usize) -> usize {
+    threads.saturating_sub(2).clamp(1, 8)
+}
+
+/// [`far_workers`] for this machine: its available parallelism, not
+/// [`crate::worker_count`], which `HORIZON_WORKER_THREADS` may have lowered or raised.
+pub fn far_workers_here() -> usize {
+    far_workers(crate::available_parallelism().map_or(1, |n| n.get()))
+}
+
 /// Battery Mode as the pools were sized with it: the first answer fixes it, since
 /// the pools start once and a later call changes nothing they already took.
 pub fn set_battery(battery: bool) {
@@ -128,6 +141,24 @@ mod tests {
         assert!(battery());
         set_battery(false);
         assert!(battery());
+    }
+
+    /// Far workers: all but two threads, 1 to 8.
+    #[test]
+    fn far_workers_leave_two_threads() {
+        let table = [
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (8, 6),
+            (16, 8),
+            (32, 8),
+        ];
+        for (threads, workers) in table {
+            assert_eq!(super::far_workers(threads), workers, "{threads} threads");
+        }
     }
 
     /// A plain Jobs pool is the streaming pool's own automatic count, so the table

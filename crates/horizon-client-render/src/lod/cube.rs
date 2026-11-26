@@ -515,6 +515,24 @@ pub trait LateContent: Send + Sync {
     /// dropped that node): nothing is made for them, so whatever waits on them
     /// can stop waiting. Nothing by default.
     fn not_drawn(&self, _boxes: &[([i32; 3], [i32; 3])]) {}
+    /// Whether every box [`LateContent::take_refreshes`] hands out is exactly
+    /// one node's extent ([`CubeKey::of_box`]) and means that node only: the
+    /// producer then remakes just that node, not every drawn node the box
+    /// touches. False by default (structures' boxes are arbitrary).
+    fn exact(&self) -> bool {
+        false
+    }
+    /// Which nodes must come coarse first because nothing is drawn over their
+    /// place yet (the plan's holes and the coverage nodes over them); `all`:
+    /// every node (a big fill: a join, a teleport, the coverage phase). Any
+    /// other node replaces one still drawn, so it may be made whole at once
+    /// (`HORIZON_FAR_WHOLE_WHEN_COVERED`). Told when it changes; nothing by
+    /// default.
+    fn coarse_first(&self, _keys: &[CubeKey], _all: bool) {}
+    /// Boxes just taken whose nodes are not made now (they are about to split
+    /// a level: their children replace them): handed out again later, if
+    /// still drawn. Nothing by default.
+    fn not_now(&self, _boxes: &[([i32; 3], [i32; 3])]) {}
 }
 
 /// A sampled node on the GPU path: its voxels, or a slot of the GPU node pool
@@ -905,6 +923,10 @@ pub struct Plan {
     pub tiles_limited: bool,
     /// Nodes that would split but wait to be drawn first ([`PlanInput::refined`]).
     pub held: usize,
+    /// Those nodes ([`Plan::held`] of them): each splits as soon as it is
+    /// drawn, so making it whole meanwhile is wasted work
+    /// (`HORIZON_FAR_LATE_SKIP_HELD`).
+    pub held_keys: Vec<CubeKey>,
 }
 
 /// What the plan needs to draw the coarse far terrain as surface tiles
@@ -1323,6 +1345,7 @@ pub fn plan_far(input: &PlanInput) -> Plan {
     // leaf, to be drawn before it splits.
     let may_split = |node: CubeKey| refined.is_none_or(|r| r.contains(&node));
     let held = std::cell::Cell::new(0usize);
+    let held_keys = std::cell::RefCell::new(Vec::<CubeKey>::new());
     // The nodes holding a leaf of the last plan: the ones it split.
     let mut was_split = FxHashSet::<CubeKey>::default();
     for &leaf in previous {
@@ -1398,6 +1421,7 @@ pub fn plan_far(input: &PlanInput) -> Plan {
                         rule.factor(camera, node) * f64::from(node.size()) * merge / distance;
                     if ratio > 1.0 && !may_split(node) {
                         held.set(held.get() + 1);
+                        held_keys.borrow_mut().push(node);
                         Fate::Leaf(distance, node)
                     } else if ratio > 1.0 {
                         Fate::Split(Candidate {
@@ -1461,6 +1485,7 @@ pub fn plan_far(input: &PlanInput) -> Plan {
     leaves.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     out.leaves = leaves.into_iter().map(|(_, node)| node).collect();
     out.held = held.get();
+    out.held_keys = held_keys.into_inner();
     out
 }
 
@@ -1607,7 +1632,9 @@ pub fn node_kind(key: CubeKey, view: Option<&FarView>, tile: Option<TileInfo>) -
 // ---------------------------------------------------------------- producer
 
 /// Nodes kept after sampling, so a node meshed again (or the parent of
-/// children already sampled) is not sampled twice.
+/// children already sampled) is not sampled twice. Only the legacy size
+/// (`HORIZON_FAR_CACHE_MB=0`): the cache is bounded by bytes otherwise
+/// (192 MiB, dense nodes packed: some 40k nodes; see [`Cache`]).
 const CACHE_NODES: usize = 1024;
 /// How often the plan is recomputed when the camera stays in one cube, for
 /// cubes that loaded or unloaded meanwhile.
@@ -1661,6 +1688,12 @@ pub mod profile {
     pub static S_KEEP: AtomicU64 = AtomicU64::new(0);
     pub static S_FAR: AtomicU64 = AtomicU64::new(0);
     pub static S_COVER_BOX: AtomicU64 = AtomicU64::new(0);
+    // Earth's two passes (cubic_lod/refine.rs, `Refine::made`): nodes made
+    // coarse, made whole when handed out to be refined, and made whole
+    // without being handed out (straight away, or read whole). Counted always.
+    pub static R_COARSE: AtomicU64 = AtomicU64::new(0);
+    pub static R_WHOLE_REFRESH: AtomicU64 = AtomicU64::new(0);
+    pub static R_WHOLE_DIRECT: AtomicU64 = AtomicU64::new(0);
     static LAST: AtomicU64 = AtomicU64::new(0);
 
     pub fn on() -> bool {
@@ -1669,13 +1702,14 @@ pub mod profile {
     pub fn add(counter: &AtomicU64, since: Instant) {
         counter.fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
     }
-    /// Logs the totals since the last log, at most every 5 s.
-    pub fn maybe_log() {
+    /// Logs the totals since the last log, at most every 5 s. Whether it
+    /// logged.
+    pub fn maybe_log() -> bool {
         static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let now = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
         let last = LAST.load(Relaxed);
         if now < last + 5000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
-            return;
+            return false;
         }
         let ms = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / 1e6;
         let n = |c: &AtomicU64| c.swap(0, Relaxed);
@@ -1713,12 +1747,107 @@ pub mod profile {
             ms(&S_KEEP),
             ms(&S_FAR),
         );
+        true
+    }
+
+    /// What the last log saw of the waste counters, to log what came since.
+    struct Seen {
+        at: Instant,
+        waste: super::WasteSnap,
+        cache: [u64; 5],
+        earth: [u64; 3],
+    }
+
+    /// Logs the far view's waste counters over the window since the last call
+    /// (the cache's size as it is now): the line to read what the workers made
+    /// that was not needed. Called with [`maybe_log`], in the same window.
+    pub(super) fn maybe_log_waste(shared: &super::Shared) {
+        static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+        let now = Instant::now();
+        let waste = shared.waste.snap();
+        let (cache, nodes, bytes) = {
+            let c = shared.cache.lock().unwrap();
+            (
+                [c.hits, c.misses, c.evicted, c.forgotten, c.cleared],
+                c.len(),
+                c.bytes(),
+            )
+        };
+        let earth = [&R_COARSE, &R_WHOLE_REFRESH, &R_WHOLE_DIRECT].map(|c| c.load(Relaxed));
+        let mut seen = SEEN.lock().unwrap();
+        let first = Seen {
+            at: shared.near_epoch,
+            waste: Default::default(),
+            cache: [0; 5],
+            earth: [0; 3],
+        };
+        let before = seen.as_ref().unwrap_or(&first);
+        let w = waste.since(&before.waste);
+        let c = std::array::from_fn::<u64, 5, _>(|i| cache[i].saturating_sub(before.cache[i]));
+        let e = std::array::from_fn::<u64, 3, _>(|i| earth[i].saturating_sub(before.earth[i]));
+        let window = now.saturating_duration_since(before.at).as_millis();
+        log::info!(
+            "Horizon far waste ({window} ms): jobs {}, built {} (uniform {}, empty {}, failed {}), delivered {}, rebuilt {}; plan +{} -{} (installs {}, reused {}, readded {}, dropped unbuilt {}); released {}, short-lived {} {:?}; late refreshed {} (skipped held {}, dropped {}, wasted {}, other {}); retries {}; refills {} ({} keys); replans {} (moved {}, classes {}, refine {}, timer {}); cache hits {} misses {} evicted {} forgotten {} cleared {}, {} nodes, {:.1} MB; earth coarse {}, whole refresh {}, whole direct {}",
+            w.jobs,
+            w.built,
+            w.built_uniform,
+            w.built_empty,
+            w.failed_jobs,
+            w.delivered,
+            w.rebuilt,
+            w.plan_added,
+            w.plan_removed,
+            w.plan_installs,
+            w.plan_reused,
+            w.plan_readded,
+            w.plan_dropped_unbuilt,
+            w.released,
+            w.short_lived,
+            w.short_lived_levels,
+            w.late_refreshed,
+            w.late_skipped_held,
+            w.late_dropped,
+            w.late_wasted,
+            w.late_other,
+            w.retries,
+            w.refills,
+            w.refill_keys,
+            w.replans,
+            w.replans_moved,
+            w.replans_classes,
+            w.replans_refine,
+            w.replans_timer,
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+            nodes,
+            bytes as f64 / (1 << 20) as f64,
+            e[0],
+            e[1],
+            e[2],
+        );
+        *seen = Some(Seen {
+            at: now,
+            waste,
+            cache,
+            earth,
+        });
     }
 }
 
 fn far_ms(name: &'static str, default: Duration) -> Duration {
     Duration::from_millis(far_knob(name, default.as_millis() as u64))
 }
+
+/// The box of blocks (minimum, maximum, inclusive) of a node's extent: the
+/// inverse of [`CubeKey::of_box`].
+fn box_of(key: CubeKey) -> ([i32; 3], [i32; 3]) {
+    let (o, size) = (key.origin(), key.size());
+    (o, o.map(|v| v + size - 1))
+}
+
 /// How long a node whose sampling failed waits before it is asked again.
 const RETRY: Duration = Duration::from_secs(1);
 /// The plan is redone when the view's detail changes by more than this ratio
@@ -1849,6 +1978,69 @@ pub struct CubeLodStats {
     /// them has been (milliseconds): the far view lingering over near ground.
     pub linger_nodes: usize,
     pub linger_ms: f32,
+    /// Per-frame delivery budget ([`DeliverBudget`]): finished nodes held
+    /// back for a later frame now, and the frames that reached it.
+    pub deliver_deferred: usize,
+    pub deliver_frames_capped: u64,
+    // The far view's waste counters, ever (always counted: `Waste`).
+    /// Keys the workers took, nodes they made, and keys that failed (no node).
+    pub jobs: u64,
+    pub built: u64,
+    pub failed_jobs: u64,
+    /// Nodes made that are uniform (air, fluid or rock), and of them air.
+    pub built_uniform: u64,
+    pub built_empty: u64,
+    /// Nodes newly handed out, and of them those handed out before, released
+    /// since (made again).
+    pub delivered: u64,
+    pub rebuilt: u64,
+    /// Changed plans put in, the nodes they added and dropped, the added ones
+    /// still drawn (free), the added ones drawn before and released since
+    /// (made again unless cached), and the dropped ones never drawn.
+    pub plan_installs: u64,
+    pub plan_added: u64,
+    pub plan_removed: u64,
+    pub plan_reused: u64,
+    pub plan_readded: u64,
+    pub plan_dropped_unbuilt: u64,
+    /// Nodes released, and of them those released within
+    /// `HORIZON_FAR_SHORT_MS` of being handed out (by level, 7 and up in the
+    /// last).
+    pub released: u64,
+    pub short_lived: u64,
+    pub short_lived_levels: [u64; 8],
+    /// Late refreshes not queued because the plan splits the node next
+    /// (`HORIZON_FAR_LATE_SKIP_HELD`), dropped because the plan dropped the
+    /// node while it waited (`HORIZON_FAR_LATE_DROP`), released within
+    /// `HORIZON_FAR_SHORT_MS` of being queued, and queued for a box that is no
+    /// node's own extent (the old, not exact path).
+    pub late_skipped_held: u64,
+    pub late_dropped: u64,
+    pub late_wasted: u64,
+    pub late_other: u64,
+    /// Failed nodes asked for again.
+    pub retries: u64,
+    /// Times the whole plan was queued again, and the keys that pushed.
+    pub refills: u64,
+    pub refill_keys: u64,
+    /// Plan jobs sent, by the reason found first: the camera cube, range,
+    /// loaded box or detail moved; new classes; the refine rule (held nodes
+    /// and a node came in); only the timer.
+    pub replans: u64,
+    pub replans_moved: u64,
+    pub replans_classes: u64,
+    pub replans_refine: u64,
+    pub replans_timer: u64,
+    /// The workers' node cache: lookups found and not, nodes pushed out for
+    /// room, forgotten for changed cubes, whole clears (ever); the nodes it
+    /// holds now and their bytes.
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_evicted: u64,
+    pub cache_forgotten: u64,
+    pub cache_cleared: u64,
+    pub cache_nodes: usize,
+    pub cache_bytes: u64,
 }
 
 /// What a worker made of a node: a CPU mesh, or (the GPU path) a node for the
@@ -1856,6 +2048,51 @@ pub struct CubeLodStats {
 enum Product {
     Mesh(SectionMesh),
     Gpu(GpuNode),
+}
+
+/// The most the main thread takes in one `CubeLod::update` of the nodes the far
+/// workers finished: how many, their mesh vertex bytes, and how long the taking
+/// runs. The rest waits for the next frame (`CubeLod::backlog`). A walk
+/// finishes a few nodes a frame; a teleport or a far-detail change finishes
+/// thousands, and handing them all out in one frame was a spike (the renderer
+/// uploads what it is handed, `upload_cube_lods`, at 2 ms a frame).
+/// `HORIZON_FAR_DELIVER_MAX` (nodes), `HORIZON_FAR_DELIVER_BYTES` and
+/// `HORIZON_FAR_DELIVER_US`; a knob of 0 is no limit of that kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeliverBudget {
+    nodes: usize,
+    bytes: usize,
+    time: Duration,
+}
+
+/// What `update` has taken so far this frame.
+#[derive(Clone, Copy, Debug, Default)]
+struct Spent {
+    nodes: usize,
+    bytes: usize,
+}
+
+impl DeliverBudget {
+    /// Nodes a frame. A fill after a teleport finishes about a thousand a
+    /// second: this is far above a walk's rate and keeps a fill's pace.
+    const NODES: u64 = 256;
+    const BYTES: u64 = 4 << 20;
+    const US: u64 = 1000;
+
+    fn get() -> Self {
+        Self {
+            nodes: far_knob("HORIZON_FAR_DELIVER_MAX", Self::NODES) as usize,
+            bytes: far_knob("HORIZON_FAR_DELIVER_BYTES", Self::BYTES) as usize,
+            time: Duration::from_micros(far_knob("HORIZON_FAR_DELIVER_US", Self::US)),
+        }
+    }
+
+    /// Whether `spent` (and `elapsed` since the frame began taking) used it up.
+    fn reached(&self, spent: &Spent, elapsed: Duration) -> bool {
+        (self.nodes > 0 && spent.nodes >= self.nodes)
+            || (self.bytes > 0 && spent.bytes >= self.bytes)
+            || (!self.time.is_zero() && elapsed >= self.time)
+    }
 }
 
 struct Done {
@@ -2189,38 +2426,284 @@ impl Queue {
     }
 }
 
-#[derive(Default)]
-struct Cache {
-    nodes: FxHashMap<CubeKey, (Arc<CubeNode>, u64)>,
+/// A node kept in the cache: the node itself (uniform nodes, nodes of more
+/// than 256 kinds of voxel, or any node with packing off), or a dense node
+/// packed to one byte a voxel plus its palette (about 4 KiB, not 32).
+#[derive(Clone)]
+enum Entry {
+    Node(Arc<CubeNode>),
+    Packed(Arc<Packed>),
+}
+
+/// A dense node as a palette of its distinct voxels and, per voxel, the
+/// palette index (same order as the node's voxels), with its cover and
+/// fluid tops as they were.
+struct Packed {
+    key: CubeKey,
+    palette: Vec<Voxel>,
+    indices: Box<[u8; VOLUME]>,
+    covered: Option<Box<CoverMask>>,
+    fluid_tops: Option<Box<FluidTops>>,
+}
+
+impl Entry {
+    /// The entry for `node`: packed when `pack` and it is dense with at most
+    /// 256 distinct voxels. Takes the time of a pass over 4096 voxels, so
+    /// call it outside the cache's lock.
+    fn pack(node: Arc<CubeNode>, pack: bool) -> Self {
+        let Voxels::Dense(dense) = &node.voxels else {
+            return Self::Node(node);
+        };
+        if !pack {
+            return Self::Node(node);
+        }
+        let mut palette: Vec<Voxel> = Vec::new();
+        let mut index_of: FxHashMap<Voxel, u8> = FxHashMap::default();
+        let mut indices = Box::new([0u8; VOLUME]);
+        for (slot, voxel) in indices.iter_mut().zip(dense.iter()) {
+            *slot = match index_of.get(voxel) {
+                Some(&i) => i,
+                None => {
+                    if palette.len() == 256 {
+                        return Self::Node(node);
+                    }
+                    let i = palette.len() as u8;
+                    palette.push(*voxel);
+                    index_of.insert(*voxel, i);
+                    i
+                }
+            };
+        }
+        Self::Packed(Arc::new(Packed {
+            key: node.key,
+            palette,
+            indices,
+            covered: node.covered.clone(),
+            fluid_tops: node.fluid_tops.clone(),
+        }))
+    }
+
+    /// The node this entry holds (a packed one is built again: call it
+    /// outside the cache's lock).
+    fn unpack(&self) -> Arc<CubeNode> {
+        match self {
+            Self::Node(node) => node.clone(),
+            Self::Packed(p) => {
+                let mut dense = Box::new([p.palette[0]; VOLUME]);
+                for (voxel, &i) in dense.iter_mut().zip(p.indices.iter()) {
+                    *voxel = p.palette[usize::from(i)];
+                }
+                Arc::new(
+                    CubeNode::from_dense(p.key, dense)
+                        .with_covered(p.covered.clone())
+                        .with_fluid_tops(p.fluid_tops.clone()),
+                )
+            }
+        }
+    }
+
+    fn key(&self) -> CubeKey {
+        match self {
+            Self::Node(node) => node.key,
+            Self::Packed(p) => p.key,
+        }
+    }
+
+    /// An estimate of the bytes the entry holds.
+    fn bytes(&self) -> u64 {
+        let (voxels, covered, tops) = match self {
+            Self::Node(node) => (
+                match &node.voxels {
+                    Voxels::Uniform(_) => 0,
+                    Voxels::Dense(_) => VOLUME * std::mem::size_of::<Voxel>(),
+                },
+                node.covered.is_some(),
+                node.fluid_tops.is_some(),
+            ),
+            Self::Packed(p) => (
+                VOLUME + p.palette.len() * std::mem::size_of::<Voxel>(),
+                p.covered.is_some(),
+                p.fluid_tops.is_some(),
+            ),
+        };
+        let covered = if covered { 32 } else { 0 };
+        let tops = if tops { 512 } else { 0 };
+        (std::mem::size_of::<CubeNode>() + 64 + voxels + covered + tops) as u64
+    }
+}
+
+/// An entry with the tick of its last use and its estimated bytes.
+struct Slot {
+    entry: Entry,
     tick: u64,
+    bytes: u64,
+}
+
+/// The nodes the workers keep after sampling (see [`CACHE_NODES`]): bounded
+/// by bytes (`HORIZON_FAR_CACHE_MB`, dense nodes packed unless
+/// `HORIZON_FAR_CACHE_PACK=0`), least recently used out first. Every call is
+/// O(1) amortized but [`Cache::forget`] (O(levels) per changed cube); packing
+/// and unpacking are left to the caller, outside the lock.
+struct Cache {
+    nodes: FxHashMap<CubeKey, Slot>,
+    /// Uses, oldest first: (tick, key). An item whose tick is not its key's
+    /// current tick is stale (the key was used since, or went) and skipped.
+    log: VecDeque<(u64, CubeKey)>,
+    tick: u64,
+    bytes: u64,
+    budget: u64,
+    pack: bool,
+    max_nodes: usize,
+    /// Counters, ever (the far view's waste counters: `CubeLodStats`):
+    /// lookups found and not found, nodes pushed out for room, nodes dropped
+    /// because cubes under them changed (`Changes::Cubes`), and whole clears
+    /// (`Changes::All`).
+    hits: u64,
+    misses: u64,
+    evicted: u64,
+    forgotten: u64,
+    cleared: u64,
+}
+
+impl Default for Cache {
+    /// `HORIZON_FAR_CACHE_MB` (192; 0: the old cache, 1024 nodes unpacked) and
+    /// `HORIZON_FAR_CACHE_PACK` (1).
+    fn default() -> Self {
+        let mb = far_knob("HORIZON_FAR_CACHE_MB", 192);
+        if mb == 0 {
+            return Self::with_budget(u64::MAX, false, CACHE_NODES);
+        }
+        let pack = far_knob("HORIZON_FAR_CACHE_PACK", 1) != 0;
+        Self::with_budget(mb.saturating_mul(1 << 20), pack, usize::MAX)
+    }
 }
 
 impl Cache {
-    /// Drops the nodes holding any of `cubes`.
-    fn forget(&mut self, cubes: &[SectionPos]) {
-        self.nodes
-            .retain(|key, _| !cubes.iter().any(|&c| key.contains_cube(c)));
+    /// A cache of at most `bytes` (estimated) and `max_nodes` nodes.
+    fn with_budget(bytes: u64, pack: bool, max_nodes: usize) -> Self {
+        Self {
+            nodes: FxHashMap::default(),
+            log: VecDeque::new(),
+            tick: 0,
+            bytes: 0,
+            budget: bytes,
+            pack,
+            max_nodes,
+            hits: 0,
+            misses: 0,
+            evicted: 0,
+            forgotten: 0,
+            cleared: 0,
+        }
     }
-    fn get(&mut self, key: CubeKey) -> Option<Arc<CubeNode>> {
+    /// Nodes kept now, and the bytes they take (an estimate).
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    /// Drops the nodes holding any of `cubes`: for each cube the node of each
+    /// level that holds it (not a scan of the cache).
+    fn forget(&mut self, cubes: &[SectionPos]) {
+        for &cube in cubes {
+            for level in 0..=MAX_CUBE_LEVEL {
+                if self.remove_key(CubeKey::containing(level, cube)) {
+                    self.forgotten += 1;
+                }
+            }
+        }
+    }
+    /// Drops node `key` (counts nothing).
+    fn remove(&mut self, key: CubeKey) {
+        self.remove_key(key);
+    }
+    fn remove_key(&mut self, key: CubeKey) -> bool {
+        match self.nodes.remove(&key) {
+            Some(slot) => {
+                self.bytes -= slot.bytes;
+                true
+            }
+            None => false,
+        }
+    }
+    /// Drops everything (counts nothing).
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.log.clear();
+        self.bytes = 0;
+    }
+    /// The entry of `key` if kept (counts a hit or a miss, and the use).
+    /// Cheap: unpack it outside the lock.
+    fn lookup(&mut self, key: CubeKey) -> Option<Entry> {
+        let Some(slot) = self.nodes.get_mut(&key) else {
+            self.misses += 1;
+            return None;
+        };
+        self.hits += 1;
+        self.tick += 1;
+        slot.tick = self.tick;
+        let entry = slot.entry.clone();
+        self.log.push_back((self.tick, key));
+        self.compact();
+        Some(entry)
+    }
+    /// Keeps `entry` (packed already), pushing out the least recently used
+    /// nodes until the budget holds; never the one just kept.
+    fn put(&mut self, entry: Entry) {
+        let key = entry.key();
+        let bytes = entry.bytes();
         self.tick += 1;
         let tick = self.tick;
-        let entry = self.nodes.get_mut(&key)?;
-        entry.1 = tick;
-        Some(entry.0.clone())
-    }
-    fn insert(&mut self, node: Arc<CubeNode>) {
-        self.tick += 1;
-        if self.nodes.len() >= CACHE_NODES
-            && let Some(oldest) = self
-                .nodes
-                .iter()
-                .min_by_key(|(_, (_, tick))| *tick)
-                .map(|(&key, _)| key)
-        {
-            self.nodes.remove(&oldest);
+        if let Some(old) = self.nodes.insert(key, Slot { entry, tick, bytes }) {
+            self.bytes -= old.bytes;
         }
-        self.nodes.insert(node.key, (node, self.tick));
+        self.bytes += bytes;
+        self.log.push_back((tick, key));
+        while (self.bytes > self.budget || self.nodes.len() > self.max_nodes)
+            && self.nodes.len() > 1
+        {
+            let Some((t, oldest)) = self.log.pop_front() else {
+                break;
+            };
+            if oldest == key || self.nodes.get(&oldest).is_none_or(|s| s.tick != t) {
+                continue;
+            }
+            self.remove_key(oldest);
+            self.evicted += 1;
+        }
+        self.compact();
     }
+    /// Keeps the log near the size of the cache: stale items out.
+    fn compact(&mut self) {
+        if self.log.len() > self.nodes.len() * 4 + 1024 {
+            let nodes = &self.nodes;
+            self.log
+                .retain(|(t, key)| nodes.get(key).is_some_and(|s| s.tick == *t));
+        }
+    }
+    #[cfg(test)]
+    fn get(&mut self, key: CubeKey) -> Option<Arc<CubeNode>> {
+        self.lookup(key).map(|entry| entry.unpack())
+    }
+    #[cfg(test)]
+    fn insert(&mut self, node: Arc<CubeNode>) {
+        let entry = Entry::pack(node, self.pack);
+        self.put(entry);
+    }
+}
+
+/// The cached node at `key`, unpacked outside the cache's lock.
+fn cache_get(shared: &Shared, key: CubeKey) -> Option<Arc<CubeNode>> {
+    let entry = shared.cache.lock().unwrap().lookup(key);
+    entry.map(|entry| entry.unpack())
+}
+
+/// Keeps `node` in the cache, packed before the cache's lock is taken.
+fn cache_put(shared: &Shared, node: Arc<CubeNode>) {
+    let pack = shared.cache.lock().unwrap().pack;
+    let entry = Entry::pack(node, pack);
+    shared.cache.lock().unwrap().put(entry);
 }
 
 /// What the classifier thread has found of nodes, and what it is to look at.
@@ -2233,6 +2716,86 @@ struct Classes {
 
 mod known_classes;
 use known_classes::KnownClasses;
+
+/// Counters of the far view's work and of what of it was wasted (nodes made
+/// again, made for nothing, plans redone), always counted, read by
+/// [`CubeLod::stats`] and the profile log ([`profile::maybe_log_waste`]).
+/// `$f` is a counter; `short_lived_levels` counts by level on top.
+macro_rules! waste_counters {
+    ($($f:ident),* $(,)?) => {
+        #[derive(Default)]
+        struct Waste {
+            $($f: std::sync::atomic::AtomicU64,)*
+            short_lived_levels: [std::sync::atomic::AtomicU64; 8],
+        }
+
+        /// [`Waste`] read at one moment.
+        #[derive(Clone, Copy, Default)]
+        struct WasteSnap {
+            $($f: u64,)*
+            short_lived_levels: [u64; 8],
+        }
+
+        impl Waste {
+            fn snap(&self) -> WasteSnap {
+                WasteSnap {
+                    $($f: self.$f.load(Ordering::Relaxed),)*
+                    short_lived_levels: std::array::from_fn(|i| {
+                        self.short_lived_levels[i].load(Ordering::Relaxed)
+                    }),
+                }
+            }
+        }
+
+        impl WasteSnap {
+            /// What came since `before`.
+            fn since(&self, before: &WasteSnap) -> WasteSnap {
+                WasteSnap {
+                    $($f: self.$f.saturating_sub(before.$f),)*
+                    short_lived_levels: std::array::from_fn(|i| {
+                        self.short_lived_levels[i].saturating_sub(before.short_lived_levels[i])
+                    }),
+                }
+            }
+        }
+    };
+}
+
+waste_counters!(
+    jobs,
+    built,
+    failed_jobs,
+    built_uniform,
+    built_empty,
+    delivered,
+    rebuilt,
+    plan_installs,
+    plan_added,
+    plan_removed,
+    plan_reused,
+    plan_readded,
+    plan_dropped_unbuilt,
+    released,
+    short_lived,
+    late_refreshed,
+    late_skipped_held,
+    late_dropped,
+    late_wasted,
+    late_other,
+    retries,
+    refills,
+    refill_keys,
+    replans,
+    replans_moved,
+    replans_classes,
+    replans_refine,
+    replans_timer,
+);
+
+/// Adds `n` to a [`Waste`] counter.
+fn bump(counter: &std::sync::atomic::AtomicU64, n: usize) {
+    counter.fetch_add(n as u64, Ordering::Relaxed);
+}
 
 impl Shared {
     fn new() -> Self {
@@ -2253,6 +2816,7 @@ impl Shared {
             near_epoch: Instant::now(),
             planner: Mutex::default(),
             planner_wake: Condvar::new(),
+            waste: Waste::default(),
         }
     }
 }
@@ -2296,6 +2860,8 @@ struct Shared {
     /// off between the batches of columns arriving.
     near_seen_ms: std::sync::atomic::AtomicU64,
     near_epoch: Instant,
+    /// What the far view did and wasted ([`Waste`]).
+    waste: Waste,
 }
 
 // ---------------------------------------------------------------- planner
@@ -2476,6 +3042,8 @@ struct PlanDone {
     tiles_limited: bool,
     /// The plan's nodes waiting to be drawn before they split.
     held: usize,
+    /// Those nodes ([`Plan::held_keys`]), also when the plan did not change.
+    held_keys: Vec<CubeKey>,
     elapsed: Duration,
 }
 
@@ -2616,6 +3184,7 @@ fn make_plan(
         coarsened: plan.coarsened,
         tiles_limited: plan.tiles_limited,
         held: plan.held,
+        held_keys: plan.held_keys,
         elapsed: Duration::ZERO,
     };
     if changed {
@@ -2696,6 +3265,19 @@ enum Phase {
 /// A planned node with nothing drawn over its place, and the coverage leaf
 /// (a node or a tile) over it when the coverage layer has one.
 type Hole = (CubeKey, Option<FarKey>);
+
+/// Why a plan job was sent (the waste counters): the first that applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Replan {
+    /// The camera's cube, the range, the loaded box or the detail changed.
+    Moved,
+    /// New classes came.
+    Classes,
+    /// Nodes are held a level and one came in.
+    Refine,
+    /// Only the timer.
+    Timer,
+}
 
 /// What the last plan job was asked with.
 #[derive(Clone, Copy, Debug)]
@@ -2889,6 +3471,9 @@ pub struct CubeLod {
     backend: Option<GpuBackend>,
     /// Nodes finished for the GPU mesher, not yet taken.
     gpu_out: Vec<GpuNode>,
+    /// Finished nodes pulled from the workers' channel and held back by the
+    /// per-frame delivery budget ([`DeliverBudget`]), oldest first.
+    backlog: VecDeque<Done>,
     context: Option<Arc<WorkerContext>>,
     /// Block states the renderer has material records for.
     known_states: FxHashSet<u32>,
@@ -2918,6 +3503,20 @@ pub struct CubeLod {
     delivered_since: bool,
     /// The drawn nodes over loaded near cubes, since when.
     lingering: FxHashMap<CubeKey, Instant>,
+    /// Nodes ever handed out (cleared past 1<<20, and by `clear`): one handed
+    /// out again after its release was made again (`Waste::rebuilt`).
+    ever: FxHashSet<CubeKey>,
+    /// When each drawn node was handed out, and when it was queued to be made
+    /// again for late content: a release soon after was work for nothing.
+    delivered_at: FxHashMap<CubeKey, Instant>,
+    refreshed_at: FxHashMap<CubeKey, Instant>,
+    /// The leaves the last plan held back a level ([`Plan::held_keys`]).
+    held_keys: FxHashSet<CubeKey>,
+    /// Counts up when the holes, the coverage layer or the phase change, and
+    /// the count the late content was last told at
+    /// (`HORIZON_FAR_WHOLE_WHEN_COVERED`).
+    holes_version: u64,
+    holes_told: u64,
 }
 
 impl CubeLod {
@@ -2927,14 +3526,17 @@ impl CubeLod {
         context: Arc<WorkerContext>,
         air: BlockStateId,
     ) -> Self {
-        // As many as the threads, from 2 to 8: the far view's fill waits on its
-        // workers (the GPU and its pool have room to spare), and they step
-        // behind the near terrain while it loads. On 8 threads: 4 workers
-        // filled in 17.3 s after a teleport, 6 in 14.8 s, 8 at normal priority
-        // about 13 s (research/far-fill).
+        // All but two of the machine's threads, from 1 to 8
+        // (`horizon_threads::sizing::far_workers`): the main/render thread and
+        // the near terrain keep a core each, and the far threads run below them
+        // for good (`far_below_main`). Walking on 8 threads, 8 workers took 3.1
+        // cores and crowded the frame out; 6 take at most 6. The fill after a
+        // teleport waits on the workers: 4 filled in 17.3 s, 6 in 14.8 s, 8 in
+        // about 13 s (research/far-fill), so this trades about 2 s of fill for
+        // the frame. `HORIZON_FAR_WORKERS` sets the count outright.
         let wanted_threads = far_knob(
             "HORIZON_FAR_WORKERS",
-            horizon_threads::worker_count().clamp(2, 8) as u64,
+            horizon_threads::sizing::far_workers_here() as u64,
         )
         .max(1) as usize;
         let backend = sampler.gpu();
@@ -2959,7 +3561,10 @@ impl CubeLod {
                 let shared = shared.clone();
                 thread::Builder::new()
                     .name("Cube far classes".into())
-                    .spawn(move || classify_loop(&shared, sampler.as_mut()))
+                    .spawn(move || {
+                        horizon_threads::far_below_main();
+                        classify_loop(&shared, sampler.as_mut())
+                    })
                     .expect("spawn the cube classifier thread")
             })
             .into_iter()
@@ -2970,7 +3575,10 @@ impl CubeLod {
             threads.push(
                 thread::Builder::new()
                     .name("Cube far descent".into())
-                    .spawn(move || descent_loop(&shared, &descent))
+                    .spawn(move || {
+                        horizon_threads::far_below_main();
+                        descent_loop(&shared, &descent)
+                    })
                     .expect("spawn the cube descent thread"),
             );
         }
@@ -2979,7 +3587,10 @@ impl CubeLod {
             threads.push(
                 thread::Builder::new()
                     .name("Cube far planner".into())
-                    .spawn(move || plan_loop(&shared))
+                    .spawn(move || {
+                        horizon_threads::far_below_main();
+                        plan_loop(&shared)
+                    })
                     .expect("spawn the cube planner thread"),
             );
         }
@@ -3054,6 +3665,7 @@ impl CubeLod {
             linger_queued: FxHashSet::default(),
             budget: NODE_BUDGET,
             gpu_out: Vec::new(),
+            backlog: VecDeque::new(),
             context,
             known_states: FxHashSet::default(),
             biomes_sent: false,
@@ -3072,6 +3684,12 @@ impl CubeLod {
             held: 0,
             delivered_since: false,
             lingering: FxHashMap::default(),
+            ever: FxHashSet::default(),
+            delivered_at: FxHashMap::default(),
+            refreshed_at: FxHashMap::default(),
+            held_keys: FxHashSet::default(),
+            holes_version: 0,
+            holes_told: u64::MAX,
             backend,
         }
     }
@@ -3219,6 +3837,46 @@ impl CubeLod {
     /// as ready.
     pub fn stats(&self) -> CubeLodStats {
         let mut out = self.stats;
+        let w = self.shared.waste.snap();
+        out.jobs = w.jobs;
+        out.built = w.built;
+        out.failed_jobs = w.failed_jobs;
+        out.built_uniform = w.built_uniform;
+        out.built_empty = w.built_empty;
+        out.delivered = w.delivered;
+        out.rebuilt = w.rebuilt;
+        out.plan_installs = w.plan_installs;
+        out.plan_added = w.plan_added;
+        out.plan_removed = w.plan_removed;
+        out.plan_reused = w.plan_reused;
+        out.plan_readded = w.plan_readded;
+        out.plan_dropped_unbuilt = w.plan_dropped_unbuilt;
+        out.released = w.released;
+        out.short_lived = w.short_lived;
+        out.short_lived_levels = w.short_lived_levels;
+        out.late_skipped_held = w.late_skipped_held;
+        out.late_dropped = w.late_dropped;
+        out.late_wasted = w.late_wasted;
+        out.late_other = w.late_other;
+        out.retries = w.retries;
+        out.refills = w.refills;
+        out.refill_keys = w.refill_keys;
+        out.replans = w.replans;
+        out.replans_moved = w.replans_moved;
+        out.replans_classes = w.replans_classes;
+        out.replans_refine = w.replans_refine;
+        out.replans_timer = w.replans_timer;
+        {
+            let cache = self.shared.cache.lock().unwrap();
+            out.cache_hits = cache.hits;
+            out.cache_misses = cache.misses;
+            out.cache_evicted = cache.evicted;
+            out.cache_forgotten = cache.forgotten;
+            out.cache_cleared = cache.cleared;
+            out.cache_nodes = cache.len();
+            out.cache_bytes = cache.bytes();
+        }
+        out.deliver_deferred = self.backlog.len();
         out.planned = self.plan.len() + self.tiles.plan.len();
         out.pending = self.missing + self.tiles.missing;
         out.ready = out.planned - out.pending;
@@ -3492,6 +4150,7 @@ impl CubeLod {
         if stale && !hold {
             let mut slot = self.shared.planner.lock().unwrap();
             if slot.job.is_none() && !slot.busy && slot.done.is_none() {
+                let reason = self.replan_reason(cube, max_distance, loaded, &rule, view, now);
                 let snapshot = LoadedSnapshot::take(cube, loaded, &is_loaded);
                 track_lingering(
                     &self.delivered,
@@ -3521,6 +4180,17 @@ impl CubeLod {
                 });
                 drop(slot);
                 self.shared.planner_wake.notify_one();
+                let w = &self.shared.waste;
+                bump(&w.replans, 1);
+                bump(
+                    match reason {
+                        Replan::Moved => &w.replans_moved,
+                        Replan::Classes => &w.replans_classes,
+                        Replan::Refine => &w.replans_refine,
+                        Replan::Timer => &w.replans_timer,
+                    },
+                    1,
+                );
                 self.replan = false;
                 self.jumped = None;
                 self.asked = Some(Asked {
@@ -3534,49 +4204,152 @@ impl CubeLod {
             }
         }
         let mut out = Vec::new();
-        while let Ok(done) = self.results.try_recv() {
-            let key = done.key;
-            // A drawn node made again for late content replaces the old one
-            // (the renderer swaps a key's node); a failed remake keeps it.
-            let again = self.refreshing.remove(&key) && self.delivered.contains(&key);
-            if !(self.wanted.contains(&key) || self.cover.contains(&key))
-                || (self.delivered.contains(&key) && !again)
-                || (again && done.product.is_none())
-            {
-                if let Some(Product::Gpu(node)) = &done.product {
-                    self.release(node);
-                }
-                continue;
-            }
-            match done.product {
-                Some(Product::Mesh(mesh)) => {
-                    let empty = mesh.solid.is_empty() && mesh.translucent.is_empty();
-                    if again && !empty {
-                        self.empty.remove(&key);
-                    }
-                    self.deliver(key, empty);
-                    out.push((key, mesh));
-                }
-                Some(Product::Gpu(node)) => {
-                    let empty = matches!(node.content,
-                        GpuContent::Uniform(voxel) if voxel.state == self.air);
-                    if matches!(node.content, GpuContent::Slot(_)) && node.states.is_empty() {
-                        self.stats.gpu_generated += 1;
-                    }
-                    self.deliver(key, empty);
-                    self.gpu_out.push(node);
-                }
-                None => {
-                    self.failed.insert(key, now);
-                }
-            }
-        }
+        self.drain_results(now, &mut out);
         self.retry(now);
         self.recheck_holes(now, false);
         self.advance_phase(now);
         self.track_completion(now);
         self.late_content(camera, view.forward, max_distance);
         out
+    }
+
+    /// Why the plan is redone now, the first that applies (for the waste
+    /// counters only: the decision is `update`'s).
+    fn replan_reason(
+        &self,
+        cube: SectionPos,
+        max_distance: f64,
+        loaded: LoadedBox,
+        rule: &Rule,
+        view: &FarView,
+        now: Instant,
+    ) -> Replan {
+        let Some(a) = &self.asked else {
+            return Replan::Moved;
+        };
+        if a.cube != cube
+            || a.max_distance != max_distance
+            || a.loaded != loaded
+            || refocused(&a.rule, rule, view)
+        {
+            Replan::Moved
+        } else if self.replan {
+            Replan::Classes
+        } else if self.held > 0
+            && self.delivered_since
+            && now.saturating_duration_since(a.at) >= far_ms("HORIZON_FAR_REFINE_MS", REFINE_REPLAN)
+        {
+            Replan::Refine
+        } else {
+            Replan::Timer
+        }
+    }
+
+    /// Takes the finished nodes the workers sent, within the per-frame
+    /// delivery budget ([`DeliverBudget`]): what is over it waits in
+    /// `backlog` for the next `update`, in the order it came. Once the budget
+    /// is reached the sibling group of the last node taken is still finished
+    /// (the up to seven others of its parent that already came), so a swap
+    /// that waits for all eight children is not held to the next frame by the
+    /// cap, and a parent is never released ([`CubeLod::removed`]) before every
+    /// node over its place is handed out: a node still in `backlog` is not
+    /// `delivered`. Results nobody wants any more cost nothing and use none of it.
+    fn drain_results(&mut self, now: Instant, out: &mut Vec<(CubeKey, SectionMesh)>) {
+        self.drain_results_within(now, out, DeliverBudget::get());
+    }
+
+    /// [`CubeLod::drain_results`] under `budget`.
+    fn drain_results_within(
+        &mut self,
+        now: Instant,
+        out: &mut Vec<(CubeKey, SectionMesh)>,
+        budget: DeliverBudget,
+    ) {
+        self.backlog.extend(self.results.try_iter());
+        if self.backlog.is_empty() {
+            return;
+        }
+        let started = Instant::now();
+        let mut spent = Spent::default();
+        let mut group: Option<CubeKey> = None;
+        let mut capped = false;
+        while let Some(done) = self.backlog.pop_front() {
+            if spent.nodes > 0
+                && budget.reached(&spent, started.elapsed())
+                && group != Some(done.key.parent())
+            {
+                self.backlog.push_front(done);
+                capped = true;
+                break;
+            }
+            self.accept(done, now, out, &mut spent, &mut group);
+        }
+        if capped && let Some(parent) = group {
+            let mut i = 0;
+            while i < self.backlog.len() {
+                if self.backlog[i].key.parent() == parent {
+                    let done = self.backlog.remove(i).expect("a backlog entry");
+                    self.accept(done, now, out, &mut spent, &mut group);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        if capped {
+            self.stats.deliver_frames_capped += 1;
+        }
+    }
+
+    /// One finished node: handed out (counted in `spent`), or dropped.
+    fn accept(
+        &mut self,
+        done: Done,
+        now: Instant,
+        out: &mut Vec<(CubeKey, SectionMesh)>,
+        spent: &mut Spent,
+        group: &mut Option<CubeKey>,
+    ) {
+        let key = done.key;
+        // A drawn node made again for late content replaces the old one
+        // (the renderer swaps a key's node); a failed remake keeps it.
+        let again = self.refreshing.remove(&key) && self.delivered.contains(&key);
+        if !(self.wanted.contains(&key) || self.cover.contains(&key))
+            || (self.delivered.contains(&key) && !again)
+            || (again && done.product.is_none())
+        {
+            if let Some(Product::Gpu(node)) = &done.product {
+                self.release(node);
+            }
+            return;
+        }
+        match done.product {
+            Some(Product::Mesh(mesh)) => {
+                let empty = mesh.solid.is_empty() && mesh.translucent.is_empty();
+                if again && !empty {
+                    self.empty.remove(&key);
+                }
+                spent.nodes += 1;
+                spent.bytes += (mesh.solid.len() + mesh.translucent.len())
+                    * std::mem::size_of::<crate::mesher::TerrainVertex>();
+                *group = Some(key.parent());
+                self.deliver(key, empty);
+                out.push((key, mesh));
+            }
+            Some(Product::Gpu(node)) => {
+                let empty = matches!(node.content,
+                    GpuContent::Uniform(voxel) if voxel.state == self.air);
+                if matches!(node.content, GpuContent::Slot(_)) && node.states.is_empty() {
+                    self.stats.gpu_generated += 1;
+                }
+                spent.nodes += 1;
+                *group = Some(key.parent());
+                self.deliver(key, empty);
+                self.gpu_out.push(node);
+            }
+            None => {
+                self.failed.insert(key, now);
+            }
+        }
     }
 
     /// Tells the late content the view, and once every planned node is
@@ -3587,6 +4360,7 @@ impl CubeLod {
         };
         let complete = self.is_complete();
         late.view(camera, forward, max_distance, complete);
+        self.tell_coarse_first(&late);
         if !complete {
             return;
         }
@@ -3618,27 +4392,102 @@ impl CubeLod {
         if !not_drawn.is_empty() {
             late.not_drawn(&not_drawn);
         }
-        let again: Vec<CubeKey> = (self.delivered.iter())
-            .filter(|k| self.wanted.contains(k) || self.cover.contains(k))
-            .filter(|k| !self.refreshing.contains(k) && touches(k))
-            .copied()
-            .collect();
+        let exact = late.exact() && far_knob("HORIZON_FAR_LATE_EXACT", 1) != 0;
+        let mut again: Vec<CubeKey> = if exact {
+            // Each box is one node's extent: remake that node only, not every
+            // drawn node the box touches (a coarser or finer one overlapping
+            // it is another box's, or none's).
+            let mut seen = FxHashSet::default();
+            (boxes.iter())
+                .filter_map(|(min, max)| CubeKey::of_box(*min, *max))
+                .filter(|k| {
+                    self.delivered.contains(k)
+                        && (self.wanted.contains(k) || self.cover.contains(k))
+                        && !self.refreshing.contains(k)
+                        && seen.insert(*k)
+                })
+                .collect()
+        } else {
+            (self.delivered.iter())
+                .filter(|k| self.wanted.contains(k) || self.cover.contains(k))
+                .filter(|k| !self.refreshing.contains(k) && touches(k))
+                .copied()
+                .collect()
+        };
+        if !exact && !again.is_empty() {
+            // Keys that are no box's own node: made for a box that crosses them.
+            let own: FxHashSet<CubeKey> = (boxes.iter())
+                .filter_map(|(min, max)| CubeKey::of_box(*min, *max))
+                .collect();
+            bump(
+                &self.shared.waste.late_other,
+                again.iter().filter(|k| !own.contains(k)).count(),
+            );
+        }
+        // A node the plan splits as soon as it is drawn is not worth making
+        // whole now: its box is handed out again later, if still drawn. Only
+        // with exact boxes (they say they can be handed out again).
+        if exact && far_knob("HORIZON_FAR_LATE_SKIP_HELD", 1) != 0 && !self.held_keys.is_empty() {
+            let (skipped, rest): (Vec<CubeKey>, Vec<CubeKey>) =
+                again.into_iter().partition(|k| self.held_keys.contains(k));
+            again = rest;
+            if !skipped.is_empty() {
+                bump(&self.shared.waste.late_skipped_held, skipped.len());
+                let skipped: Vec<_> = skipped.into_iter().map(box_of).collect();
+                late.not_now(&skipped);
+            }
+        }
         if again.is_empty() {
             return;
         }
         self.stats.late_refreshed += again.len() as u64;
+        bump(&self.shared.waste.late_refreshed, again.len());
         // Made again means asked of the sampler again: the node the workers
         // keep in memory is the out-of-date one (taking it back left the far
         // view's coarse Earth nodes coarse, without their trees, for good).
         {
             let mut cache = self.shared.cache.lock().unwrap();
             for key in &again {
-                cache.nodes.remove(key);
+                cache.remove(*key);
             }
         }
+        let now = Instant::now();
+        self.refreshed_at.extend(again.iter().map(|&k| (k, now)));
         self.refreshing.extend(again.iter().copied());
-        self.shared.queue.lock().unwrap().later.extend(again);
+        {
+            let mut queue = self.shared.queue.lock().unwrap();
+            // A key the plan dropped while it was queued (`dropped`) is wanted
+            // again: not to be skipped.
+            for key in &again {
+                queue.dropped.remove(key);
+            }
+            queue.later.extend(again);
+        }
         self.shared.wake.notify_all();
+    }
+
+    /// Tells the late content which nodes must come coarse first (nothing is
+    /// drawn over their place: the holes and the coverage layer over them),
+    /// when that changed since it was told (`HORIZON_FAR_WHOLE_WHEN_COVERED`).
+    fn tell_coarse_first(&mut self, late: &Arc<dyn LateContent>) {
+        if self.holes_told == self.holes_version
+            || far_knob("HORIZON_FAR_WHOLE_WHEN_COVERED", 1) == 0
+        {
+            return;
+        }
+        self.holes_told = self.holes_version;
+        let mut seen = FxHashSet::default();
+        let mut keys = Vec::new();
+        for &(key, over) in &self.holes {
+            keys.push(key);
+            if let Some(FarKey::Cube(c)) = over {
+                keys.push(c);
+            }
+        }
+        keys.extend(self.cover.iter().copied());
+        keys.retain(|k| seen.insert(*k));
+        let all = matches!(self.phase, Phase::Cover { .. }) || self.holes.len() > COVER_MIN_HOLES;
+        late.coarse_first(&keys, all);
     }
 
     /// How often the plan is redone with nothing else asking: [`REPLAN`], or
@@ -3655,6 +4504,15 @@ impl CubeLod {
         if !self.delivered.insert(key) {
             return;
         }
+        let w = &self.shared.waste;
+        bump(&w.delivered, 1);
+        if self.ever.len() > 1 << 20 {
+            self.ever.clear();
+        }
+        if !self.ever.insert(key) {
+            bump(&w.rebuilt, 1);
+        }
+        self.delivered_at.insert(key, Instant::now());
         self.delivered_since = true;
         self.release_dirty = true;
         self.holes_dirty = true;
@@ -3684,15 +4542,31 @@ impl CubeLod {
         self.stats.plan_ms = done.elapsed.as_secs_f32() * 1000.0;
         self.held = done.held;
         self.stats.held = done.held;
+        // Before the early return: the held leaves change with an unchanged plan.
+        self.held_keys = done.held_keys.iter().copied().collect();
         if !done.changed {
             return;
         }
+        let w = &self.shared.waste;
+        bump(&w.plan_installs, 1);
+        bump(&w.plan_added, done.added.len());
+        bump(&w.plan_removed, done.removed.len());
+        self.holes_version += 1;
         self.stats.plan_changed = Some(now);
         self.release_dirty = true;
         self.releasing.clear();
         let mut dropped = Vec::new();
+        // Late refreshes queued for nodes this plan drops: not worth making.
+        let mut refresh_dropped: Vec<CubeKey> = Vec::new();
         for &key in &done.removed {
             self.wanted.remove(&key);
+            if far_knob("HORIZON_FAR_LATE_DROP", 1) != 0
+                && !self.cover.contains(&key)
+                && self.refreshing.remove(&key)
+            {
+                self.refreshed_at.remove(&key);
+                refresh_dropped.push(key);
+            }
             if self.delivered.contains(&key) {
                 self.stale.insert(key);
                 if self.empty.contains(&key) {
@@ -3701,16 +4575,34 @@ impl CubeLod {
             } else {
                 self.missing = self.missing.saturating_sub(1);
                 dropped.push(key);
+                bump(&self.shared.waste.plan_dropped_unbuilt, 1);
+            }
+        }
+        if !refresh_dropped.is_empty() {
+            bump(&self.shared.waste.late_dropped, refresh_dropped.len());
+            self.shared
+                .queue
+                .lock()
+                .unwrap()
+                .dropped
+                .extend(refresh_dropped.iter().copied());
+            if let Some(late) = &self.late {
+                let boxes: Vec<_> = refresh_dropped.iter().copied().map(box_of).collect();
+                late.not_drawn(&boxes);
             }
         }
         for &key in &done.added {
             self.wanted.insert(key);
             if self.delivered.contains(&key) {
+                bump(&self.shared.waste.plan_reused, 1);
                 self.stale.remove(&key);
                 if self.empty.contains(&key) {
                     self.empty_planned += 1;
                 }
             } else {
+                if self.ever.contains(&key) {
+                    bump(&self.shared.waste.plan_readded, 1);
+                }
                 self.missing += 1;
             }
         }
@@ -4084,6 +4976,7 @@ impl CubeLod {
         self.holes_dirty = false;
         self.holes_at = now;
         let (delivered, tiles) = (&self.delivered, &self.tiles.delivered);
+        let before = self.holes.len();
         self.holes.retain(|(key, over)| {
             !(delivered.contains(key)
                 || match over {
@@ -4092,6 +4985,9 @@ impl CubeLod {
                     None => false,
                 })
         });
+        if self.holes.len() != before {
+            self.holes_version += 1;
+        }
         self.tiles.holes.retain(|t| !tiles.contains(t));
     }
 
@@ -4099,6 +4995,7 @@ impl CubeLod {
     /// hole where the layer has one, else the hole itself (the plan is as
     /// coarse there).
     fn begin_cover(&mut self, now: Instant) {
+        self.holes_version += 1;
         let since = match self.phase {
             Phase::Cover { since, .. } => since,
             Phase::Refine => now,
@@ -4174,6 +5071,7 @@ impl CubeLod {
             return;
         }
         self.phase = Phase::Refine;
+        self.holes_version += 1;
         self.holes_dirty = true;
         self.recheck_holes(now, true);
         self.fill_queue();
@@ -4222,12 +5120,16 @@ impl CubeLod {
             .retain(|k| wanted.contains(k) || cover.contains(k));
         queue.first.extend(urgent);
         queue.first.extend(holes);
+        let mut pushed = queue.first.len();
         for &(b, key) in &self.order {
             if waiting(&key) && !firsts.contains(&key) {
                 queue.push(b, key);
+                pushed += 1;
             }
         }
         drop(queue);
+        bump(&self.shared.waste.refills, 1);
+        bump(&self.shared.waste.refill_keys, pushed);
         self.shared.wake.notify_all();
     }
 
@@ -4254,6 +5156,7 @@ impl CubeLod {
         for key in &due {
             self.failed.remove(key);
         }
+        bump(&self.shared.waste.retries, due.len());
         self.queue_jobs(due, Vec::new());
     }
 
@@ -4281,10 +5184,25 @@ impl CubeLod {
         let mut released: Vec<CubeKey> = self.releasing.drain(..take).collect();
         // Planned again since it was found, or a plan put in since: kept.
         released.retain(|k| self.stale.contains(k) && !self.wanted.contains(k));
+        let short = far_ms("HORIZON_FAR_SHORT_MS", Duration::from_millis(5000));
+        let now = Instant::now();
+        let w = &self.shared.waste;
         for key in &released {
             self.delivered.remove(key);
             self.stale.remove(key);
             self.empty.remove(key);
+            bump(&w.released, 1);
+            if let Some(at) = self.delivered_at.remove(key)
+                && now.saturating_duration_since(at) < short
+            {
+                bump(&w.short_lived, 1);
+                bump(&w.short_lived_levels[usize::from(key.level).min(7)], 1);
+            }
+            if let Some(at) = self.refreshed_at.remove(key)
+                && now.saturating_duration_since(at) < short
+            {
+                bump(&w.late_wasted, 1);
+            }
         }
         let camera = self.camera;
         released.sort_by_cached_key(|k| (k.distance(camera) * 16.0) as u64);
@@ -4433,7 +5351,12 @@ impl CubeLod {
             queue.later.clear();
         }
         self.refreshing.clear();
-        self.shared.cache.lock().unwrap().nodes.clear();
+        self.ever.clear();
+        self.delivered_at.clear();
+        self.refreshed_at.clear();
+        self.held_keys.clear();
+        self.holes_version += 1;
+        self.shared.cache.lock().unwrap().clear();
         {
             // A plan in the works belongs to the old count: dropped.
             let mut slot = self.shared.planner.lock().unwrap();
@@ -4473,7 +5396,10 @@ impl CubeLod {
         self.held = 0;
         self.delivered_since = false;
         self.lingering.clear();
-        while let Ok(done) = self.results.try_recv() {
+        for done in std::mem::take(&mut self.backlog)
+            .into_iter()
+            .chain(self.results.try_iter().collect::<Vec<_>>())
+        {
             if let Some(Product::Gpu(node)) = &done.product {
                 self.release(node);
             }
@@ -4662,19 +5588,17 @@ fn work(
     air: BlockStateId,
     backend: Option<GpuBackend>,
 ) {
-    // The far workers start behind the server and at far terrain's priority
-    // (below normal on Windows), and by default step back to normal once the
-    // near terrain is in, behind it again while it loads
-    // (`CubeLod::set_near_loading`), as the column far terrain's threads do.
-    // Kept below normal for good, they filled the far view slower: 14.8 s
-    // after a teleport with 6 workers, about 13 s at normal (research/far-fill).
-    // `HORIZON_FAR_PRIORITY`: 0 that, 1 below normal for good, 2 left as spawned.
+    // The far workers go below the main/render thread for good (10 nice
+    // levels on Linux, below normal on Windows, utility QoS on macOS) and stay
+    // there: they used to step back to normal once the near terrain was in,
+    // which let 8 of them take the frame's cores while walking. The near-loading
+    // gate below (only `WORKERS_NEAR` workers while near terrain loads) stays.
+    // `HORIZON_FAR_PRIORITY`: 0 (default) below main, with the near-loading gate;
+    // 1 below main without the gate; 2 left as spawned (no gate).
     let priority = far_knob("HORIZON_FAR_PRIORITY", 0);
     if priority != 2 {
-        horizon_threads::behind_server();
-        horizon_threads::far_terrain_current();
+        horizon_threads::far_below_main();
     }
-    let mut behind = true;
     let mut mesher = Mesher::default();
     let kind = classifier(&context, air);
     loop {
@@ -4687,10 +5611,6 @@ fn work(
         let take = if gpu.is_some() { gpu_batch } else { 1 };
         if priority == 0 {
             let loading = shared.near_loading.load(Ordering::Relaxed);
-            if loading != behind {
-                horizon_threads::far_terrain_behind(loading);
-                behind = loading;
-            }
             // While the near terrain loads, and for `NEAR_HOLD` after (its
             // `terrain_loading` flickers off between the batches of columns
             // arriving), only the first `WORKERS_NEAR` workers go on; the others
@@ -4711,8 +5631,8 @@ fn work(
             }
         }
         let profiling = profile::on();
-        if profiling {
-            profile::maybe_log();
+        if profiling && profile::maybe_log() {
+            profile::maybe_log_waste(&shared);
         }
         let started = Instant::now();
         if let Some(backend) = gpu {
@@ -4780,7 +5700,11 @@ fn work(
         match sampler.changes() {
             Changes::None => {}
             Changes::Cubes(cubes) => shared.cache.lock().unwrap().forget(&cubes),
-            Changes::All => shared.cache.lock().unwrap().nodes.clear(),
+            Changes::All => {
+                let mut cache = shared.cache.lock().unwrap();
+                cache.clear();
+                cache.cleared += 1;
+            }
         }
         let mut fetched: FxHashMap<CubeKey, Option<Resident>> = FxHashMap::default();
         if gpu.is_some() && !shared.stop.load(Ordering::Relaxed) {
@@ -4788,7 +5712,7 @@ fn work(
                 let mut cache = shared.cache.lock().unwrap();
                 keys.iter()
                     .copied()
-                    .filter(|&k| cache.get(k).is_none())
+                    .filter(|&k| cache.lookup(k).is_none())
                     .collect()
             };
             if !uncached.is_empty() {
@@ -4813,6 +5737,12 @@ fn work(
                 )
                 .map(Product::Gpu),
                 None => node(&shared, sampler.as_mut(), key, air, &kind).map(|node| {
+                    if let Some(voxel) = node.as_uniform() {
+                        bump(&shared.waste.built_uniform, 1);
+                        if voxel.state == air {
+                            bump(&shared.waste.built_empty, 1);
+                        }
+                    }
                     let mut mesh = SectionMesh::default();
                     let sea = sampler.sea_surface();
                     mesh::mesh_cube(&mut mesher, &node, air, sea, &context, &mut mesh);
@@ -4820,6 +5750,27 @@ fn work(
                     Product::Mesh(mesh)
                 }),
             };
+            // What the worker made: counted for the waste log and the stats.
+            {
+                let w = &shared.waste;
+                bump(&w.jobs, 1);
+                match &product {
+                    None => bump(&w.failed_jobs, 1),
+                    Some(made) => {
+                        bump(&w.built, 1);
+                        if let Product::Gpu(GpuNode {
+                            content: GpuContent::Uniform(voxel),
+                            ..
+                        }) = made
+                        {
+                            bump(&w.built_uniform, 1);
+                            if voxel.state == air {
+                                bump(&w.built_empty, 1);
+                            }
+                        }
+                    }
+                }
+            }
             if profiling {
                 if key.level < MIN_LEVEL {
                     profile::add(&profile::CPU_NODES, started);
@@ -4902,7 +5853,7 @@ fn gpu_node(
     backend: &GpuBackend,
     fetched: Option<Option<Resident>>,
 ) -> Option<GpuNode> {
-    let cached = shared.cache.lock().unwrap().get(key);
+    let cached = cache_get(shared, key);
     if let Some(node) = cached {
         if let Some(Some(Resident::Slot(slot))) = fetched {
             backend.pool.free(slot);
@@ -4929,7 +5880,7 @@ fn gpu_node(
         Some(Resident::Node(node)) => {
             debug_assert_eq!(node.key, key);
             let node = Arc::new(node);
-            shared.cache.lock().unwrap().insert(node.clone());
+            cache_put(shared, node.clone());
             gpu_from_node(&node, air, backend)
         }
         None if (1..=3).contains(&key.level) => {
@@ -4949,7 +5900,7 @@ fn node(
     air: BlockStateId,
     kind: &impl Fn(BlockStateId) -> Kind,
 ) -> Option<Arc<CubeNode>> {
-    if let Some(node) = shared.cache.lock().unwrap().get(key) {
+    if let Some(node) = cache_get(shared, key) {
         return Some(node);
     }
     if shared.stop.load(Ordering::Relaxed) {
@@ -4970,7 +5921,7 @@ fn node(
     };
     debug_assert_eq!(node.key, key);
     let node = Arc::new(node);
-    shared.cache.lock().unwrap().insert(node.clone());
+    cache_put(shared, node.clone());
     Some(node)
 }
 
@@ -5755,6 +6706,7 @@ mod tests {
             coarsened: 1.0,
             tiles_limited: false,
             held: 0,
+            held_keys: Vec::new(),
             elapsed: Duration::ZERO,
         };
         lod.install(done, Instant::now());
@@ -5935,6 +6887,202 @@ mod tests {
         // Out of range, nothing replaces it.
         put(&mut lod, &[], &[]);
         assert_eq!(lod.removed(), vec![coarse]);
+    }
+
+    // ---- per-frame delivery budget
+
+    fn budget(nodes: usize) -> DeliverBudget {
+        DeliverBudget {
+            nodes,
+            bytes: 0,
+            time: Duration::ZERO,
+        }
+    }
+
+    /// A test far view whose worker channel the test feeds.
+    fn lod_fed() -> (CubeLod, mpsc::Sender<Done>) {
+        let shared = Arc::new(Shared::new());
+        let (tx, results) = mpsc::channel();
+        (
+            CubeLod::assemble(shared, results, Vec::new(), None, None, AIR),
+            tx,
+        )
+    }
+
+    /// A worker's finished node with no vertices (it draws nothing).
+    fn made(key: CubeKey) -> Done {
+        Done {
+            key,
+            product: Some(Product::Mesh(SectionMesh::default())),
+        }
+    }
+
+    fn taken(lod: &mut CubeLod, budget: DeliverBudget) -> Vec<CubeKey> {
+        let mut out = Vec::new();
+        lod.drain_results_within(Instant::now(), &mut out, budget);
+        out.into_iter().map(|(k, _)| k).collect()
+    }
+
+    #[test]
+    fn the_delivery_budget_is_reached_by_nodes_bytes_or_time() {
+        let b = DeliverBudget {
+            nodes: 4,
+            bytes: 1000,
+            time: Duration::from_micros(500),
+        };
+        let spent = |nodes, bytes| Spent { nodes, bytes };
+        let quick = Duration::from_micros(10);
+        assert!(!b.reached(&spent(3, 999), quick));
+        assert!(b.reached(&spent(4, 0), quick));
+        assert!(b.reached(&spent(1, 1000), quick));
+        assert!(b.reached(&spent(1, 0), Duration::from_micros(500)));
+        // A knob of 0 is no limit of its kind.
+        let open = DeliverBudget {
+            nodes: 0,
+            bytes: 0,
+            time: Duration::ZERO,
+        };
+        assert!(!open.reached(&spent(1 << 20, 1 << 30), Duration::from_secs(9)));
+        let d = DeliverBudget {
+            nodes: DeliverBudget::NODES as usize,
+            bytes: DeliverBudget::BYTES as usize,
+            time: Duration::from_micros(DeliverBudget::US),
+        };
+        assert_eq!((d.nodes, d.bytes, d.time.as_micros()), (256, 4 << 20, 1000));
+    }
+
+    #[test]
+    fn a_frame_takes_no_more_than_the_node_budget_and_leaves_the_rest() {
+        let (mut lod, tx) = lod_fed();
+        // Ten nodes of ten different parents: no sibling group to finish.
+        let keys: Vec<CubeKey> = (0..10).map(|i| key(0, i * 2, 0, 0)).collect();
+        put(&mut lod, &keys, &[]);
+        for &k in &keys {
+            tx.send(made(k)).unwrap();
+        }
+        assert_eq!(taken(&mut lod, budget(3)), keys[..3]);
+        assert_eq!(lod.backlog.len(), 7);
+        assert_eq!(lod.stats().deliver_deferred, 7);
+        assert_eq!(lod.stats().deliver_frames_capped, 1);
+        assert_eq!(lod.stats().pending, 7, "what waits is still missing");
+        assert_eq!(taken(&mut lod, budget(3)), keys[3..6]);
+        // The last four fit in a frame of 5: that frame is not capped.
+        assert_eq!(taken(&mut lod, budget(5)), keys[6..]);
+        assert!(lod.backlog.is_empty());
+        assert_eq!(lod.stats().deliver_frames_capped, 2);
+        assert_eq!(lod.stats().pending, 0);
+    }
+
+    #[test]
+    fn the_time_budget_stops_a_frame_too() {
+        let (mut lod, tx) = lod_fed();
+        let keys: Vec<CubeKey> = (0..6).map(|i| key(0, i * 2, 0, 0)).collect();
+        put(&mut lod, &keys, &[]);
+        for &k in &keys {
+            tx.send(made(k)).unwrap();
+        }
+        // One nanosecond is spent by the first node: one a frame.
+        let tiny = DeliverBudget {
+            nodes: 0,
+            bytes: 0,
+            time: Duration::from_nanos(1),
+        };
+        assert_eq!(taken(&mut lod, tiny), keys[..1]);
+        assert_eq!(lod.backlog.len(), 5);
+    }
+
+    #[test]
+    fn a_sibling_group_is_taken_together_whatever_the_budget() {
+        let (mut lod, tx) = lod_fed();
+        let parent = key(1, 4, 0, 0);
+        let kids = parent.children();
+        let others = [key(0, 100, 0, 0), key(0, 102, 0, 0), key(0, 104, 0, 0)];
+        let all: Vec<CubeKey> = kids.iter().chain(&others).copied().collect();
+        put(&mut lod, &all, &[]);
+        // The first child, other nodes in between, then the seven others.
+        tx.send(made(kids[0])).unwrap();
+        tx.send(made(others[0])).unwrap();
+        tx.send(made(others[1])).unwrap();
+        for &k in &kids[1..] {
+            tx.send(made(k)).unwrap();
+        }
+        tx.send(made(others[2])).unwrap();
+        let got = taken(&mut lod, budget(1));
+        assert_eq!(got.len(), 8, "{got:?}");
+        assert!(kids.iter().all(|k| got.contains(k)));
+        // The nodes of other parents wait, in their order.
+        assert_eq!(
+            lod.backlog.iter().map(|d| d.key).collect::<Vec<_>>(),
+            others
+        );
+    }
+
+    #[test]
+    fn a_parent_is_not_removed_while_its_children_wait_in_the_backlog() {
+        let (mut lod, tx) = lod_fed();
+        let coarse = key(1, 0, 0, 0);
+        let kids = coarse.children();
+        let other = key(0, 100, 0, 0);
+        put(&mut lod, &[coarse, other], &[]);
+        lod.deliver(coarse, false);
+        let next: Vec<CubeKey> = kids.iter().copied().chain([other]).collect();
+        put(&mut lod, &next, &[]);
+        // Another node first uses the frame's budget; the eight children wait.
+        tx.send(made(other)).unwrap();
+        for &k in &kids {
+            tx.send(made(k)).unwrap();
+        }
+        assert_eq!(taken(&mut lod, budget(1)), [other]);
+        assert_eq!(lod.backlog.len(), 8);
+        assert!(lod.removed().is_empty(), "the replacement is not out yet");
+        // Next frame all eight come out together, and only then the parent goes.
+        assert_eq!(taken(&mut lod, budget(1)).len(), 8);
+        assert_eq!(lod.removed(), vec![coarse]);
+    }
+
+    #[test]
+    fn a_swap_set_out_of_order_over_frames_releases_the_parent_once_complete() {
+        let (mut lod, tx) = lod_fed();
+        let coarse = key(1, 0, 0, 0);
+        let kids = coarse.children();
+        put(&mut lod, &[coarse], &[]);
+        lod.deliver(coarse, false);
+        put(&mut lod, &kids, &[]);
+        // Children finish out of order, three frames apart.
+        for &i in &[5usize, 2, 7] {
+            tx.send(made(kids[i])).unwrap();
+        }
+        assert_eq!(taken(&mut lod, budget(1)).len(), 3);
+        assert!(lod.removed().is_empty());
+        for &i in &[0usize, 6, 1, 4] {
+            tx.send(made(kids[i])).unwrap();
+        }
+        assert_eq!(taken(&mut lod, budget(2)).len(), 4);
+        assert!(lod.removed().is_empty(), "one child missing");
+        tx.send(made(kids[3])).unwrap();
+        assert_eq!(taken(&mut lod, budget(2)).len(), 1);
+        assert_eq!(lod.removed(), vec![coarse]);
+    }
+
+    #[test]
+    fn results_nobody_wants_use_no_budget_and_clear_drops_the_backlog() {
+        let (mut lod, tx) = lod_fed();
+        let keys: Vec<CubeKey> = (0..4).map(|i| key(0, i * 2, 0, 0)).collect();
+        put(&mut lod, &keys[..2], &[]);
+        // Two unplanned nodes first, then the two planned.
+        tx.send(made(keys[2])).unwrap();
+        tx.send(made(keys[3])).unwrap();
+        tx.send(made(keys[0])).unwrap();
+        tx.send(made(keys[1])).unwrap();
+        assert_eq!(taken(&mut lod, budget(2)), keys[..2]);
+        assert!(lod.backlog.is_empty());
+        put(&mut lod, &keys, &[]);
+        tx.send(made(keys[2])).unwrap();
+        tx.send(made(keys[3])).unwrap();
+        assert_eq!(taken(&mut lod, budget(1)), keys[2..3]);
+        assert_eq!(lod.backlog.len(), 1);
+        lod.clear();
+        assert!(lod.backlog.is_empty());
     }
 
     #[test]
@@ -6698,6 +7846,299 @@ mod tests {
 }
 
 #[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn voxel(state: u32, biome: u16) -> Voxel {
+        Voxel {
+            state: BlockStateId(state),
+            biome,
+        }
+    }
+
+    /// A dense node of `states` kinds of voxel (a stripe pattern), with a
+    /// cover mask and fluid tops when asked.
+    fn dense(key: CubeKey, states: u32, extras: bool) -> CubeNode {
+        let node = CubeNode::from_fn(key, |x, y, z| {
+            let i = CubeNode::index(x, y, z) as u32;
+            voxel(i % states, (i % 2) as u16)
+        });
+        if !extras {
+            return node;
+        }
+        let mut cover = Box::new([0u64; 4]);
+        cover[1] = 0xdead_beef;
+        let mut tops = Box::new([NO_FLUID_TOP; 256]);
+        tops[7] = 100;
+        tops[200] = FLUID_TOP_SCALE;
+        node.with_covered(Some(cover)).with_fluid_tops(Some(tops))
+    }
+
+    fn k(x: i32) -> CubeKey {
+        CubeKey::new(2, x, 0, 0)
+    }
+
+    fn same(a: &CubeNode, b: &CubeNode) {
+        assert_eq!(a.key, b.key);
+        for i in 0..VOLUME {
+            assert_eq!(a.at(i), b.at(i), "voxel {i}");
+        }
+        assert_eq!(a.covered_mask(), b.covered_mask());
+        assert_eq!(a.fluid_tops(), b.fluid_tops());
+        assert_eq!(a.as_uniform(), b.as_uniform());
+    }
+
+    #[test]
+    fn a_packed_node_comes_back_voxel_for_voxel() {
+        for extras in [false, true] {
+            for states in [2, 5, 256] {
+                let node = Arc::new(dense(k(3), states, extras));
+                let entry = Entry::pack(node.clone(), true);
+                let Entry::Packed(p) = &entry else {
+                    panic!("{states} states should pack");
+                };
+                let distinct: FxHashSet<Voxel> = (0..VOLUME).map(|i| node.at(i)).collect();
+                assert_eq!(p.palette.len(), distinct.len());
+                same(&node, &entry.unpack());
+            }
+        }
+    }
+
+    #[test]
+    fn nodes_of_more_than_256_voxels_or_one_stay_whole() {
+        let many = Arc::new(dense(k(1), 300, true));
+        assert!(matches!(
+            Entry::pack(many.clone(), true),
+            Entry::Node(n) if Arc::ptr_eq(&n, &many)
+        ));
+        let uniform = Arc::new(CubeNode::uniform(k(2), voxel(1, 0)));
+        assert!(matches!(Entry::pack(uniform.clone(), true), Entry::Node(_)));
+        // Unpacked on request, dense or not.
+        let few = Arc::new(dense(k(3), 4, false));
+        assert!(matches!(Entry::pack(few, false), Entry::Node(_)));
+        // The estimate: a uniform node costs next to nothing, a dense one 32 KiB, a packed one about 4 KiB.
+        let base = (std::mem::size_of::<CubeNode>() + 64) as u64;
+        assert_eq!(Entry::pack(uniform, true).bytes(), base);
+        assert_eq!(
+            Entry::pack(many, true).bytes(),
+            base + (VOLUME * std::mem::size_of::<Voxel>()) as u64 + 32 + 512
+        );
+        let packed = Entry::pack(Arc::new(dense(k(4), 4, true)), true).bytes();
+        assert_eq!(
+            packed,
+            base + (VOLUME + 4 * std::mem::size_of::<Voxel>()) as u64 + 32 + 512
+        );
+        println!("bytes per entry: packed dense with extras {packed}, uniform {base}");
+    }
+
+    #[test]
+    fn the_least_recently_used_node_goes_first_and_the_budget_holds() {
+        let one = Entry::pack(Arc::new(dense(k(0), 3, false)), true).bytes();
+        let budget = one * 3 + one / 2;
+        let mut cache = Cache::with_budget(budget, true, usize::MAX);
+        for x in 0..3 {
+            cache.insert(Arc::new(dense(k(x), 3, false)));
+        }
+        assert_eq!((cache.len(), cache.bytes()), (3, one * 3));
+        // Using 0 makes 1 the least recently used.
+        same(&cache.get(k(0)).unwrap(), &dense(k(0), 3, false));
+        cache.insert(Arc::new(dense(k(3), 3, false)));
+        assert!(cache.nodes.contains_key(&k(0)));
+        assert!(!cache.nodes.contains_key(&k(1)));
+        assert!(cache.nodes.contains_key(&k(2)) && cache.nodes.contains_key(&k(3)));
+        assert!(cache.bytes() <= budget);
+        assert_eq!((cache.hits, cache.misses, cache.evicted), (1, 0, 1));
+        // Evicted, then fetched again: a miss.
+        assert!(cache.get(k(1)).is_none());
+        assert_eq!((cache.hits, cache.misses), (1, 1));
+        // Many more: the bytes always hold, and what is kept is the newest.
+        for x in 4..100 {
+            cache.insert(Arc::new(dense(k(x), 3, false)));
+            assert!(cache.bytes() <= budget);
+        }
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.evicted, 1 + 96);
+        assert!((97..100).all(|x| cache.nodes.contains_key(&k(x))));
+        // Keeping a node again replaces it without counting its bytes twice.
+        cache.insert(Arc::new(dense(k(99), 3, false)));
+        assert_eq!(cache.bytes(), one * 3);
+        // remove and clear count nothing.
+        let before = (
+            cache.hits,
+            cache.misses,
+            cache.evicted,
+            cache.forgotten,
+            cache.cleared,
+        );
+        cache.remove(k(99));
+        assert_eq!((cache.len(), cache.bytes()), (2, one * 2));
+        cache.clear();
+        assert_eq!((cache.len(), cache.bytes()), (0, 0));
+        assert_eq!(
+            before,
+            (
+                cache.hits,
+                cache.misses,
+                cache.evicted,
+                cache.forgotten,
+                cache.cleared
+            )
+        );
+    }
+
+    #[test]
+    fn the_node_just_kept_stays_even_when_it_alone_is_over_the_budget() {
+        let mut cache = Cache::with_budget(1, false, usize::MAX);
+        cache.insert(Arc::new(dense(k(0), 3, false)));
+        assert_eq!(cache.len(), 1);
+        cache.insert(Arc::new(dense(k(1), 3, false)));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.nodes.contains_key(&k(1)));
+    }
+
+    #[test]
+    fn the_legacy_cache_keeps_at_most_its_count_unpacked() {
+        let mut cache = Cache::with_budget(u64::MAX, false, CACHE_NODES);
+        for x in 0..(CACHE_NODES as i32 + 100) {
+            cache.insert(Arc::new(dense(k(x), 3, false)));
+        }
+        assert_eq!(cache.len(), CACHE_NODES);
+        assert_eq!(cache.evicted, 100);
+        assert!(
+            cache
+                .nodes
+                .values()
+                .all(|s| matches!(s.entry, Entry::Node(_)))
+        );
+        assert!(cache.nodes.contains_key(&k(CACHE_NODES as i32 + 99)));
+        assert!(!cache.nodes.contains_key(&k(99)) && cache.nodes.contains_key(&k(100)));
+        // A small count too.
+        let mut small = Cache::with_budget(u64::MAX, false, 4);
+        for x in 0..10 {
+            small.insert(Arc::new(CubeNode::uniform(k(x), voxel(1, 0))));
+        }
+        assert_eq!(small.len(), 4);
+    }
+
+    #[test]
+    fn the_log_stays_small_however_often_nodes_are_used() {
+        let mut cache = Cache::with_budget(u64::MAX, false, usize::MAX);
+        for x in 0..10 {
+            cache.insert(Arc::new(CubeNode::uniform(k(x), voxel(1, 0))));
+        }
+        for i in 0..100_000 {
+            assert!(cache.get(k(i % 10)).is_some());
+            assert!(cache.log.len() <= cache.len() * 4 + 1024 + 1);
+        }
+        // After all that, the order is still right: 5 is the oldest used.
+        let mut cache = Cache::with_budget(u64::MAX, false, 10);
+        for x in 0..10 {
+            cache.insert(Arc::new(CubeNode::uniform(k(x), voxel(1, 0))));
+        }
+        for _ in 0..5000 {
+            for x in (0..10).filter(|&x| x != 5) {
+                cache.get(k(x));
+            }
+        }
+        cache.insert(Arc::new(CubeNode::uniform(k(10), voxel(1, 0))));
+        assert!(!cache.nodes.contains_key(&k(5)));
+        assert_eq!(cache.len(), 10);
+    }
+
+    #[test]
+    fn forgetting_drops_exactly_the_nodes_holding_the_changed_cubes() {
+        let mut cache = Cache::with_budget(u64::MAX, false, usize::MAX);
+        let cube = SectionPos::new(-3, 5, 9);
+        let mut held = Vec::new();
+        let mut kept = Vec::new();
+        for level in 0..=MAX_CUBE_LEVEL {
+            held.push(CubeKey::containing(level, cube));
+            // Its neighbour at the same level that does not hold the cube.
+            let mut other = CubeKey::containing(level, cube);
+            other.x += 1;
+            kept.push(other);
+        }
+        for key in held.iter().chain(&kept) {
+            cache.insert(Arc::new(CubeNode::uniform(*key, voxel(1, 0))));
+        }
+        assert_eq!(cache.len(), 2 * 23);
+        // Two cubes under the same nodes count once.
+        cache.forget(&[cube, cube]);
+        assert_eq!(cache.forgotten, 23);
+        assert_eq!(cache.len(), 23);
+        assert!(held.iter().all(|key| !cache.nodes.contains_key(key)));
+        assert!(kept.iter().all(|key| cache.nodes.contains_key(key)));
+        assert_eq!(
+            cache.bytes(),
+            23 * Entry::pack(Arc::new(CubeNode::uniform(k(0), voxel(1, 0))), true).bytes()
+        );
+        // Forgotten nodes' log items are skipped: filling it up evicts only live ones.
+        assert!(cache.get(held[0]).is_none());
+    }
+
+    #[test]
+    fn forgetting_by_level_matches_the_old_scan_on_random_keys() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: i32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as i32 - n / 2
+        };
+        for _round in 0..20 {
+            let mut cache = Cache::with_budget(u64::MAX, false, usize::MAX);
+            for _ in 0..600 {
+                let level = next(1 << 20).rem_euclid(9) as u8;
+                let key = if next(10) < 3 {
+                    CubeKey::new(level, next(8), next(8), next(8))
+                } else {
+                    let cube = SectionPos::new(next(40), next(40), next(40));
+                    CubeKey::containing(level, cube)
+                };
+                cache.insert(Arc::new(CubeNode::uniform(key, voxel(1, 0))));
+            }
+            let cubes: Vec<SectionPos> = (0..6)
+                .map(|_| SectionPos::new(next(40), next(40), next(40)))
+                .collect();
+            let mut old: FxHashMap<CubeKey, ()> = cache.nodes.keys().map(|&k| (k, ())).collect();
+            old.retain(|key, _| !cubes.iter().any(|&c| key.contains_cube(c)));
+            let before = cache.len();
+            cache.forget(&cubes);
+            let mut now: Vec<CubeKey> = cache.nodes.keys().copied().collect();
+            let mut expected: Vec<CubeKey> = old.keys().copied().collect();
+            now.sort_by_key(|k| (k.level, k.x, k.y, k.z));
+            expected.sort_by_key(|k| (k.level, k.x, k.y, k.z));
+            assert_eq!(now, expected);
+            assert_eq!(cache.forgotten as usize, before - cache.len());
+        }
+    }
+
+    #[test]
+    fn a_default_budget_holds_forty_thousand_packed_nodes() {
+        let mut cache = Cache::with_budget(192 << 20, true, usize::MAX);
+        let template = dense(k(0), 4, true);
+        for x in 0..41_000 {
+            let mut node = template.clone();
+            node.key = k(x);
+            cache.insert(Arc::new(node));
+        }
+        assert_eq!(cache.len(), 41_000);
+        assert_eq!(cache.evicted, 0);
+        assert!(cache.bytes() <= 192 << 20);
+        let per_entry = cache.bytes() / cache.len() as u64;
+        println!(
+            "packed dense node estimate: {per_entry} bytes; 192 MiB / that = {}",
+            (192u64 << 20) / per_entry
+        );
+        assert!(per_entry <= 5 * 1024, "{per_entry}");
+        let back = cache.get(k(40_999)).unwrap();
+        let mut want = template.clone();
+        want.key = k(40_999);
+        same(&want, &back);
+    }
+}
+
+#[cfg(test)]
 mod whole_world_tests {
     use super::*;
 
@@ -6865,5 +8306,395 @@ mod whole_world_tests {
         // Past that ring the rule decides again: coarser nodes stand.
         assert!(plan.iter().any(|k| k.level >= 2));
         disjoint(&plan);
+    }
+}
+
+/// The far view's waste counters, and the late-refresh fixes that stop work
+/// being made for nothing (`HORIZON_FAR_LATE_EXACT`, `_SKIP_HELD`, `_DROP` and
+/// `HORIZON_FAR_WHOLE_WHEN_COVERED`, all on by default).
+#[cfg(test)]
+mod waste_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    const AIR: BlockStateId = BlockStateId(0);
+    type Boxes = Vec<([i32; 3], [i32; 3])>;
+
+    fn key(level: u8, x: i32, y: i32, z: i32) -> CubeKey {
+        CubeKey::new(level, x, y, z)
+    }
+
+    fn lod_for_test() -> CubeLod {
+        let shared = Arc::new(Shared::new());
+        let (_tx, results) = mpsc::channel();
+        CubeLod::assemble(shared, results, Vec::new(), None, None, AIR)
+    }
+
+    /// Puts `keys` in as the plan, as the planner thread would hand it over,
+    /// with `held` as the leaves it held back.
+    fn put_held(lod: &mut CubeLod, keys: &[CubeKey], held: &[CubeKey]) {
+        let next: FxHashSet<CubeKey> = keys.iter().copied().collect();
+        let added = keys
+            .iter()
+            .copied()
+            .filter(|k| !lod.wanted.contains(k))
+            .collect();
+        let removed = (lod.wanted.iter().copied())
+            .filter(|k| !next.contains(k))
+            .collect();
+        let camera = lod.camera;
+        let mut leaves = keys.to_vec();
+        leaves.sort_by(|a, b| a.distance(camera).total_cmp(&b.distance(camera)));
+        let mut tree: Vec<(u128, CubeKey)> = keys.iter().map(|&k| (tree_order(k), k)).collect();
+        tree.sort_unstable();
+        let mut footprints: Vec<(u64, u8, FarKey)> = keys
+            .iter()
+            .map(|&k| (footprint_order(k.level, k.x, k.z), k.level, FarKey::Cube(k)))
+            .collect();
+        footprints.sort_unstable();
+        let done = PlanDone {
+            epoch: lod.epoch,
+            tree,
+            order: leaves.iter().map(|&k| (bucket(camera, k), k)).collect(),
+            leaves: Arc::new(leaves),
+            changed: true,
+            added,
+            removed,
+            cover: FxHashSet::default(),
+            tiles: Arc::new(Vec::new()),
+            tiles_added: Vec::new(),
+            tiles_removed: Vec::new(),
+            cover_tiles: FxHashSet::default(),
+            footprints,
+            pruned: 0,
+            limited: false,
+            coarsened: 1.0,
+            tiles_limited: false,
+            held: held.len(),
+            held_keys: held.to_vec(),
+            elapsed: Duration::ZERO,
+        };
+        lod.install(done, Instant::now());
+    }
+
+    fn put(lod: &mut CubeLod, keys: &[CubeKey]) {
+        put_held(lod, keys, &[]);
+    }
+
+    /// A late content that hands out `take` and records what it is told.
+    #[derive(Default)]
+    struct Late {
+        exact: bool,
+        take: Mutex<Boxes>,
+        not_drawn: Mutex<Boxes>,
+        not_now: Mutex<Boxes>,
+        coarse: Mutex<Vec<(Vec<CubeKey>, bool)>>,
+    }
+
+    impl LateContent for Late {
+        fn view(&self, _: [f64; 3], _: [f64; 3], _: f64, _: bool) {}
+        fn take_refreshes(&self) -> Boxes {
+            std::mem::take(&mut *self.take.lock().unwrap())
+        }
+        fn not_drawn(&self, boxes: &[([i32; 3], [i32; 3])]) {
+            self.not_drawn.lock().unwrap().extend_from_slice(boxes);
+        }
+        fn exact(&self) -> bool {
+            self.exact
+        }
+        fn coarse_first(&self, keys: &[CubeKey], all: bool) {
+            let mut keys = keys.to_vec();
+            keys.sort();
+            self.coarse.lock().unwrap().push((keys, all));
+        }
+        fn not_now(&self, boxes: &[([i32; 3], [i32; 3])]) {
+            self.not_now.lock().unwrap().extend_from_slice(boxes);
+        }
+    }
+
+    fn late_now(lod: &mut CubeLod) {
+        lod.late_content([0.0; 3], [0.0, 0.0, 1.0], 1e4);
+    }
+
+    fn sorted(keys: impl IntoIterator<Item = CubeKey>) -> Vec<CubeKey> {
+        let mut keys: Vec<CubeKey> = keys.into_iter().collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn a_node_released_and_planned_again_counts_as_made_again() {
+        let mut lod = lod_for_test();
+        let (a, b) = (key(1, 0, 0, 0), key(2, 5, 0, 0));
+        put(&mut lod, &[a, b]);
+        lod.deliver(a, false);
+        // `b` is dropped before it is ever drawn.
+        put(&mut lod, &[a]);
+        assert_eq!(lod.stats().plan_dropped_unbuilt, 1);
+        // `a` is dropped while drawn, and let go at once (inside SHORT_MS).
+        put(&mut lod, &[]);
+        assert_eq!(lod.removed(), [a]);
+        let s = lod.stats();
+        assert_eq!((s.released, s.short_lived), (1, 1));
+        let mut levels = [0u64; 8];
+        levels[1] = 1;
+        assert_eq!(s.short_lived_levels, levels);
+        assert_eq!((s.delivered, s.rebuilt, s.plan_readded), (1, 0, 0));
+        // Planned again: not drawn, and drawn before.
+        put(&mut lod, &[a]);
+        let s = lod.stats();
+        assert_eq!((s.plan_readded, s.plan_reused), (1, 0));
+        assert_eq!((s.plan_installs, s.plan_added, s.plan_removed), (4, 3, 2));
+        lod.deliver(a, false);
+        let s = lod.stats();
+        assert_eq!((s.delivered, s.rebuilt), (2, 1));
+        // A node planned again while still drawn is free.
+        put(&mut lod, &[]);
+        put(&mut lod, &[a]);
+        assert_eq!(lod.stats().plan_reused, 1);
+    }
+
+    /// An exact late content (Earth's) remakes the node whose extent a box is,
+    /// not every drawn node the box touches.
+    #[test]
+    fn exact_late_content_remakes_only_the_nodes_of_its_boxes() {
+        let run = |exact: bool| {
+            let mut lod = lod_for_test();
+            let (k, parent, child, other) = (
+                key(1, 1, 0, 0),
+                key(2, 0, 0, 0),
+                key(0, 2, 0, 0),
+                key(1, 9, 0, 0),
+            );
+            put(&mut lod, &[k, parent, child, other]);
+            for n in [k, parent, child, other] {
+                lod.deliver(n, false);
+            }
+            let late = Arc::new(Late {
+                exact,
+                take: Mutex::new(vec![box_of(k)]),
+                ..Late::default()
+            });
+            lod.late = Some(late);
+            lod.shared.queue.lock().unwrap().clear();
+            late_now(&mut lod);
+            let remade = sorted(lod.refreshing.iter().copied());
+            let queued = sorted(lod.shared.queue.lock().unwrap().drain());
+            assert_eq!(remade, queued);
+            (k, parent, child, remade, lod.stats())
+        };
+        let (k, _, _, remade, s) = run(true);
+        assert_eq!(remade, [k]);
+        assert_eq!((s.late_refreshed, s.late_other), (1, 0));
+        // Not exact: the old scan over every node the box touches.
+        let (k, parent, child, remade, s) = run(false);
+        assert_eq!(remade, sorted([k, parent, child]));
+        assert_eq!((s.late_refreshed, s.late_other), (3, 2));
+    }
+
+    /// A leaf the plan held back splits once it is drawn: not made whole
+    /// meanwhile, its box put back for later.
+    #[test]
+    fn a_held_leaf_is_not_remade_and_its_box_goes_back() {
+        let mut lod = lod_for_test();
+        let (held, other) = (key(1, 1, 0, 0), key(1, 4, 0, 0));
+        put_held(&mut lod, &[held, other], &[held]);
+        assert!(lod.held_keys.contains(&held));
+        lod.deliver(held, false);
+        lod.deliver(other, false);
+        let late = Arc::new(Late {
+            exact: true,
+            take: Mutex::new(vec![box_of(held), box_of(other)]),
+            ..Late::default()
+        });
+        lod.late = Some(late.clone());
+        lod.shared.queue.lock().unwrap().clear();
+        late_now(&mut lod);
+        assert_eq!(sorted(lod.refreshing.iter().copied()), [other]);
+        assert_eq!(*late.not_now.lock().unwrap(), [box_of(held)]);
+        let s = lod.stats();
+        assert_eq!((s.late_skipped_held, s.late_refreshed), (1, 1));
+        // The leaves held are kept up to date by a plan that did not change.
+        let done = PlanDone {
+            epoch: lod.epoch,
+            leaves: lod.plan.clone(),
+            changed: false,
+            added: Vec::new(),
+            removed: Vec::new(),
+            tiles: Arc::default(),
+            tiles_added: Vec::new(),
+            tiles_removed: Vec::new(),
+            order: Vec::new(),
+            cover: FxHashSet::default(),
+            cover_tiles: FxHashSet::default(),
+            tree: Vec::new(),
+            footprints: Vec::new(),
+            pruned: 0,
+            limited: false,
+            coarsened: 1.0,
+            tiles_limited: false,
+            held: 0,
+            held_keys: Vec::new(),
+            elapsed: Duration::ZERO,
+        };
+        lod.install(done, Instant::now());
+        assert!(lod.held_keys.is_empty());
+    }
+
+    /// A refresh queued for a node the plan drops is not made, and Earth's
+    /// batch place for it is freed at once.
+    #[test]
+    fn a_plan_dropping_a_queued_refresh_cancels_it() {
+        let mut lod = lod_for_test();
+        let (a, b) = (key(1, 0, 0, 0), key(1, 4, 0, 0));
+        put(&mut lod, &[a, b]);
+        lod.deliver(a, false);
+        lod.deliver(b, false);
+        let late = Arc::new(Late {
+            exact: true,
+            take: Mutex::new(vec![box_of(a)]),
+            ..Late::default()
+        });
+        lod.late = Some(late.clone());
+        lod.shared.queue.lock().unwrap().clear();
+        late_now(&mut lod);
+        assert_eq!(sorted(lod.refreshing.iter().copied()), [a]);
+        assert_eq!(lod.stats().late_refreshed, 1);
+        // The plan drops `a`: it stays drawn until replaced, but is not remade.
+        put(&mut lod, &[b]);
+        assert!(lod.refreshing.is_empty());
+        assert_eq!(*late.not_drawn.lock().unwrap(), [box_of(a)]);
+        assert_eq!(lod.stats().late_dropped, 1);
+        assert!(lod.shared.queue.lock().unwrap().drain().is_empty());
+        // Queued again (the plan took it back, a box for it came): not skipped.
+        put(&mut lod, &[a, b]);
+        late.take.lock().unwrap().push(box_of(a));
+        late_now(&mut lod);
+        assert_eq!(sorted(lod.refreshing.iter().copied()), [a]);
+        assert_eq!(lod.shared.queue.lock().unwrap().drain(), [a]);
+    }
+
+    /// A refresh released soon after it was queued counts as wasted.
+    #[test]
+    fn a_refreshed_node_released_soon_counts_as_wasted() {
+        let mut lod = lod_for_test();
+        let (a, b) = (key(1, 0, 0, 0), key(1, 4, 0, 0));
+        put(&mut lod, &[a, b]);
+        lod.deliver(a, false);
+        lod.deliver(b, false);
+        lod.late = Some(Arc::new(Late {
+            exact: true,
+            take: Mutex::new(vec![box_of(a)]),
+            ..Late::default()
+        }));
+        lod.shared.queue.lock().unwrap().clear();
+        late_now(&mut lod);
+        // The refresh is on its way (not cancelled: `a` is a coverage node
+        // for the plan's purposes here), the plan lets `a` go anyway.
+        lod.cover.insert(a);
+        put(&mut lod, &[b]);
+        assert_eq!(lod.stats().late_dropped, 0);
+        lod.cover.remove(&a);
+        assert_eq!(lod.removed(), [a]);
+        assert_eq!(lod.stats().late_wasted, 1);
+    }
+
+    /// The late content hears which nodes come coarse first, when that
+    /// changes: the holes, and everything in the coverage phase.
+    #[test]
+    fn the_late_content_is_told_the_holes_when_they_change() {
+        let mut lod = lod_for_test();
+        let nodes = [
+            key(1, 0, 0, 0),
+            key(1, 1, 0, 0),
+            key(1, 2, 0, 0),
+            key(1, 3, 0, 0),
+            key(1, 4, 0, 0),
+        ];
+        put(&mut lod, &nodes);
+        // A fresh plan asks for the coverage layer first: let that phase end.
+        for n in nodes {
+            lod.deliver(n, false);
+        }
+        lod.advance_phase(Instant::now());
+        assert!(matches!(lod.phase, Phase::Refine));
+        let late = Arc::new(Late {
+            exact: true,
+            ..Late::default()
+        });
+        lod.late = Some(late.clone());
+        late_now(&mut lod);
+        assert_eq!(*late.coarse.lock().unwrap(), [(vec![], false)]);
+        // Nothing changed: not told again.
+        late_now(&mut lod);
+        assert_eq!(late.coarse.lock().unwrap().len(), 1);
+        // A new node with nothing drawn over it: a hole, to come coarse first.
+        let hole = key(1, 5, 0, 0);
+        let mut more = nodes.to_vec();
+        more.push(hole);
+        put(&mut lod, &more);
+        assert!(matches!(lod.phase, Phase::Refine));
+        late_now(&mut lod);
+        assert_eq!(late.coarse.lock().unwrap()[1], (vec![hole], false));
+        late_now(&mut lod);
+        assert_eq!(late.coarse.lock().unwrap().len(), 2);
+        // Drawn: no hole any more.
+        lod.deliver(hole, false);
+        lod.recheck_holes(Instant::now(), false);
+        late_now(&mut lod);
+        assert_eq!(late.coarse.lock().unwrap()[2], (vec![], false));
+    }
+
+    #[test]
+    fn the_whole_plan_comes_coarse_first_in_the_coverage_phase() {
+        let mut lod = lod_for_test();
+        let late = Arc::new(Late {
+            exact: true,
+            ..Late::default()
+        });
+        lod.late = Some(late.clone());
+        // A fresh plan with nothing drawn: the coverage layer comes first.
+        let hole = key(1, 0, 0, 0);
+        put(&mut lod, &[hole]);
+        assert!(matches!(lod.phase, Phase::Cover { .. }));
+        late_now(&mut lod);
+        assert_eq!(*late.coarse.lock().unwrap(), [(vec![hole], true)]);
+        late_now(&mut lod);
+        assert_eq!(late.coarse.lock().unwrap().len(), 1);
+    }
+
+    /// The nodes the planner holds back a level are exported with the count.
+    #[test]
+    fn the_planner_exports_the_leaves_it_holds_back() {
+        let camera = [0.0, 100.0, 0.0];
+        let nowhere = |_: SectionPos| false;
+        let plan_of = |drawn: &[CubeKey]| {
+            let refined = refined_set(drawn);
+            plan_far(&PlanInput {
+                camera,
+                max_distance: 3000.0,
+                rule: &Rule::distance(DETAIL),
+                loaded: LoadedBox {
+                    horizontal: 2,
+                    vertical: 1,
+                },
+                is_loaded: &nowhere,
+                previous: &[],
+                class: &|_| NodeClass::Mixed,
+                surface: None,
+                refined: Some(&refined),
+            })
+        };
+        // Nothing drawn: the roots wait.
+        let mut plan = plan_of(&[]);
+        for _ in 0..3 {
+            assert_eq!(plan.held_keys.len(), plan.held);
+            assert!(plan.held > 0, "some node waits to be drawn");
+            let held: FxHashSet<CubeKey> = plan.held_keys.iter().copied().collect();
+            assert_eq!(held.len(), plan.held, "each once");
+            // They are leaves of the plan (the budget did not bind).
+            assert!(held.iter().all(|k| plan.leaves.contains(k)));
+            plan = plan_of(&plan.leaves);
+        }
     }
 }
