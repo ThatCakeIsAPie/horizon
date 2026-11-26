@@ -29,13 +29,33 @@
 //!   missing is "later" and the tiles are requested.
 //!
 //! What was seen is kept (`lod::cube_cache`, `<dimension>/horizon_cube_lod/`):
-//! a node of level 1 made of saved cubes (the player's edits, vanilla's
-//! decorated terrain), or sampled outside vanilla's range where the generator
-//! is exact, is stored; a coarser node is built from its eight stored
-//! children and stored too, up to `MAX_CACHED_LEVEL`. A node is asked for from
-//! the store first, then built from stored children or saved cubes, and only
-//! then sampled. `CubeLodCache::invalidate` (called by the level when it saves
-//! a cube) erases the stored nodes over a cube.
+//! every FINAL node, of every level up to `MAX_CACHED_LEVEL`, is stored: a
+//! node made of saved cubes (the player's edits, vanilla's decorated terrain),
+//! or sampled where the generator is exact (outside a Hybrid world's vanilla
+//! band), level 0 (generated cubes, not saved ones) to the coarsest. Not final
+//! and never stored ([`final_node`]): a node in a Hybrid band (a guess until
+//! its cubes are saved), a coarse Earth node (the first pass, refined later:
+//! the whole one is stored when it is made, and replaces any older record),
+//! one made after the level shut down, and one that is "later" (no answer).
+//! A node whose eight children are stored is built from them if it is not
+//! stored itself. A node is asked for from the store first, then built from
+//! stored children or saved cubes, and only then sampled.
+//! `CubeLodCache::invalidate` (called by the level when it saves a cube, and
+//! by the far structures when they reach a cube) erases the stored nodes over
+//! a cube at every level.
+//!
+//! Writes never happen on the far workers or the main thread: [`Keeper`], the
+//! "Cube far writer" thread, takes the nodes from a queue, batches them and
+//! appends each bucket file's records in one write; a full queue drops the
+//! write (counted). The store is size-bounded (default 1 GB,
+//! `HORIZON_FAR_DISK_MB`).
+//!
+//! GPU products are not stored: on the GPU path of a Custom level a node the
+//! far generator leaves in the GPU node pool (`Resident::Slot`) is never read
+//! back. The GPU regenerates one in well under a millisecond, reading it back
+//! would add a GPU to CPU sync and PCIe traffic on the GPU thread, and the
+//! cache exists to save CPU builds. Nodes the CPU built (`Resident::Node`:
+//! structures, the CPU reference sampler) are stored like any other.
 //!
 //! Nodes also carry which columns have something solid over them
 //! (`CubeNode::column_covered`): terrain, overhangs or floating land over a
@@ -442,13 +462,28 @@ impl CubicLodSampler {
     }
 
     /// A node of the finest levels made of the saved cubes it holds (the
-    /// others sampled as usual), or `None` when none of them was saved. The
-    /// flag says whether it is worth keeping (see [`Self::keep`]).
-    fn of_saved_cubes(&mut self, key: CubeKey) -> Option<(CubeNode, bool)> {
+    /// others sampled as usual), or [`Saved::No`] when none of them was saved.
+    /// The flag says whether it is worth keeping (see [`Self::keep`]).
+    ///
+    /// In an Earth world the node gets its sky cover and its columns' water
+    /// tops the way a generated one does ([`Self::earth_covered`]): without
+    /// the tops the mesher takes water ending on a node's top (the sea, a
+    /// bay) to go on in the node above and draws the sand bed instead. When
+    /// the tiles those read are missing the node is [`Saved::Later`] (they
+    /// are asked for), never drawn without them.
+    fn of_saved_cubes(&mut self, key: CubeKey) -> Saved {
         match key.level {
             0 => {
-                let node = self.saved_cube(SectionPos::new(key.x, key.y, key.z))?;
-                Some((self.covered(node), false))
+                let Some(node) = self.saved_cube(SectionPos::new(key.x, key.y, key.z)) else {
+                    return Saved::No;
+                };
+                if self.is_earth() {
+                    return match self.earth_covered(key, node) {
+                        Some(node) => Saved::Node(node, false),
+                        None => Saved::Later,
+                    };
+                }
+                Saved::Node(self.covered(node), false)
             }
             1 => {
                 let children = key.children();
@@ -457,26 +492,39 @@ impl CubicLodSampler {
                     .map(|c| self.saved_cube(SectionPos::new(c.x, c.y, c.z)))
                     .collect();
                 if saved.iter().all(Option::is_none) {
-                    return None;
+                    return Saved::No;
                 }
                 let all_saved = saved.iter().all(Option::is_some);
                 let mut nodes = Vec::with_capacity(8);
                 for (child, saved) in children.iter().zip(saved) {
                     nodes.push(match saved {
                         Some(node) => node,
-                        None => self.sampled_plain(*child)?,
+                        None => match self.sampled_plain(*child) {
+                            Some(node) => node,
+                            // An Earth child waits for its tiles; the saved ones are not
+                            // replaced by a node of generated terrain meanwhile.
+                            None if self.is_earth() => return Saved::Later,
+                            None => return Saved::No,
+                        },
                     });
                 }
                 let air = BlockStateId(self.air);
                 let refs: [&CubeNode; 8] = std::array::from_fn(|i| &nodes[i]);
                 let node = downsample(refs, air, |s| self.kind(s));
+                if self.is_earth() {
+                    // Exact whenever the surfaces are known (else it is later).
+                    return match self.earth_covered(key, node) {
+                        Some(node) => Saved::Node(node, all_saved || !self.in_band(key)),
+                        None => Saved::Later,
+                    };
+                }
                 let (cover, exact) = self.cover_of(key);
                 // Inside vanilla's range, cubes not saved yet are the far
                 // columns' guess: the node waits until they are.
                 let keep = exact && (all_saved || !self.in_band(key));
-                Some((node.with_covered(cover), keep))
+                Saved::Node(node.with_covered(cover), keep)
             }
-            _ => None,
+            _ => Saved::No,
         }
     }
 
@@ -625,43 +673,41 @@ impl CubicLodSampler {
         (Some(mask), exact)
     }
 
-    /// Stores `node` and whatever nodes it now completes (a parent whose
-    /// eight children are stored), unless a cube under it was saved since
-    /// `since` (the cache's cursor when the node's building started).
+    /// Hands `node` to the writer thread ([`Keeper`]), which stores it and
+    /// whatever nodes it then completes (a parent whose eight children are
+    /// stored), unless a cube under it was saved since `since` (the cache's
+    /// cursor when the node's building started). Never writes here: a full
+    /// queue drops the write.
     fn keep(&mut self, node: &CubeNode, since: u64) {
         let started = std::time::Instant::now();
-        // On the keeper's thread when it has room; here otherwise.
-        let queued = self
-            .keeper
-            .as_ref()
-            .is_some_and(|k| k.queue(node.clone(), since));
-        if !queued {
-            self.keep_timed(node, since);
+        if let Some(keeper) = &self.keeper {
+            keeper.queue(node.clone(), since);
         }
         if crate::lod::cube::profile::on() {
             crate::lod::cube::profile::add(&crate::lod::cube::profile::S_KEEP, started);
         }
     }
 
-    fn keep_timed(&mut self, node: &CubeNode, since: u64) {
-        let Some(cache) = self.cache.clone() else {
-            return;
-        };
-        if !unchanged(&cache, node.key, since) {
-            return;
-        }
-        cache.put(node);
-        let mut key = node.key;
-        while key.level < MAX_CACHED_LEVEL {
-            let parent = key.parent();
-            if cache.contains(parent) || self.of_cached_children(parent, since).is_none() {
-                break;
-            }
-            key = parent;
+    /// [`Self::keep`] for a coarse node (an Earth node's tree-less first pass):
+    /// stored as coarse, so a revisit draws it at once from disk; never as
+    /// final (the whole node replaces it once made).
+    fn keep_coarse(&mut self, node: &CubeNode, since: u64) {
+        if let Some(keeper) = &self.keeper {
+            keeper.queue_coarse(node.clone(), since);
         }
     }
 
-    /// Level `key` made of its eight stored children, stored itself.
+    /// [`Self::keep`] for a far generator's answer: a node the CPU made is
+    /// kept, a slot of the GPU pool never (see the module's docs).
+    fn keep_answer(&mut self, answer: Option<Resident>, since: u64) -> Option<Resident> {
+        if let Some(Resident::Node(node)) = &answer {
+            self.keep(node, since);
+        }
+        answer
+    }
+
+    /// Level `key` made of its eight stored children, handed to the writer to
+    /// be stored itself.
     fn of_cached_children(&mut self, key: CubeKey, since: u64) -> Option<CubeNode> {
         let cache = self.cache.clone()?;
         if key.level < 2 || key.level > MAX_CACHED_LEVEL {
@@ -674,91 +720,233 @@ impl CubicLodSampler {
         let air = BlockStateId(self.air);
         let refs: [&CubeNode; 8] = std::array::from_fn(|i| &nodes[i]);
         let node = downsample(refs, air, |s| self.kind(s));
-        if unchanged(&cache, key, since) {
-            cache.put(&node);
-        }
+        self.keep(&node, since);
         Some(node)
+    }
+
+    /// What the cache says of node `key` when its class cannot be worked out
+    /// (an Earth node whose tiles are missing): uniform air is air; any other
+    /// stored node is `Mixed`, which the planner asks for, and the store
+    /// answers. Rock and water are not answered from here: a stored node is
+    /// the final voxels, `Mixed` is always safe, and the classifier says
+    /// `Rock` (a closed shell) and `Air` for water from the elevation once the
+    /// tiles come.
+    fn cached_class(&self, key: CubeKey) -> Option<NodeClass> {
+        let (node, coarse) = self.cache.as_ref()?.get_any(key)?;
+        // A coarse node lacks the trees the whole one may stand in its air.
+        Some(if coarse {
+            NodeClass::Mixed
+        } else {
+            stored_class(&node, self.air)
+        })
     }
 }
 
-/// The cache writes of [`CubicLodSampler::keep`] on a thread of their own: a
-/// node, then each parent it completes (read back from its eight children,
-/// downsampled and stored). They took the far workers 2 to 13 s of every 40
-/// in a fill after a teleport (research/far-fill); nothing they write is
-/// needed for the nodes being made, only by later lookups. A full queue
-/// (`QUEUE`) sends the write back to the worker, as it was.
-pub struct Keeper {
-    tx: std::sync::Mutex<std::sync::mpsc::SyncSender<(CubeNode, u64)>>,
+/// What [`CubicLodSampler::of_saved_cubes`] made of node `key`.
+enum Saved {
+    /// None of its cubes was saved.
+    No,
+    /// Some were, but what it still needs (an Earth world's tiles) is not in.
+    Later,
+    /// The node, and whether it is worth keeping.
+    Node(CubeNode, bool),
 }
 
+/// [`CubicLodSampler::cached_class`]'s rule for a stored `node`.
+fn stored_class(node: &CubeNode, air: u32) -> NodeClass {
+    match node.as_uniform() {
+        Some(v) if v.state.0 == air => NodeClass::Air,
+        _ => NodeClass::Mixed,
+    }
+}
+
+/// Whether a node just made is final, so worth keeping on disk: not in a
+/// Hybrid world's vanilla band (the far columns' guess), not the coarse first
+/// pass of an Earth node (refined later; the whole node is stored then) and not
+/// made after the level shut down (built of air in place of data it could not
+/// read). A "later" answer (`None`) never gets here.
+fn final_node(in_band: bool, coarse: bool, cancelled: bool) -> bool {
+    !in_band && !coarse && !cancelled
+}
+
+/// Whether a stored node is drawn as it is: a whole one always; a coarse one
+/// (`record_coarse`) only while the node is still to be made coarse
+/// (`pass_coarse`: not handed out to be refined), so a node being refined is
+/// built whole instead of drawn coarse again.
+fn draw_stored(record_coarse: bool, pass_coarse: bool) -> bool {
+    !record_coarse || pass_coarse
+}
+
+/// The writes of [`CubicLodSampler::keep`] on a thread of their own ("Cube far
+/// writer"): the far workers queue each node they made, the thread takes
+/// whatever is queued (up to `BATCH`), stores them with one append per bucket
+/// file, then builds and stores each parent whose eight children are now
+/// stored ([`keep_batch`]). The writes took the far workers 2 to 13 s of
+/// every 40 in a fill after a teleport (research/far-fill); nothing they write
+/// is needed for the nodes being made, only by later lookups. A full queue
+/// (`QUEUE`) drops the write and counts it: a worker never writes.
+pub struct Keeper {
+    tx: Option<std::sync::mpsc::SyncSender<Queued>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    dropped: std::sync::atomic::AtomicU64,
+}
+
+/// A node for the writer: the node, the cache's cursor when its building
+/// started, and whether it is coarse.
+type Queued = (CubeNode, u64, bool);
+
 impl Keeper {
-    const QUEUE: usize = 1024;
+    const QUEUE: usize = 4096;
+    /// Nodes the thread takes at once.
+    const BATCH: usize = 256;
 
     fn start(cache: Arc<CubeLodCache>, air: u32, fluids: Vec<u32>) -> Option<Arc<Self>> {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(CubeNode, u64)>(Self::QUEUE);
-        std::thread::Builder::new()
-            .name("Cube far keeper".into())
+        let kind = move |state: BlockStateId| {
+            if state.0 == air {
+                Kind::Air
+            } else if fluids.contains(&state.0) {
+                Kind::Fluid
+            } else {
+                Kind::Solid
+            }
+        };
+        Self::spawn(Self::QUEUE, move |batch| {
+            keep_batch(&cache, air, &kind, batch);
+        })
+    }
+
+    /// A writer thread that hands each batch it takes to `work`.
+    fn spawn(
+        queue: usize,
+        mut work: impl FnMut(Vec<Queued>) + Send + 'static,
+    ) -> Option<Arc<Self>> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Queued>(queue);
+        let thread = std::thread::Builder::new()
+            .name("Cube far writer".into())
             .spawn(move || {
                 horizon_threads::far_below_main();
-                let kind = |state: BlockStateId| {
-                    if state.0 == air {
-                        Kind::Air
-                    } else if fluids.contains(&state.0) {
-                        Kind::Fluid
-                    } else {
-                        Kind::Solid
+                // Blocks for one node, then takes what else is queued.
+                while let Ok(first) = rx.recv() {
+                    let mut batch = vec![first];
+                    while batch.len() < Self::BATCH
+                        && let Ok(next) = rx.try_recv()
+                    {
+                        batch.push(next);
                     }
-                };
-                while let Ok((node, since)) = rx.recv() {
-                    keep_into(&cache, air, &kind, &node, since);
+                    work(batch);
                 }
             })
             .ok()?;
         Some(Arc::new(Self {
-            tx: std::sync::Mutex::new(tx),
+            tx: Some(tx),
+            thread: Some(thread),
+            dropped: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
-    /// Hands `node` to the thread: false when its queue is full.
+    /// Hands `node` to the thread without waiting: false (and counted) when
+    /// its queue is full, and the write is dropped.
     fn queue(&self, node: CubeNode, since: u64) -> bool {
-        self.tx
-            .lock()
-            .is_ok_and(|tx| tx.try_send((node, since)).is_ok())
+        self.send((node, since, false))
+    }
+
+    /// [`Self::queue`] for a coarse node (stored as coarse).
+    fn queue_coarse(&self, node: CubeNode, since: u64) -> bool {
+        self.send((node, since, true))
+    }
+
+    fn send(&self, item: Queued) -> bool {
+        let sent = self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(item).is_ok());
+        if !sent {
+            let n = self
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if n == 1 || n % 4096 == 0 {
+                log::warn!("Horizon: cube far writer is behind: {n} nodes not kept");
+            }
+        }
+        sent
+    }
+
+    /// Writes dropped for want of room.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
-/// [`CubicLodSampler::keep`]'s work: stores `node` and each parent it now
-/// completes, unless a cube under one was saved since `since`.
-fn keep_into(
+impl Drop for Keeper {
+    /// The last fork is gone: the thread finishes what is queued and ends.
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// [`Keeper`]'s work for a batch: stores the nodes (each unless a cube under
+/// it was saved since its `since`) in one batch, then each parent they
+/// complete (all eight children stored, itself not: a stored parent is never
+/// overwritten), level by level, one batch each.
+fn keep_batch(
     cache: &CubeLodCache,
     air: u32,
     kind: &impl Fn(BlockStateId) -> Kind,
-    node: &CubeNode,
-    since: u64,
+    batch: Vec<Queued>,
 ) {
-    if !unchanged(cache, node.key, since) {
-        return;
+    let mut nodes = Vec::with_capacity(batch.len());
+    let mut coarse = Vec::new();
+    // The parents to look at, with the oldest `since` of the children.
+    let mut parents: std::collections::HashMap<CubeKey, u64> = std::collections::HashMap::new();
+    for (node, since, is_coarse) in batch {
+        if !unchanged(cache, node.key, since) {
+            continue;
+        }
+        // Coarse nodes complete no parent (parents are made of whole ones).
+        if is_coarse {
+            coarse.push(node);
+            continue;
+        }
+        let key = node.key;
+        if key.level < MAX_CACHED_LEVEL && key.level >= 1 {
+            let at = parents.entry(key.parent()).or_insert(since);
+            *at = (*at).min(since);
+        }
+        nodes.push(node);
     }
-    cache.put(node);
-    let mut key = node.key;
-    while key.level < MAX_CACHED_LEVEL {
-        let parent = key.parent();
-        if cache.contains(parent) || parent.level < 2 {
-            break;
-        }
-        let mut nodes = Vec::with_capacity(8);
-        for child in parent.children() {
-            match cache.get(child) {
-                Some(n) => nodes.push(n),
-                None => return,
+    cache.put_many(&nodes);
+    if !coarse.is_empty() {
+        cache.put_coarse(&coarse);
+    }
+    while !parents.is_empty() {
+        let mut built = Vec::new();
+        let mut next: std::collections::HashMap<CubeKey, u64> = std::collections::HashMap::new();
+        for (parent, since) in parents {
+            if cache.contains(parent) {
+                continue;
             }
+            let children: Option<Vec<CubeNode>> =
+                parent.children().iter().map(|&c| cache.get(c)).collect();
+            let Some(children) = children else {
+                continue;
+            };
+            let refs: [&CubeNode; 8] = std::array::from_fn(|i| &children[i]);
+            let node = downsample(refs, BlockStateId(air), kind);
+            if !unchanged(cache, parent, since) {
+                continue;
+            }
+            if parent.level < MAX_CACHED_LEVEL {
+                let at = next.entry(parent.parent()).or_insert(since);
+                *at = (*at).min(since);
+            }
+            built.push(node);
         }
-        let refs: [&CubeNode; 8] = std::array::from_fn(|i| &nodes[i]);
-        let built = downsample(refs, BlockStateId(air), kind);
-        if unchanged(cache, parent, since) {
-            cache.put(&built);
-        }
-        key = parent;
+        cache.put_many(&built);
+        parents = next;
     }
 }
 
@@ -821,25 +1009,40 @@ fn cover_columns(
 impl CubeSampler for CubicLodSampler {
     fn node(&mut self, key: CubeKey) -> Option<CubeNode> {
         let since = self.cache.as_ref().map_or(0, |c| c.cursor());
-        // Kept nodes are whole (`refine`: a coarse one is never kept).
-        if let Some(node) = self.cache.as_ref().and_then(|c| c.get(key)) {
-            self.made_whole(key);
+        // A stored whole node; a stored coarse one while the node is still to be
+        // drawn coarse (`refine` hands it out to be made whole later).
+        if let Some((node, coarse)) = self.cache.as_ref().and_then(|c| c.get_any(key))
+            && draw_stored(coarse, self.is_coarse(key))
+        {
+            if coarse {
+                if let Some(refine) = &self.refine {
+                    refine.made(key, false, true);
+                }
+            } else {
+                self.made_whole(key);
+            }
             return Some(node);
         }
         if let Some(node) = self.of_cached_children(key, since) {
             self.made_whole(key);
             return Some(node);
         }
-        if key.level <= 1
-            && let Some((node, keep)) = self.of_saved_cubes(key)
-        {
-            if keep {
-                self.keep(&node, since);
+        if key.level <= 1 {
+            match self.of_saved_cubes(key) {
+                Saved::Node(node, keep) => {
+                    if keep {
+                        self.keep(&node, since);
+                    }
+                    // The world's own cubes, trees and all: whole. Without this a node
+                    // handed out to be refined waited out its time in the batch.
+                    self.made_whole(key);
+                    return Some(node);
+                }
+                // Saved cubes under it, and the tiles its cover and water tops read are not in:
+                // later, not a generated node in place of them.
+                Saved::Later => return None,
+                Saved::No => {}
             }
-            // The world's own cubes, trees and all: whole. Without this a node
-            // handed out to be refined waited out its time in the batch.
-            self.made_whole(key);
-            return Some(node);
         }
         let node = self.sampled(key)?;
         // An Earth node made after the level shut down is built of air in
@@ -849,9 +1052,22 @@ impl CubeSampler for CubicLodSampler {
         }
         let node = self.with_structures(node);
         // The generator is exact outside a Hybrid world's band (and
-        // everywhere in the others). A coarse node (refined later) is not kept.
-        if key.level == 1 && !self.in_band(key) && !self.is_coarse(key) {
+        // everywhere in the others): every level is kept, level 0 included (a
+        // generated cube; one read from a save returned above). A coarse node
+        // (refined later) is not.
+        if final_node(
+            self.in_band(key),
+            self.is_coarse(key),
+            self.level.generation_cancelled(),
+        ) {
             self.keep(&node, since);
+        } else if final_node(
+            self.in_band(key),
+            false,
+            self.level.generation_cancelled(),
+        ) {
+            // Coarse: kept as coarse, drawn at once on a revisit.
+            self.keep_coarse(&node, since);
         }
         Some(node)
     }
@@ -871,9 +1087,11 @@ impl CubeSampler for CubicLodSampler {
             if self.has_structures(key)
                 && let Some(node) = self.structure_node(key)
             {
+                self.keep(&node, since);
                 return Some(Resident::Node(node));
             }
-            return self.far.as_mut()?.resident(key);
+            let answer = self.far.as_mut()?.resident(key);
+            return self.keep_answer(answer, since);
         }
         self.node(key).map(Resident::Node)
     }
@@ -884,6 +1102,8 @@ impl CubeSampler for CubicLodSampler {
         let mut out: Vec<Option<Resident>> = (0..keys.len()).map(|_| None).collect();
         let mut far_keys = Vec::new();
         let mut far_places = Vec::new();
+        // Before any of the batch is made: a cube saved meanwhile voids the writes.
+        let batch_since = self.cache.as_ref().map_or(0, |c| c.cursor());
         for (i, &key) in keys.iter().enumerate() {
             if self.far_makes(key) {
                 let started = std::time::Instant::now();
@@ -896,6 +1116,7 @@ impl CubeSampler for CubicLodSampler {
                     && let Some(node) = self.structure_node(key)
                 {
                     // Drawn with a structure's voxels: sampled here.
+                    self.keep(&node, since);
                     out[i] = Some(Resident::Node(node));
                 } else {
                     far_keys.push(key);
@@ -917,7 +1138,7 @@ impl CubeSampler for CubicLodSampler {
                 crate::lod::cube::profile::add(&crate::lod::cube::profile::S_FAR, started);
             }
             for (i, answer) in far_places.into_iter().zip(answers) {
-                out[i] = answer;
+                out[i] = self.keep_answer(answer, batch_since);
             }
         }
         out
@@ -1184,5 +1405,247 @@ mod tests {
         cover_columns([0, 0, 0], 6, 1024 - 3, &mut mask, pillar);
         assert!(covered(&mask, 0, 0));
         assert!(!covered(&mask, 1, 0));
+    }
+
+    fn dense(key: CubeKey, salt: u32) -> CubeNode {
+        CubeNode::from_fn(key, |x, y, z| Voxel {
+            state: BlockStateId(((x + 2 * y + 3 * z) as u32 + salt) % 5),
+            biome: (x ^ z) as u16,
+        })
+    }
+    fn kind(state: BlockStateId) -> Kind {
+        if state.0 == 0 { Kind::Air } else { Kind::Solid }
+    }
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("horizon-cubic-lod-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+    fn same(a: &CubeNode, b: &CubeNode) {
+        assert_eq!(a.key, b.key);
+        assert_eq!(a.fluid_tops(), b.fluid_tops());
+        assert!((0..4096).all(|i| a.at(i) == b.at(i)));
+    }
+
+    #[test]
+    fn only_final_nodes_are_kept_a_coarse_one_never_and_the_whole_one_after_it() {
+        // Not a Hybrid band's guess, not made after the level shut down.
+        assert!(final_node(false, false, false));
+        assert!(!final_node(true, false, false));
+        assert!(!final_node(false, false, true));
+        // The Earth refine pass: coarse until it is made whole.
+        let refine = refine::Refine::default();
+        let key = CubeKey::new(3, 4, 0, 1);
+        let coarse = |r: &refine::Refine| r.pass(key) == refine::Pass::Coarse;
+        // Asked for the first time: made coarse (and not kept).
+        assert!(!final_node(false, coarse(&refine), false));
+        refine.made(key, false, true);
+        assert!(!final_node(false, coarse(&refine), false));
+        // Handed out to be refined and made whole: kept.
+        refine.made(key, true, true);
+        assert!(final_node(false, coarse(&refine), false));
+        // Read whole from the cache once: whole from then on.
+        let other = CubeKey::new(2, 0, 0, 0);
+        refine.made(other, true, true);
+        assert!(final_node(
+            false,
+            refine.pass(other) == refine::Pass::Coarse,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_stored_coarse_node_is_drawn_until_it_is_handed_out_then_built_whole() {
+        let refine = refine::Refine::default();
+        let key = CubeKey::new(2, 7, 1, -4);
+        let pass_coarse = |r: &refine::Refine| r.pass(key) == refine::Pass::Coarse;
+        // A stored whole node is always drawn.
+        assert!(draw_stored(false, pass_coarse(&refine)));
+        // A reopen: the stored coarse node is drawn (and noted coarse, to be refined).
+        assert!(draw_stored(true, pass_coarse(&refine)));
+        refine.made(key, false, true);
+        assert!(draw_stored(true, pass_coarse(&refine)));
+        // Handed out to be made whole: built, not drawn coarse again.
+        crate::lod::cube::LateContent::view(&refine, [0.0; 3], [1.0, 0.0, 0.0], 1e6, true);
+        let handed = crate::lod::cube::LateContent::take_refreshes(&refine);
+        assert_eq!(handed.len(), 1);
+        assert!(!draw_stored(true, pass_coarse(&refine)));
+        // Made whole: a coarse record left behind is never drawn again; the whole one is.
+        refine.made(key, true, true);
+        assert!(!draw_stored(true, pass_coarse(&refine)));
+        assert!(draw_stored(false, pass_coarse(&refine)));
+    }
+
+    #[test]
+    fn the_writer_stores_coarse_nodes_as_coarse_and_makes_no_parent_of_them() {
+        let dir = scratch("writer-coarse");
+        let cache = CubeLodCache::open_with_cap(&dir, "t", 0).unwrap();
+        let parent = CubeKey::new(3, 0, 0, 0);
+        let since = cache.cursor();
+        let batch: Vec<Queued> = parent
+            .children()
+            .into_iter()
+            .map(|c| (dense(c, 1), since, true))
+            .collect();
+        keep_batch(&cache, 0, &kind, batch);
+        for child in parent.children() {
+            let (node, coarse) = cache.get_any(child).unwrap();
+            assert!(coarse);
+            same(&node, &dense(child, 1));
+            assert!(cache.get(child).is_none());
+        }
+        assert!(cache.get_any(parent).is_none(), "no parent of coarse nodes");
+        // The whole children replace them and complete the parent.
+        let batch: Vec<Queued> = parent
+            .children()
+            .into_iter()
+            .map(|c| (dense(c, 2), since, false))
+            .collect();
+        keep_batch(&cache, 0, &kind, batch);
+        for child in parent.children() {
+            same(&cache.get(child).unwrap(), &dense(child, 2));
+        }
+        assert!(cache.contains(parent));
+        // A late coarse write does not undo a whole node.
+        let child = parent.children()[0];
+        keep_batch(&cache, 0, &kind, vec![(dense(child, 3), since, true)]);
+        same(&cache.get(child).unwrap(), &dense(child, 2));
+        // Through the thread too.
+        let keeper = Keeper::start(cache.clone(), 0, Vec::new()).unwrap();
+        let fresh = CubeKey::new(2, 40, 0, 40);
+        assert!(keeper.queue_coarse(dense(fresh, 4), cache.cursor()));
+        drop(keeper);
+        assert!(cache.get_any(fresh).unwrap().1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stored_node_classifies_as_air_or_mixed_never_as_rock_or_water() {
+        let key = CubeKey::new(4, 0, 0, 0);
+        let voxel = |state| Voxel {
+            state: BlockStateId(state),
+            biome: 0,
+        };
+        assert_eq!(
+            stored_class(&CubeNode::uniform(key, voxel(0)), 0),
+            NodeClass::Air
+        );
+        // Rock, water (state 9 is a fluid for the caller) and a mixed node: asked for.
+        assert_eq!(
+            stored_class(&CubeNode::uniform(key, voxel(1)), 0),
+            NodeClass::Mixed
+        );
+        assert_eq!(
+            stored_class(&CubeNode::uniform(key, voxel(9)), 0),
+            NodeClass::Mixed
+        );
+        assert_eq!(stored_class(&dense(key, 0), 0), NodeClass::Mixed);
+    }
+
+    #[test]
+    fn the_writer_stores_every_level_and_completes_parents_without_overwriting_one() {
+        let dir = scratch("writer");
+        let cache = CubeLodCache::open_with_cap(&dir, "t", 0).unwrap();
+        let keeper = Keeper::start(cache.clone(), 0, Vec::new()).unwrap();
+        let since = cache.cursor();
+        // Level 0 and a high level go in like any other.
+        let (low, high) = (CubeKey::new(0, 3, -2, 5), CubeKey::new(11, 1, 0, -1));
+        assert!(keeper.queue(dense(low, 1), since));
+        assert!(keeper.queue(dense(high, 2), since));
+        // The eight children of a level 3 node complete it.
+        let parent = CubeKey::new(3, 0, 0, 0);
+        for child in parent.children() {
+            assert!(keeper.queue(dense(child, 3), since));
+        }
+        // Another level 3 node was stored whole before; its children arrive later.
+        let direct = CubeKey::new(3, 4, 0, 0);
+        cache.put(&dense(direct, 7));
+        for child in direct.children() {
+            assert!(keeper.queue(dense(child, 3), since));
+        }
+        // A node made before a cube under it was saved is stale.
+        let stale = CubeKey::new(5, 9, 9, 9);
+        let cube = SectionPos::new(9 * 32 + 3, 9 * 32, 9 * 32);
+        assert!(stale.contains_cube(cube));
+        cache.invalidate(cube);
+        assert!(keeper.queue(dense(stale, 4), since));
+        assert_eq!(keeper.dropped(), 0);
+        // The last handle ends the thread once it has written everything.
+        drop(keeper);
+        same(&cache.get(low).unwrap(), &dense(low, 1));
+        same(&cache.get(high).unwrap(), &dense(high, 2));
+        for child in parent.children() {
+            same(&cache.get(child).unwrap(), &dense(child, 3));
+        }
+        let built = cache
+            .get(parent)
+            .expect("the parent of eight stored children is stored");
+        assert_eq!(built.key, parent);
+        same(&cache.get(direct).unwrap(), &dense(direct, 7));
+        assert!(!cache.contains(stale), "a stale node was kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_batch_is_one_append_per_bucket_and_its_parents_one_more() {
+        let dir = scratch("batch");
+        let cache = CubeLodCache::open_with_cap(&dir, "t", 0).unwrap();
+        let parent = CubeKey::new(3, 0, 0, 0);
+        let batch: Vec<Queued> = parent
+            .children()
+            .into_iter()
+            .map(|c| (dense(c, 1), cache.cursor(), false))
+            .collect();
+        keep_batch(&cache, 0, &kind, batch);
+        // The eight share a bucket (one write); the parent is another (one more).
+        assert_eq!(cache.writes(), 2);
+        assert!(cache.contains(parent));
+        // Seven of eight: no parent.
+        let other = CubeKey::new(3, 1, 0, 0);
+        let batch: Vec<Queued> = other
+            .children()
+            .into_iter()
+            .take(7)
+            .map(|c| (dense(c, 1), cache.cursor(), false))
+            .collect();
+        keep_batch(&cache, 0, &kind, batch);
+        assert!(!cache.contains(other));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_write_and_never_blocks_the_caller() {
+        use std::sync::mpsc;
+        let (started_tx, started) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let (done_tx, done) = mpsc::channel();
+        // A writer stuck on its first batch, with room for two more nodes.
+        let keeper = Keeper::spawn(2, move |batch| {
+            let _ = started_tx.send(());
+            if done_tx.send(batch.len()).is_ok() {
+                // Only the first batch waits.
+                let _ = released.recv();
+            }
+        })
+        .unwrap();
+        let node = |i: i32| dense(CubeKey::new(0, i, 0, 0), 1);
+        assert!(keeper.queue(node(0), 0));
+        started.recv().unwrap();
+        assert!(keeper.queue(node(1), 0));
+        assert!(keeper.queue(node(2), 0));
+        let at = std::time::Instant::now();
+        // Full: dropped at once, counted.
+        assert!(!keeper.queue(node(3), 0));
+        assert!(!keeper.queue(node(4), 0));
+        assert!(at.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(keeper.dropped(), 2);
+        let _ = release.send(());
+        drop(release);
+        drop(keeper);
+        // What was queued was written: the first alone, then the two together.
+        let sizes: Vec<usize> = done.try_iter().collect();
+        assert_eq!(sizes.iter().sum::<usize>(), 3, "{sizes:?}");
+        assert_eq!(sizes[0], 1);
     }
 }

@@ -444,7 +444,14 @@ impl CubicLodSampler {
     pub(super) fn earth_class(&self, key: CubeKey) -> Option<NodeClass> {
         let generator = self.wg.generator.clone();
         let earth = generator.earth_generator()?;
-        self.or_request(class(earth, key, self.far_decor()))
+        let got = class(earth, key, self.far_decor());
+        // Tiles missing, but the far cache holds the node: it needs none of them (and they are not asked for).
+        if got.is_err()
+            && let Some(class) = self.cached_class(key)
+        {
+            return Some(class);
+        }
+        self.or_request(got)
     }
 }
 

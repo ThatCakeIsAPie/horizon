@@ -634,3 +634,189 @@ fn far_nodes_over_tree_cover_get_trees_and_a_node_just_over_the_ground_is_not_sk
     // Trees only ever take away sky.
     assert!(probe.iter().all(|&(p, t)| p != NodeClass::Mixed || t == NodeClass::Mixed));
 }
+
+/// The far view's water tops (`CubeNode::fluid_tops`) over the sea of the test terrain, through the sampler, on
+/// each way a far node is made. The sea tops at `sea_level - 1`, on the top of the node under the sea level, at
+/// every level: a node without tops draws its bed (sand) in place of its water.
+mod water_tops {
+    use super::*;
+    use crate::chunk::{BIOME_STRATEGY, Chunk, ColumnLayout, Section, block_strategy};
+    use crate::cubic_lod::Saved;
+    use horizon_core::paletted::PalettedContainer;
+
+    /// Tiles are asked for, never fetched, by a far worker: this loads what was asked, as the downloader does.
+    fn load_asked(level: &Arc<crate::cubic::CubicLevel>) {
+        let generator = level.generation().generator.clone();
+        let earth = generator.earth_generator().unwrap();
+        for t in earth.take_requests() {
+            earth.field().store().load(t).unwrap();
+        }
+    }
+
+    /// `make` until the tiles it needed (asked for each time it said later) are in; the number of laters.
+    fn when_ready<T>(
+        level: &Arc<crate::cubic::CubicLevel>,
+        mut make: impl FnMut() -> Option<T>,
+    ) -> (T, usize) {
+        for laters in 0..40 {
+            if let Some(made) = make() {
+                return (made, laters);
+            }
+            load_asked(level);
+        }
+        panic!("never ready");
+    }
+
+    /// Every column of `node` ends its water on the node's top.
+    fn sea_on_top(node: &CubeNode, what: &str) {
+        let size = node.key.size() as f32;
+        for z in 0..16 {
+            for x in 0..16 {
+                assert_eq!(node.fluid_top(x, z), Some(size), "{what}: column {x},{z}");
+            }
+        }
+    }
+
+    /// Cube (`x`, `y`, 0) of the sea: stone for its lowest `floor` layers, water over them.
+    fn save_sea_cube(e: &sampler::Earth, x: i32, y: i32, floor: i32) {
+        let blocks = generator_blocks(e);
+        let section = Section {
+            blocks: PalettedContainer::new(block_strategy(), blocks.water),
+            biomes: PalettedContainer::new(BIOME_STRATEGY, 0u32),
+            ..Section::default()
+        };
+        let mut cube = Chunk::with_layout(x, 0, ColumnLayout::window(y * 16, 16));
+        cube.sections[0] = Arc::new(section);
+        for ly in 0..floor {
+            for lz in 0..16 {
+                for lx in 0..16 {
+                    cube.set(lx, y * 16 + ly, lz, blocks.stone);
+                }
+            }
+        }
+        assert!(e.level.save_cube(&cube, y));
+    }
+
+    fn generator_blocks(e: &sampler::Earth) -> EarthBlocks {
+        let generator = e.level.generation().generator.clone();
+        *generator.earth_generator().unwrap().blocks()
+    }
+
+    /// 1. Saved cubes: a node of the cubes the player walked over, as the sampler hands it out.
+    #[test]
+    fn saved_cubes_over_the_sea_get_their_water_tops_at_levels_0_and_1() {
+        let Some(mut e) = sampler::earth("saved-tops") else {
+            return;
+        };
+        let level = e.level.clone();
+        // Cube (-188, -1, 0) holds blocks y -16..-1 at x -3008: out at sea (the terrain 1,200 blocks under).
+        save_sea_cube(&e, -188, -1, 3);
+        let (key0, key1) = (CubeKey::new(0, -188, -1, 0), CubeKey::new(1, -94, -1, 0));
+        let generator = e.level.generation().generator.clone();
+        let earth = generator.earth_generator().unwrap();
+
+        // Level 0: the saved cube itself. Its tiles missing, it is later (and they are asked for), not drawn
+        // without tops.
+        assert!(e.sampler.node(key0).is_none());
+        assert!(!earth.take_requests().is_empty(), "the tiles were asked for");
+        let (node, laters) = when_ready(&level, || e.sampler.node(key0));
+        assert!(laters > 0);
+        // Its voxels are the saved ones (stone floor, water over it), its tops the sea's.
+        assert_eq!(node.get(3, 0, 3).state.0, earth.blocks().stone);
+        assert_eq!(node.get(3, 15, 3).state.0, earth.blocks().water);
+        sea_on_top(&node, "saved cube");
+
+        // Level 1: one saved cube of its eight, the others the generator's.
+        let (node, _) = when_ready(&level, || e.sampler.node(key1));
+        sea_on_top(&node, "saved level 1");
+
+        // A cube above the sea (nothing wet) gets no tops and its cover as before.
+        let dry = CubeKey::new(0, -188, 400, 0);
+        let (node, _) = when_ready(&level, || e.sampler.node(dry));
+        assert!(node.fluid_tops().is_none());
+    }
+
+    /// 1b. The keep flag: a level 1 node of saved cubes is kept when exact (its surfaces are known), only then.
+    #[test]
+    fn a_saved_level_1_node_of_an_earth_world_is_kept_when_its_tiles_are_in_and_later_before() {
+        let Some(mut e) = sampler::earth("saved-keep") else {
+            return;
+        };
+        let level = e.level.clone();
+        save_sea_cube(&e, -188, -1, 3);
+        let key1 = CubeKey::new(1, -94, -1, 0);
+        // No tiles yet: later, nothing to keep and no node of generated terrain in place of the saved cubes.
+        assert!(matches!(e.sampler.of_saved_cubes(key1), Saved::Later));
+        assert!(e.sampler.node(key1).is_none());
+        let (saved, _) = when_ready(&level, || match e.sampler.of_saved_cubes(key1) {
+            Saved::Node(node, keep) => Some((node, keep)),
+            Saved::Later => None,
+            Saved::No => panic!("a cube was saved"),
+        });
+        // One of eight saved, outside a Hybrid band: exact, kept.
+        assert!(saved.1);
+        sea_on_top(&saved.0, "level 1");
+        // Nothing saved under it: not made from saved cubes at all.
+        assert!(matches!(
+            e.sampler.of_saved_cubes(CubeKey::new(1, -60, -1, 0)),
+            Saved::No
+        ));
+        assert!(matches!(
+            e.sampler.of_saved_cubes(CubeKey::new(2, -47, -1, 0)),
+            Saved::No
+        ));
+    }
+
+    /// 2. Generated nodes: levels 0 and 1 (cubes), 2 and up (surfaces), none of them saved.
+    #[test]
+    fn generated_sea_nodes_get_their_water_tops_at_every_level() {
+        let Some(mut e) = sampler::earth("generated-tops") else {
+            return;
+        };
+        let level = e.level.clone();
+        for key in [
+            CubeKey::new(0, -190, -1, 0),
+            CubeKey::new(1, -100, -1, 0),
+            CubeKey::new(2, -50, -1, 0),
+            CubeKey::new(3, -26, -1, 0),
+            CubeKey::new(5, -7, -1, 0),
+        ] {
+            let (node, _) = when_ready(&level, || e.sampler.node(key));
+            sea_on_top(&node, &format!("{key:?}"));
+            // The node under it: water going on above, no top in it.
+            let under = CubeKey::new(key.level, key.x, -2, key.z);
+            let (node, _) = when_ready(&level, || e.sampler.node(under));
+            assert!(node.fluid_tops().is_none(), "{under:?}");
+        }
+    }
+
+    /// 3. The coarse pass of the refining, levels 0 and 1 from the columns' surfaces (`from_surfaces`), then
+    /// `sampled`'s own step (`earth_covered`).
+    #[test]
+    fn coarse_nodes_from_the_surfaces_get_their_water_tops_too() {
+        let Some(e) = sampler::earth("coarse-tops") else {
+            return;
+        };
+        let level = e.level.clone();
+        let generator = e.level.generation().generator.clone();
+        let earth = generator.earth_generator().unwrap();
+        let biome = |x: i32, z: i32| level.biome_id_at(x, z);
+        for key in [CubeKey::new(0, -190, -1, 0), CubeKey::new(1, -100, -1, 0)] {
+            let (node, _) = when_ready(&level, || {
+                let made = from_surfaces(earth, key, e.sampler.air, &biome, FarDecor::default());
+                match made {
+                    Ok(node) => e.sampler.earth_covered(key, node),
+                    Err(missing) => {
+                        e.sampler.or_request(Err::<(), _>(missing));
+                        None
+                    }
+                }
+            });
+            assert!(
+                (0..4096).any(|i| node.at(i).state.0 == earth.blocks().water),
+                "{key:?} has water"
+            );
+            sea_on_top(&node, &format!("coarse {key:?}"));
+        }
+    }
+}
