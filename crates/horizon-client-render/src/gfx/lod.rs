@@ -440,6 +440,17 @@ pub(super) fn fade_out_code(since: Instant, level: u8, now: Instant) -> u32 {
     1 + u32::from(level) * 129 + 64 + ((faded * 64.0) as u32 + 1).min(64)
 }
 
+/// Who draws a far tile's solid quads (`Tile::far_class`, gfx/far_cull.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FarClass {
+    /// Not drawn: its replacement is not whole yet (`shown` unset).
+    Hidden,
+    /// The CPU's walk: fading in or out, dying, or standing in.
+    Cpu,
+    /// GPU culling and indirect draws: whole.
+    Gpu,
+}
+
 #[derive(Clone, Copy)]
 struct Bounds {
     min: Vec3,
@@ -491,6 +502,9 @@ pub(super) struct Visible {
     /// after theirs (`Renderer::render`'s water tiers), so depth leaves it only
     /// where they have none yet.
     pub old: bool,
+    /// The far tile's solid quads are drawn by the GPU (`far_cull`): the walk lists it for
+    /// its water alone, and draws no solid quads of it.
+    pub gpu_solid: bool,
 }
 
 impl Tile {
@@ -517,6 +531,23 @@ impl Tile {
                 (self.bounds.max + 1.0).to_array(),
             ]
         })
+    }
+    /// Who draws this far tile's solid quads at `now` (`far_cull`): nobody while it is
+    /// hidden, the CPU while it fades in or out, is dying or has a stand-in, else
+    /// GPU-driven culling, whole.
+    pub fn far_class(&self, level: u8, now: Instant) -> FarClass {
+        if self.dying.is_some() || self.previous.is_some() {
+            return FarClass::Cpu;
+        }
+        match fade_code(self.shown, level, now) {
+            None => FarClass::Hidden,
+            Some(0) => FarClass::Gpu,
+            Some(_) => FarClass::Cpu,
+        }
+    }
+    /// The box of its quads (`SectionMesh::bounds`) around its origin: (min, max).
+    pub fn bounds_box(&self) -> [Vec3; 2] {
+        [self.bounds.min, self.bounds.max]
     }
     /// Whether either mesh it holds is in the compact layout: a stand-in drawn in its place can
     /// hide a compact replacement (`Renderer::follow_packed_layout`).
@@ -545,7 +576,36 @@ impl Tile {
             origin: origin.as_vec3().to_array(),
             fade,
             old: self.dying.is_some() || self.previous.is_some(),
+            gpu_solid: false,
         })
+    }
+}
+
+#[cfg(test)]
+impl Tile {
+    /// A tile for tests (`far_cull`): `mesh`, its box `bounds` around its origin,
+    /// shown since `shown`, dying since `dying`.
+    pub(super) fn for_test(
+        mesh: SectionGpu,
+        bounds: [Vec3; 2],
+        shown: Option<Instant>,
+        dying: Option<Instant>,
+    ) -> Self {
+        Self {
+            mesh: Box::new(mesh),
+            bounds: Bounds {
+                min: bounds[0],
+                max: bounds[1],
+            },
+            shown,
+            dying,
+            alone: false,
+            previous: None,
+            cull_slot: 0,
+        }
+    }
+    pub(super) fn set_times_for_test(&mut self, shown: Option<Instant>, dying: Option<Instant>) {
+        (self.shown, self.dying) = (shown, dying);
     }
 }
 
@@ -689,7 +749,15 @@ impl Renderer {
         shown
     }
 
+    /// The far tile at `key` changed: its GPU record is read again (`far_cull`).
+    fn far_touch(&mut self, key: CubeKey) {
+        if let Some(far) = &mut self.far_cull {
+            far.records.touch(key);
+        }
+    }
+
     fn install_cube_lod(&mut self, key: CubeKey, mesh: &SectionMesh) -> Option<bool> {
+        self.far_touch(key);
         let (old_slot, shown) = match self.lod_cubes.remove(&key) {
             Some(old) => {
                 let kept = (old.cull_slot, old.shown.filter(|_| old.dying.is_none()));
@@ -870,6 +938,7 @@ impl Renderer {
     }
 
     pub fn remove_cube_lod(&mut self, key: CubeKey) {
+        self.far_touch(key);
         if let Some(tile) = self.lod_cubes.remove(&key) {
             self.lod_cull_free.push(tile.cull_slot);
             self.release_tile(tile);
@@ -892,6 +961,9 @@ impl Renderer {
         for (_, tile) in std::mem::take(&mut self.lod_cubes) {
             self.lod_cull_free.push(tile.cull_slot);
             self.release_tile(tile);
+        }
+        if let Some(far) = &mut self.far_cull {
+            far.records.clear();
         }
         self.cube_overlap.clear();
         if self.lods.is_empty() {
@@ -989,6 +1061,7 @@ impl Renderer {
             } else if tile.dying.is_none() {
                 tile.dying = Some(start);
                 tile.alone = true;
+                self.far_touch(key);
             }
         }
         // In place of the nodes dropped above: whole at once, no cross-fade
@@ -998,6 +1071,7 @@ impl Renderer {
             if let Some(tile) = self.lod_cubes.get_mut(&key) {
                 tile.shown = Some(whole);
             }
+            self.far_touch(key);
             self.track_cube(key);
         }
         // Over nothing drawn: they fade in.
@@ -1005,6 +1079,7 @@ impl Renderer {
             if let Some(tile) = self.lod_cubes.get_mut(&key) {
                 tile.shown = Some(start);
             }
+            self.far_touch(key);
             self.track_cube(key);
         }
         self.cube_overlap.frame();

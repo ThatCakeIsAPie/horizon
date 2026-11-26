@@ -165,7 +165,7 @@ impl Record {
 /// as 0: `a < b` exactly when `order_key(a) < order_key(b)`. The shader
 /// compares these where the CPU compares the floats, so no flush of subnormal
 /// floats (FXC's, a Vulkan driver's) changes an answer.
-fn order_key(x: f32) -> u32 {
+pub(super) fn order_key(x: f32) -> u32 {
     let bits = if x == 0.0 { 0 } else { x.to_bits() };
     // Below 0, larger bits are smaller floats.
     if bits < 0x8000_0000 {
@@ -181,7 +181,7 @@ fn order_key(x: f32) -> u32 {
 /// below -∞'s for one facing a negative direction. `sort` makes none: a quad
 /// joins a side only when its four corners are equal along its axis, which
 /// NaN never is.
-fn threshold_key(t: f32, positive: bool) -> u32 {
+pub(super) fn threshold_key(t: f32, positive: bool) -> u32 {
     match (t.is_nan(), positive) {
         (false, _) => order_key(t),
         (true, true) => u32::MAX,
@@ -191,7 +191,7 @@ fn threshold_key(t: f32, positive: bool) -> u32 {
 
 /// The most draws a section has: the runs its buckets that can face the eye
 /// lie in. Two runs are apart by a bucket left out, so 7 buckets hold at most 4.
-const RUNS: u32 = 4;
+pub(super) const RUNS: u32 = 4;
 /// Words per id in `runs` (the shader's `RUN_WORDS`): its page, flags and draws,
 /// then each draw's first quad and quads, then its two occlusion stamps.
 const RUN_WORDS: u64 = 1 + 2 * RUNS as u64 + 2;
@@ -380,7 +380,7 @@ pub(super) enum Prepared {
 }
 
 /// A part of a compute pass: `pipeline` over `[x, y]` workgroups, nothing when `x` is 0.
-fn step<'a>(
+pub(super) fn step<'a>(
     group: &'a wgpu::BindGroup,
     pipeline: &'a wgpu::ComputePipeline,
     [x, y]: [u32; 2],
@@ -574,15 +574,15 @@ pub(super) fn offer(
 }
 
 /// A buffer that is recreated larger when it must hold more.
-struct Grown {
-    buffer: wgpu::Buffer,
-    bytes: u64,
+pub(super) struct Grown {
+    pub(super) buffer: wgpu::Buffer,
+    pub(super) bytes: u64,
     label: &'static str,
     usage: wgpu::BufferUsages,
 }
 
 impl Grown {
-    fn new(
+    pub(super) fn new(
         device: &wgpu::Device,
         label: &'static str,
         bytes: u64,
@@ -598,7 +598,7 @@ impl Grown {
     /// Room for `bytes`, in a power of two within the device's limits:
     /// `Some(true)` when the buffer was made anew (its contents lost), `None`
     /// past the limits or when the memory for it is missing.
-    fn reserve(&mut self, device: &wgpu::Device, bytes: u64) -> Option<bool> {
+    pub(super) fn reserve(&mut self, device: &wgpu::Device, bytes: u64) -> Option<bool> {
         if bytes <= self.bytes {
             return Some(false);
         }
@@ -616,7 +616,7 @@ impl Grown {
         Some(true)
     }
     /// `reserve`, keeping what the buffer held (`runs`' stamps).
-    fn reserve_keeping(
+    pub(super) fn reserve_keeping(
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,

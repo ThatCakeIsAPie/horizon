@@ -963,12 +963,33 @@ fn mesh_voxels<L: Look>(
     node: &CubeNode,
     air: BlockStateId,
     sea_surface: Option<i32>,
-    mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
+    material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
     lets_sky_through: impl Fn(BlockStateId) -> bool,
     out: &mut SectionMesh,
 ) {
+    let faces = voxel_faces(node, air, sea_surface, material, lets_sky_through);
+    let unit = (1_i32 << node.key.level) as f32;
+    for (key, mut rects) in faces {
+        if !merge_cells(&mut rects, unit) {
+            merge(&mut rects);
+        }
+        for rect in rects {
+            emit(out, key, rect);
+        }
+    }
+    out.finish_sprite_layers();
+}
+
+/// The unmerged faces of a node: one rect per exposed voxel side, by what they merge by.
+fn voxel_faces<L: Look>(
+    node: &CubeNode,
+    air: BlockStateId,
+    sea_surface: Option<i32>,
+    mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
+    lets_sky_through: impl Fn(BlockStateId) -> bool,
+) -> Faces<L> {
     if node.as_uniform().is_some_and(|v| v.state == air) {
-        return;
+        return Faces::new();
     }
     let scale = (1_i32 << node.key.level) as f32;
     let [ox, oy, oz] = node.key.origin();
@@ -1126,13 +1147,7 @@ fn mesh_voxels<L: Look>(
             }
         }
     }
-    for (key, mut rects) in faces {
-        merge(&mut rects);
-        for rect in rects {
-            emit(out, key, rect);
-        }
-    }
-    out.finish_sprite_layers();
+    faces
 }
 
 #[cfg(test)]
@@ -1572,6 +1587,138 @@ fn merge(rects: &mut Vec<Rect>) {
         }
     }
     rects.truncate(end);
+}
+/// A cell rect of a plane: `[u0, v0, u1, v1]` in cells.
+type Cells = [u8; 4];
+/// Bit `u` of row `v`: the cell is drawn.
+type Grid = [u16; CELLS];
+
+/// The rects of one plane's unit cells (`unit` blocks a side, 16 x 16 at most) as the fewest
+/// rectangles of a few partitions: greedy rows then columns, greedy columns then rows, and the
+/// runs of each row (or column) joined to the next one's where they match, which is what `merge`
+/// does. Returns false, leaving `rects` as it was, when they are not whole cells (a fluid cut at
+/// its surface): `merge` takes those.
+fn merge_cells(rects: &mut Vec<Rect>, unit: f32) -> bool {
+    let cell = |c: f32| {
+        let n = c / unit;
+        (n.fract() == 0.0 && (0.0..=CELLS as f32).contains(&n)).then_some(n as u8)
+    };
+    let mut grid: Grid = [0; CELLS];
+    for r in rects.iter() {
+        let (Some(u0), Some(v0), Some(u1), Some(v1)) =
+            (cell(r.u0), cell(r.v0), cell(r.u1), cell(r.v1))
+        else {
+            return false;
+        };
+        if u1 != u0 + 1 || v1 != v0 + 1 || u0 >= CELLS as u8 || v0 >= CELLS as u8 {
+            return false;
+        }
+        grid[v0 as usize] |= 1 << u0;
+    }
+    if rects.len() == 1 {
+        return true;
+    }
+    let mut flipped: Grid = [0; CELLS];
+    for (v, row) in grid.iter().enumerate() {
+        for (u, column) in flipped.iter_mut().enumerate() {
+            *column |= ((row >> u) & 1) << v;
+        }
+    }
+    let mut best = greedy(grid, false);
+    let found = joined(grid, false);
+    if found.len < best.len {
+        best = found;
+    }
+    // The columns' variants only where those left more than a pair.
+    if best.len > 2 {
+        for found in [greedy(flipped, true), joined(flipped, true)] {
+            if found.len < best.len {
+                best = found;
+            }
+        }
+    }
+    rects.clear();
+    rects.extend(best.cells[..best.len].iter().map(|c| Rect {
+        u0: f32::from(c[0]) * unit,
+        v0: f32::from(c[1]) * unit,
+        u1: f32::from(c[2]) * unit,
+        v1: f32::from(c[3]) * unit,
+    }));
+    true
+}
+/// The rects of a partition: at most one a cell.
+#[derive(Clone, Copy)]
+struct Parts {
+    len: usize,
+    cells: [Cells; CELLS * CELLS],
+}
+impl Parts {
+    /// `flipped`: the grid was the plane's columns, so its rects' axes go back.
+    fn push(&mut self, rect: Cells, flipped: bool) {
+        self.cells[self.len] = match flipped {
+            false => rect,
+            true => [rect[1], rect[0], rect[3], rect[2]],
+        };
+        self.len += 1;
+    }
+}
+const NO_PARTS: Parts = Parts {
+    len: 0,
+    cells: [[0; 4]; CELLS * CELLS],
+};
+/// Greedy: from the first cell left, as far along its row as it goes, then as many rows down as
+/// have all of that run.
+fn greedy(mut grid: Grid, flipped: bool) -> Parts {
+    let mut out = NO_PARTS;
+    for v in 0..CELLS {
+        while grid[v] != 0 {
+            let u = grid[v].trailing_zeros();
+            let width = (grid[v] >> u).trailing_ones();
+            let run = (((1u32 << width) - 1) as u16) << u;
+            let mut end = v + 1;
+            while end < CELLS && grid[end] & run == run {
+                end += 1;
+            }
+            for row in &mut grid[v..end] {
+                *row &= !run;
+            }
+            out.push([u as u8, v as u8, (u + width) as u8, end as u8], flipped);
+        }
+    }
+    out
+}
+/// Each row's runs, joined with the run of the same cells in the row after.
+fn joined(grid: Grid, flipped: bool) -> Parts {
+    // The rects as they grow (unflipped), by the column their run starts at in the row before
+    // (`open`: the index + 1 of the rect, or 0) and in this one.
+    let mut rects = [[0u8; 4]; CELLS * CELLS];
+    let mut len = 0;
+    let mut open = [0u8; CELLS];
+    for v in 0..CELLS {
+        let mut row = grid[v];
+        let mut next = [0u8; CELLS];
+        while row != 0 {
+            let u = row.trailing_zeros();
+            let width = (row >> u).trailing_ones();
+            row &= !((((1u32 << width) - 1) as u16) << u);
+            let u1 = (u + width) as u8;
+            let above = usize::from(open[u as usize]);
+            if above != 0 && rects[above - 1][2] == u1 {
+                rects[above - 1][3] = v as u8 + 1;
+                next[u as usize] = above as u8;
+            } else {
+                rects[len] = [u as u8, v as u8, u1, v as u8 + 1];
+                len += 1;
+                next[u as usize] = len as u8;
+            }
+        }
+        open = next;
+    }
+    let mut out = NO_PARTS;
+    for &rect in &rects[..len] {
+        out.push(rect, flipped);
+    }
+    out
 }
 /// The widest face `emit` writes, in blocks: its UVs, counted from the face's
 /// corner, must stay within `TerrainVertex::tiled`'s range.
@@ -3072,3 +3219,6 @@ mod cube_tests {
         assert_eq!(quads(&mesh(&corner).translucent).len(), 3);
     }
 }
+
+#[cfg(test)]
+mod sample_tests;

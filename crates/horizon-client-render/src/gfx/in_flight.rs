@@ -5,19 +5,24 @@ use super::{Renderer, ScreenshotRequest, copy_frame, submit};
 
 impl Renderer {
     /// The frame's readbacks to start right after its submission (on the submit thread when
-    /// the frame goes there): occlusion culling's results (`cull`) and GPU culling's
-    /// statistics. GPU frames leave occlusion culling off, so a frame has one at most.
+    /// the frame goes there): occlusion culling's results (`cull`), GPU culling's and the
+    /// far tiles' (`far_cull`) statistics.
     pub(super) fn after_submit(&mut self) -> Option<submit::AfterSubmit> {
         let cull = self.cull.as_mut().and_then(|c| c.submitted());
         let gpu = self.gpu_culling.as_mut().and_then(|g| g.submitted());
-        match (cull, gpu) {
-            (Some(c), Some(g)) => Some(Box::new(move || {
-                c();
-                g();
+        let far = self.far_cull.as_mut().and_then(|f| f.submitted());
+        let mut reads: Vec<submit::AfterSubmit> = Vec::new();
+        reads.extend(cull.map(|c| Box::new(c) as submit::AfterSubmit));
+        reads.extend(gpu.map(|g| Box::new(g) as submit::AfterSubmit));
+        reads.extend(far.map(|f| Box::new(f) as submit::AfterSubmit));
+        match reads.len() {
+            0 => None,
+            1 => reads.pop(),
+            _ => Some(Box::new(move || {
+                for read in reads {
+                    read();
+                }
             })),
-            (Some(c), None) => Some(Box::new(c)),
-            (None, Some(g)) => Some(Box::new(g)),
-            (None, None) => None,
         }
     }
     /// Frame `frame`'s statistics shown, unless a newer frame's are: a CPU frame's as it is

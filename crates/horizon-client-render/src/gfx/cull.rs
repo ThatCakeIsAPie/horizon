@@ -927,6 +927,14 @@ impl Cull {
     pub fn hiz_read_group(&self) -> Option<&wgpu::BindGroup> {
         self.hiz.as_ref().map(Hiz::read_group)
     }
+    /// Whether `test_pass` builds the Hi-Z pyramid this frame (it has boxes to test and the
+    /// compute test); when not, `build_hiz` makes it for other readers (`far_cull`).
+    pub fn test_pass_builds_hiz(&self) -> bool {
+        !self.test_data.is_empty()
+            && self.group.is_some()
+            && self.compute_pipeline.is_some()
+            && self.hiz.is_some()
+    }
     /// Builds the reversed-Z min-depth Hi-Z pyramid from phase 1's depth, for GPU culling's
     /// compute occlusion test.
     pub fn build_hiz(
@@ -1560,7 +1568,7 @@ pub(super) fn occlusion_culling_requested(info: &wgpu::AdapterInfo, env: Option<
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::gfx) mod tests {
     use super::*;
 
     /// Culling while the newest result hid enough; else one frame in `PROBE`
@@ -1715,7 +1723,7 @@ mod tests {
     }
 
     /// Reference CPU implementation of the full Hi-Z mip pyramid.
-    fn cpu_build_hiz(depth: &[f32], depth_size: [usize; 2]) -> Vec<(Vec<f32>, [usize; 2])> {
+    pub(in crate::gfx) fn cpu_build_hiz(depth: &[f32], depth_size: [usize; 2]) -> Vec<(Vec<f32>, [usize; 2])> {
         let mut pyramid = Vec::new();
         let (mut cur, mut size) = cpu_hiz_downsample(depth, depth_size);
         loop {
@@ -1733,7 +1741,7 @@ mod tests {
     }
 
     /// Reference CPU implementation of `cs_box_test`'s conservative 2x2 Hi-Z query.
-    fn cpu_query_hiz(
+    pub(in crate::gfx) fn cpu_query_hiz(
         pyramid: &[(Vec<f32>, [usize; 2])],
         uv_min: [f32; 2],
         uv_max: [f32; 2],
