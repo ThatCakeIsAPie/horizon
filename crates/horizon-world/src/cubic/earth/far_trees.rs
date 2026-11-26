@@ -581,7 +581,7 @@ impl EarthGenerator {
                 wet: self.water_top(kind),
                 ..ColDecor::default()
             };
-            c.top_lo = floor(s);
+            c.top_lo = floor(Self::far_surface(s, step, kind));
             let styled = style(biome).filter(|_| {
                 decor.trees
                     && matches!(
@@ -644,7 +644,10 @@ impl EarthGenerator {
                 if i64::from(c.bottom) <= mid && mid <= i64::from(c.top) {
                     block = c.leaves;
                 }
-            } else if c.recolour && lo <= s && i64::from(s) < i64::from(lo) + i64::from(step) {
+            } else if c.recolour && {
+                let top = Self::far_surface(s, step, cols.kind(i));
+                lo <= top && i64::from(top) < i64::from(lo) + i64::from(step)
+            } {
                 block = c.leaves;
             }
         }

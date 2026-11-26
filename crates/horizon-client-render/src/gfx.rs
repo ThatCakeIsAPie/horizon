@@ -527,11 +527,11 @@ mod census;
 pub mod compositor;
 pub(crate) mod core_lines;
 pub(crate) mod core_sky;
+pub(crate) mod core_text;
 pub mod cube_descent;
 pub mod cube_far;
 pub mod cube_gen;
 pub mod cube_mesh;
-pub(crate) mod core_text;
 mod cull;
 mod dx12_compiler;
 mod end_sky;
@@ -1872,6 +1872,9 @@ pub struct Renderer {
     lod_cubes: FxHashMap<crate::lod::cube::CubeKey, lod::Tile>,
     /// Finished node meshes `upload_cube_lods` has yet to upload.
     cube_pending: Option<lod::CubePending>,
+    /// Which `lod_cubes` draw, and how many pairs of them overlap: the far
+    /// view's single-cut rule, counted (`Renderer::cube_overlap_stats`).
+    cube_overlap: crate::lod::swap::Overlaps,
     /// Far cube terrain meshed and drawn on the GPU (`cube_far`), once a GPU sampler asked.
     cube_far: Option<cube_far::CubeFar>,
     /// Height-map tiles for a Custom cubic world's coarsest far terrain, beside
@@ -4952,6 +4955,7 @@ impl Renderer {
             lods: FxHashMap::default(),
             lod_cubes: FxHashMap::default(),
             cube_pending: None,
+            cube_overlap: Default::default(),
             cube_far: None,
             surface_tiles: None,
             surface_tiles_failed: false,
@@ -6374,6 +6378,7 @@ impl Renderer {
         self.lods.clear();
         self.lod_cubes.clear();
         self.cube_pending = None;
+        self.cube_overlap.clear();
         self.lod_cutout.clear();
         self.lod_retiring.clear();
         self.lod_leaving.clear();

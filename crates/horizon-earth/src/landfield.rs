@@ -17,7 +17,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::landcover::{LandClass, WorldCoverFile, cache_key, level_for};
+use crate::landcover::{
+    LandClass, SPECK_GRID, SPECK_KEEP, WorldCoverFile, cache_key, level_for, soften_specks,
+};
 use crate::projection::Projection;
 use crate::source::write_atomically;
 use crate::tiff::{ByteRange, Level, Parse, Piece, TiffError, TiffIndex, parse_index};
@@ -94,32 +96,83 @@ impl std::error::Error for ProvideError {}
 pub struct LandTile {
     pub width: u32,
     pub height: u32,
+    /// The classes after the towns are given back ([`crate::landcover::unbuild`]) and the specks take the class
+    /// around them ([`soften_specks`]).
     pixels: Vec<u8>,
+    /// The specks' own classes: `(pixel index, original code)`, sorted by index.
+    specks: Vec<(u32, u8)>,
 }
 
 impl LandTile {
     /// The tile of `level` whose decoded class codes are `pixels`, with its built-up land given back to nature
-    /// ([`crate::landcover::unbuild`]): no read ever sees a built-up class.
+    /// ([`crate::landcover::unbuild`]): no read ever sees a built-up class. Specks of one or two pixels take
+    /// the class around them but remember their own ([`LandTile::class_mixed`]).
     fn decoded(level: &Level, mut pixels: Vec<u8>) -> Self {
         let (width, height) = (level.tile_width, level.tile_height);
         crate::landcover::unbuild(&mut pixels, width as usize, height as usize);
+        let specks = soften_specks(&mut pixels, width as usize, height as usize);
         Self {
             width,
             height,
             pixels,
+            specks,
         }
     }
 
-    /// The class at pixel `(x, y)` of the tile; [`LandClass::NoData`] for a value the dataset does not define.
-    /// `None` outside the tile.
-    pub fn class(&self, x: u32, y: u32) -> Option<LandClass> {
+    fn code_at(&self, x: u32, y: u32) -> Option<u8> {
         if x >= self.width || y >= self.height {
             return None;
         }
-        let code = *self
-            .pixels
-            .get(y as usize * self.width as usize + x as usize)?;
+        self.pixels
+            .get(y as usize * self.width as usize + x as usize)
+            .copied()
+    }
+
+    /// The class at pixel `(x, y)` of the tile; [`LandClass::NoData`] for a value the dataset does not define.
+    /// `None` outside the tile. A speck of one or two pixels reads as the class around it (see
+    /// [`LandTile::class_mixed`] for the speck's own class kept in part).
+    pub fn class(&self, x: u32, y: u32) -> Option<LandClass> {
+        let code = self.code_at(x, y)?;
         Some(LandClass::from_code(code).unwrap_or(LandClass::NoData))
+    }
+
+    /// The class at the point `(fx, fy)` (each `0..1`) of pixel `(x, y)`. Away from specks it is
+    /// [`LandTile::class`]. On a speck it is the speck's own class on [`SPECK_KEEP`] of the pixel's ground
+    /// (cut into [`SPECK_GRID`] by [`SPECK_GRID`] cells, each kept or not by a hash of the cell and of `place`,
+    /// which tells pixels of different levels or files apart) and the class around it elsewhere.
+    pub fn class_mixed(
+        &self,
+        x: u32,
+        y: u32,
+        inside: (f64, f64),
+        place: (i64, i64, u64),
+    ) -> Option<LandClass> {
+        match self.speck_kept(x, y, inside, place) {
+            Some(class) => Some(class),
+            None => self.class(x, y),
+        }
+    }
+
+    /// The speck's own class when pixel `(x, y)` is a speck and the point `inside` it (see
+    /// [`LandTile::class_mixed`]) is on the part of it that keeps it; `None` otherwise.
+    fn speck_kept(
+        &self,
+        x: u32,
+        y: u32,
+        (fx, fy): (f64, f64),
+        place: (i64, i64, u64),
+    ) -> Option<LandClass> {
+        if self.specks.is_empty() || x >= self.width || y >= self.height {
+            return None;
+        }
+        let index = y * self.width + x;
+        let at = self.specks.binary_search_by_key(&index, |&(i, _)| i).ok()?;
+        let cell =
+            |f: f64| ((f * f64::from(SPECK_GRID)) as i64).clamp(0, i64::from(SPECK_GRID) - 1);
+        let key = cell(fy) * i64::from(SPECK_GRID) + cell(fx);
+        let h = crate::warp::cell_hash(place.0, place.1, key, place.2 ^ 0x5EC4_5BEC_0000_0001);
+        (h < SPECK_KEEP)
+            .then(|| LandClass::from_code(self.specks[at].1).unwrap_or(LandClass::NoData))
     }
 }
 
@@ -304,8 +357,23 @@ impl LandCoverStore {
 
     /// The class at `(lat, lon)`, read at the overview level whose pixels are no taller on the ground than
     /// `metres_per_sample` (the finest level when even that is coarser). Never fetches: it answers
-    /// [`Lookup::Need`] when it lacks bytes.
+    /// [`Lookup::Need`] when it lacks bytes. This is the raw pixel grid (specks one or two pixels big are a mix
+    /// of their own class and the land around, see [`LandTile::class_mixed`]);
+    /// [`LandCoverStore::lookup_smooth`] and [`LandCoverField::class_at`] round its corners.
     pub fn lookup(&self, lat: f64, lon: f64, metres_per_sample: f64) -> Lookup {
+        self.read(lat, lon, metres_per_sample, false)
+    }
+
+    /// Like [`LandCoverStore::lookup`] but the pixels are not squares: where a point is in the pixel, the class
+    /// is the one holding most of a bilinear blend of the four pixels whose centres are nearest (the pixel's
+    /// own class on a tie). A straight edge between two classes stays at the pixel line, but a corner of
+    /// pixels is rounded and a staircase of one-pixel steps is a diagonal. It reads up to one pixel past the
+    /// point, so it may need a neighbouring tile.
+    pub fn lookup_smooth(&self, lat: f64, lon: f64, metres_per_sample: f64) -> Lookup {
+        self.read(lat, lon, metres_per_sample, true)
+    }
+
+    fn read(&self, lat: f64, lon: f64, metres_per_sample: f64, smooth: bool) -> Lookup {
         let Some(file) = WorldCoverFile::containing(lat, lon) else {
             return Lookup::NoFile;
         };
@@ -321,18 +389,81 @@ impl LandCoverStore {
             return Lookup::Class(LandClass::NoData);
         };
         let (px, py) = file.pixel(lat, lon, level.width, level.height);
+        let inside = file.pixel_fraction(lat, lon, level.width, level.height);
         let (col, row) = (px / level.tile_width, py / level.tile_height);
         let Some(tile_no) = level.tile_index(col, row) else {
             return Lookup::Class(LandClass::NoData);
         };
-        match self.tile_of(file, level_no, level, tile_no) {
-            Ok(None) => Lookup::Class(LandClass::NoData),
-            Ok(Some(tile)) => Lookup::Class(
-                tile.class(px % level.tile_width, py % level.tile_height)
+        // Which pixel of which level of which file, for the hash that keeps a speck in part.
+        let salt = ((u64::from(file.south as u16) << 32) | (u64::from(file.west as u16) << 16))
+            ^ (level_no as u64);
+        let tile = match self.tile_of(file, level_no, level, tile_no) {
+            Ok(None) => return Lookup::Class(LandClass::NoData),
+            Ok(Some(tile)) => tile,
+            Err(fetch) => return Lookup::Need(fetch),
+        };
+        let (lx, ly) = (px % level.tile_width, py % level.tile_height);
+        let place = (i64::from(px), i64::from(py), salt);
+        if !smooth {
+            return Lookup::Class(
+                tile.class_mixed(lx, ly, inside, place)
                     .unwrap_or(LandClass::NoData),
-            ),
-            Err(fetch) => Lookup::Need(fetch),
+            );
         }
+        if let Some(kept) = tile.speck_kept(lx, ly, inside, place) {
+            return Lookup::Class(kept);
+        }
+        // The four pixels whose centres are nearest the point, with the bilinear weights of the point among
+        // them: the own pixel, the one beside it, the one above or below, and the diagonal.
+        let (u, v) = (inside.0 - 0.5, inside.1 - 0.5);
+        let (step_x, tx) = (if u >= 0.0 { 1_i64 } else { -1 }, u.abs());
+        let (step_y, ty) = (if v >= 0.0 { 1_i64 } else { -1 }, v.abs());
+        let (own, here) = ((i64::from(px), i64::from(py)), (col, row));
+        let code_at = |x: i64, y: i64| -> Result<u8, Fetch> {
+            let x = x.clamp(0, i64::from(level.width) - 1) as u32;
+            let y = y.clamp(0, i64::from(level.height) - 1) as u32;
+            let there = (x / level.tile_width, y / level.tile_height);
+            let (lx, ly) = (x % level.tile_width, y % level.tile_height);
+            if there == here {
+                return Ok(tile.code_at(lx, ly).unwrap_or(0));
+            }
+            let Some(no) = level.tile_index(there.0, there.1) else {
+                return Ok(0);
+            };
+            match self.tile_of(file, level_no, level, no)? {
+                Some(other) => Ok(other.code_at(lx, ly).unwrap_or(0)),
+                None => Ok(0),
+            }
+        };
+        let samples = [
+            (own.0, own.1, (1.0 - tx) * (1.0 - ty)),
+            (own.0 + step_x, own.1, tx * (1.0 - ty)),
+            (own.0, own.1 + step_y, (1.0 - tx) * ty),
+            (own.0 + step_x, own.1 + step_y, tx * ty),
+        ];
+        // The own pixel first, so on a tie it wins.
+        let mut votes: [(u8, f64); 4] = [(0, 0.0); 4];
+        let mut used = 0;
+        for (x, y, weight) in samples {
+            let code = match code_at(x, y) {
+                Ok(code) => code,
+                Err(fetch) => return Lookup::Need(fetch),
+            };
+            match votes[..used].iter_mut().find(|(c, _)| *c == code) {
+                Some((_, total)) => *total += weight,
+                None => {
+                    votes[used] = (code, weight);
+                    used += 1;
+                }
+            }
+        }
+        let mut best = votes[0];
+        for &(code, total) in &votes[1..used] {
+            if total > best.1 + 1e-12 {
+                best = (code, total);
+            }
+        }
+        Lookup::Class(LandClass::from_code(best.0).unwrap_or(LandClass::NoData))
     }
 
     /// The fetches still missing for lookups anywhere in `area` at `metres_per_sample`: first the index pieces of
@@ -725,17 +856,63 @@ impl LandCoverStore {
     }
 }
 
+/// Ground size of a pixel of the finest WorldCover level, north to south, in metres (the sphere's 3 degrees over
+/// 36000 rows). The coarser levels are twice, four times, ... that.
+pub const LEVEL0_PIXEL_M: f64 = 9.28;
+/// The most overview levels above the finest that a file has (WorldCover's go to 594 m).
+const MAX_LEVEL: i32 = 6;
+/// The warp of [`LandCoverField::class_at`]: a coarse and a fine wave of offsets, each in pixels of the level
+/// read. The wavelength is how far apart the offset's lattice is, the amplitude its largest size. Both
+/// directions have their own noise. Together the offset is never over [`LAND_WARP_MAX_PX`] pixels, so the data
+/// stays where it is to about a pixel, but a pixel's straight edges are bent into waves and its corners round.
+pub const LAND_WARP_COARSE_WAVELENGTH_PX: f64 = 4.0;
+pub const LAND_WARP_COARSE_PX: f64 = 0.8;
+pub const LAND_WARP_FINE_WAVELENGTH_PX: f64 = 1.25;
+pub const LAND_WARP_FINE_PX: f64 = 0.35;
+/// The largest offset of the warp, in pixels.
+pub const LAND_WARP_MAX_PX: f64 = LAND_WARP_COARSE_PX + LAND_WARP_FINE_PX;
+/// Salts (fixed, so the warp is the same in every world) of the four noises.
+const WARP_SALTS: [u64; 4] = [
+    0x1A4D_0001_C0A7_5E01,
+    0x1A4D_0002_C0A7_5E02,
+    0x1A4D_0003_F1BE_5E03,
+    0x1A4D_0004_F1BE_5E04,
+];
+
 /// Land cover at world blocks: a [`LandCoverStore`] placed on the globe by a [`Projection`], as
 /// [`crate::ElevationField`] places the elevation tiles.
+///
+/// The classes are a grid of square pixels (about 9 m, 18 m, ... by level); read by nearest pixel they would
+/// show as squares and staircases in the world, near and far. So every read goes through
+/// [`LandCoverField::class_at`], which does two things. It rounds the pixels' corners
+/// ([`LandCoverStore::lookup_smooth`]: a staircase of one-pixel steps becomes a diagonal), and it bends the grid
+/// a little first: the point it asks the store about is moved by a smooth deterministic noise of up to
+/// [`LAND_WARP_MAX_PX`] pixels, so straight pixel edges become wavy lines. Every reader (the ground, the far
+/// view, biomes, vegetation) sees the same map.
 #[derive(Clone)]
 pub struct LandCoverField {
     store: Arc<LandCoverStore>,
     projection: Projection,
+    /// Metres from north to south of a pixel of the finest level, for the size of the warp.
+    level0_pixel_m: f64,
 }
 
 impl LandCoverField {
     pub fn new(store: Arc<LandCoverStore>, projection: Projection) -> Self {
-        Self { store, projection }
+        Self {
+            store,
+            projection,
+            level0_pixel_m: LEVEL0_PIXEL_M,
+        }
+    }
+
+    /// The same field with the finest level's pixels `metres` tall on the ground, for data that is not
+    /// WorldCover's (a test's miniature files); the warp scales with it.
+    pub fn with_level0_pixel_metres(mut self, metres: f64) -> Self {
+        if metres.is_finite() && metres > 0.0 {
+            self.level0_pixel_m = metres;
+        }
+        self
     }
 
     pub fn store(&self) -> &Arc<LandCoverStore> {
@@ -746,11 +923,58 @@ impl LandCoverField {
         &self.projection
     }
 
+    /// The size in blocks `(east-west, north-south)` of a pixel of the level a read at `metres_per_sample` takes
+    /// (the coarsest whose pixel is no taller than that, like [`level_for`]). East-west pixels are narrower by
+    /// the cosine of the latitude.
+    fn pixel_blocks(&self, metres_per_sample: f64) -> (f64, f64) {
+        let level = if metres_per_sample.is_finite() && metres_per_sample > self.level0_pixel_m {
+            ((metres_per_sample / self.level0_pixel_m).log2().floor() as i32).clamp(0, MAX_LEVEL)
+        } else {
+            0
+        };
+        let tall =
+            self.level0_pixel_m * f64::from(1_u32 << level) / self.projection.metres_per_block();
+        let cos = self
+            .projection
+            .reference_latitude()
+            .to_radians()
+            .cos()
+            .max(0.01);
+        (tall * cos, tall)
+    }
+
+    /// The point `(x, z)` bent by the warp for a read at `metres_per_sample`: the offset field is noise over the
+    /// world's own block coordinates, so it is smooth from block to block, and it is scaled to the pixels of the
+    /// level that read takes.
+    fn warped(&self, x: f64, z: f64, metres_per_sample: f64) -> (f64, f64) {
+        let (px, pz) = self.pixel_blocks(metres_per_sample);
+        let octave = |wavelength: f64, amplitude: f64, salts: [u64; 2]| {
+            let (u, v) = (x / (wavelength * px), z / (wavelength * pz));
+            (
+                amplitude * px * crate::warp::value_noise(u, v, salts[0]),
+                amplitude * pz * crate::warp::value_noise(u, v, salts[1]),
+            )
+        };
+        let (cx, cz) = octave(
+            LAND_WARP_COARSE_WAVELENGTH_PX,
+            LAND_WARP_COARSE_PX,
+            [WARP_SALTS[0], WARP_SALTS[1]],
+        );
+        let (fx, fz) = octave(
+            LAND_WARP_FINE_WAVELENGTH_PX,
+            LAND_WARP_FINE_PX,
+            [WARP_SALTS[2], WARP_SALTS[3]],
+        );
+        (x + cx + fx, z + cz + fz)
+    }
+
     /// The class at the world point `(x, z)` (fractional blocks; add 0.5 for a block's centre), read at the
-    /// overview level that suits `metres_per_sample` of ground. See [`LandCoverStore::lookup`].
+    /// overview level that suits `metres_per_sample` of ground, after the warp and with the pixels' corners
+    /// rounded (see [`LandCoverField`]). The store's [`LandCoverStore::lookup`] is the same read without either.
     pub fn class_at(&self, x: f64, z: f64, metres_per_sample: f64) -> Lookup {
+        let (x, z) = self.warped(x, z, metres_per_sample);
         let at = self.projection.to_lat_lon(x, z);
-        self.store.lookup(at.lat, at.lon, metres_per_sample)
+        self.store.lookup_smooth(at.lat, at.lon, metres_per_sample)
     }
 
     /// The class at the centre of block `(x, z)`, read as finely as the blocks are big.
@@ -794,8 +1018,13 @@ impl LandCoverField {
     /// `metres_per_sample`, for prefetching. The area is the lat/lon box around the rectangle's corners and
     /// edge midpoints, which for a local projection holds the rectangle.
     pub fn needs(&self, x0: i32, z0: i32, x1: i32, z1: i32, metres_per_sample: f64) -> Vec<Fetch> {
-        let (xa, xb) = (f64::from(x0.min(x1)), f64::from(x0.max(x1)) + 1.0);
-        let (za, zb) = (f64::from(z0.min(z1)), f64::from(z0.max(z1)) + 1.0);
+        // A read inside the rectangle may be bent out of it by up to the warp.
+        let (px, pz) = self.pixel_blocks(metres_per_sample);
+        // plus the one pixel past the point that the rounding of corners reads.
+        let reach = LAND_WARP_MAX_PX + 1.0;
+        let (gx, gz) = (reach * px + 1.0, reach * pz + 1.0);
+        let (xa, xb) = (f64::from(x0.min(x1)) - gx, f64::from(x0.max(x1)) + 1.0 + gx);
+        let (za, zb) = (f64::from(z0.min(z1)) - gz, f64::from(z0.max(z1)) + 1.0 + gz);
         let (xm, zm) = ((xa + xb) / 2.0, (za + zb) / 2.0);
         let mut south = f64::INFINITY;
         let mut north = f64::NEG_INFINITY;

@@ -131,12 +131,20 @@ impl Rig {
         } else {
             s
         };
-        let at = if lo <= surface && surface <= top {
+        // Land rounds to the nearer voxel face (`EarthGenerator::far_surface`): the voxel drawn as the surface
+        // holds `drawn`, and the ones above and under it read `lift` blocks higher.
+        let drawn = if s < self.settings.sea_level_y || step <= 2 {
             surface
-        } else if top < surface {
-            top
         } else {
-            lo
+            surface - (step / 2 - 1)
+        };
+        let lift = surface - drawn;
+        let at = if lo <= drawn && drawn <= top {
+            surface
+        } else if top < drawn {
+            top + lift
+        } else {
+            lo + lift
         };
         self.expected(at, s, z)
     }
@@ -647,7 +655,10 @@ fn a_tile_that_is_refused_does_not_keep_the_generator_waiting() {
     let mut out = Box::new([0; 4096]);
     // Cube (0, -1, 0) is the 16 blocks under the sea level (0), over a sea floor 30 m down.
     let uniform = within_ten_seconds(g, || g.generate_blocking(cube(0, -1, 0), &mut out));
-    assert!(!g.is_cancelled(), "the generator waited for a tile that cannot come");
+    assert!(
+        !g.is_cancelled(),
+        "the generator waited for a tile that cannot come"
+    );
     assert_eq!(uniform, Some(rig.blocks.water));
     assert_eq!(
         within_ten_seconds(g, || g.surface_y_blocking(3, 3)),
@@ -1011,8 +1022,14 @@ fn a_far_voxel_holding_the_surface_is_the_surface_block_of_each_kind_at_every_st
         };
         let want = surface_block(&b);
         for step in [2, 8, 64] {
-            let lo = s.div_euclid(step) * step;
-            // Every height of the voxel that holds the surface asks for the same voxel.
+            // Land rounds to the nearer voxel face; the water's top stays.
+            let drawn = if s0 < g.sea_level() {
+                s
+            } else {
+                EarthGenerator::far_surface(s, step, SurfaceKind::Grass)
+            };
+            let lo = drawn.div_euclid(step) * step;
+            // Every height of the voxel drawn as the surface asks for the same voxel.
             for y in lo..lo + step {
                 assert_eq!(
                     g.block_at_blocking(5, y, 9, step),
@@ -1057,7 +1074,15 @@ fn the_far_blocks_along_a_smooth_slope_are_all_the_surface_material() {
                 block, rig.blocks.grass_block,
                 "step {step}, column {x},{z}: the top voxel (from {lo}) over surface {s}"
             );
-            assert!(lo <= s && s < lo + step, "the top voxel holds the surface");
+            let drawn = EarthGenerator::far_surface(s, step, SurfaceKind::Grass);
+            assert!(
+                lo <= drawn && drawn < lo + step,
+                "the top voxel holds the drawn surface"
+            );
+            assert!(
+                (lo + step - (s + 1)).abs() <= step / 2,
+                "within half a voxel"
+            );
             seen_heights.insert(s.rem_euclid(step));
         }
     }

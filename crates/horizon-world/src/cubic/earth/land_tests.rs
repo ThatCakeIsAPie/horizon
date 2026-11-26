@@ -794,6 +794,51 @@ fn near_and_far_give_the_same_surface_material_at_every_step() {
     }
 }
 
+#[test]
+fn the_far_path_reads_the_same_class_at_a_point_as_the_near_path() {
+    use super::generator::Access;
+    let rig = terrain_rig(mosaic);
+    let (g, land) = (&rig.generator, &rig.source);
+    let block = land.field().projection().metres_per_block();
+    let mut compared = 0;
+    for stride in [1, 4, 16, 64, 256] {
+        for (x0, z0) in [(-1200, -300), (0, 0), (433, -120), (1800, 640)] {
+            let (w, d) = (6, 5);
+            let fetched = g
+                .classes_core(Access::Fetch, land, [x0, z0], [w, d], stride, stride)
+                .ok()
+                .unwrap();
+            // Once the tiles are held a local read gives the same grid.
+            let local = g
+                .classes_core(Access::Local, land, [x0, z0], [w, d], stride, stride)
+                .ok()
+                .unwrap();
+            assert_eq!(fetched, local, "stride {stride} at {x0},{z0}");
+            for j in 0..d {
+                for i in 0..w {
+                    let (x, z) = (x0 + i as i32 * stride, z0 + j as i32 * stride);
+                    let at = land.field().class_at(
+                        f64::from(x) + 0.5,
+                        f64::from(z) + 0.5,
+                        f64::from(stride) * block,
+                    );
+                    assert_eq!(
+                        Lookup::Class(fetched[j * w + i]),
+                        at,
+                        "stride {stride} at {x},{z}"
+                    );
+                    if stride == 1 {
+                        // The near read of a block is the same point.
+                        assert_eq!(land.field().class_at_block(x, z), at);
+                    }
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(compared, 5 * 4 * 30);
+}
+
 /// The name of a column's kind for the lists of kinds a test saw: the variant's name, and a water column is the
 /// "Sea" when its top is the block under the sea level, else a "Lake".
 fn kind_name(g: &EarthGenerator, s: i32, kind: SurfaceKind) -> String {
@@ -871,7 +916,7 @@ fn a_lake_shows_in_the_far_view_and_dry_land_under_the_sea_level_is_not_flooded_
     let dry = LandRig::level(45.0, -50.0, 30);
     let cols = dry.loaded(|g| g.node_columns(5, 0, 0));
     for i in 0..256 {
-        let s = cols.surfaces[i];
+        let s = EarthGenerator::far_surface(cols.surfaces[i], 32, cols.kind(i));
         let lo = s.div_euclid(32) * 32;
         assert_eq!(
             dry.generator.far_voxel(&cols, i, lo),

@@ -458,20 +458,27 @@ impl EarthGenerator {
     /// The dry kinds differ: their terracotta is the band of the voxel's middle height (a function of the height
     /// alone, so the bands stay level whatever the surfaces of the columns), and a mixed top is the mix's main
     /// block ([`SCRUB_FAR`], [`BARREN_FAR`]), not one column's pick standing for the whole voxel.
+    ///
+    /// On land the voxel holding the surface is ground only when the ground fills at least half of it
+    /// ([`EarthGenerator::far_surface`]), so the far ground lies within half a voxel of the real one.
     pub fn voxel_block(&self, lo: i32, step: i32, s: i32, kind: SurfaceKind) -> u32 {
         if step <= 1 {
             return self.block_for(lo, s, kind);
         }
+        // The voxels are chosen against the rounded surface `drawn`, then read `lift` blocks higher, so the
+        // voxel holding `drawn` is the surface block and the ones under it are what lies under the surface.
+        let drawn = Self::far_surface(s, step, kind);
+        let lift = i64::from(s) - i64::from(drawn);
         let top = i64::from(lo) + i64::from(step) - 1;
-        let surface = i64::from(s);
+        let surface = i64::from(drawn);
         let y = if i64::from(lo) <= surface && surface <= top {
             s
         } else if top < surface {
-            top as i32
+            (top + lift) as i32
         } else {
-            lo
+            (i64::from(lo) + lift).min(i64::from(i32::MAX)) as i32
         };
-        if kind.is_dry() && y <= s && i64::from(y) >= surface - DRY_ROCK_DEPTH {
+        if kind.is_dry() && y <= s && i64::from(y) >= i64::from(s) - DRY_ROCK_DEPTH {
             return match kind {
                 SurfaceKind::Scrub(_) if y == s => self.dry_top_block(SCRUB_FAR),
                 SurfaceKind::Barren(_) if y == s => self.dry_top_block(BARREN_FAR),
@@ -487,6 +494,19 @@ impl EarthGenerator {
             DryTop::GrassBlock => self.blocks.grass_block,
             DryTop::CoarseDirt => self.blocks.coarse_dirt,
             DryTop::RedSand => self.blocks.red_sand,
+        }
+    }
+
+    /// The height whose voxel a far grid of `step` draws as the surface of a land column whose surface block is
+    /// `s`: the voxel holding `s` is ground only when the ground fills at least half of it (`s` in its upper
+    /// half), else the voxel under it is the top. A voxel holding the surface drawn whole stood up to a whole
+    /// voxel above the real ground: a sandy shore a block over the sea stood as a box a voxel tall out of the
+    /// water. Water and marsh keep their surface: it is the water's top, level with the near water.
+    pub fn far_surface(s: i32, step: i32, kind: SurfaceKind) -> i32 {
+        if step <= 2 || kind.is_water() || kind == SurfaceKind::Marsh {
+            s
+        } else {
+            s.saturating_sub(step / 2 - 1)
         }
     }
 
@@ -1039,7 +1059,10 @@ impl EarthGenerator {
         let ymin = Self::voxel_floor(min[1].min(max[1]), step);
         let ymax = Self::voxel_floor(min[1].max(max[1]), step).saturating_add(step - 1);
         let s_hi = self.vertical_block(hi).saturating_add(up);
-        Ok(self.classify_heights(ymin, ymax, self.vertical_block(lo), s_hi))
+        // A land voxel holding the surface is drawn as air when the ground fills less than half of it
+        // ([`Self::far_surface`]): solid only under the lowest top that can be drawn.
+        let s_lo = Self::far_surface(self.vertical_block(lo), step, SurfaceKind::Grass);
+        Ok(self.classify_heights(ymin, ymax, s_lo, s_hi))
     }
 
     pub(super) fn node_core(

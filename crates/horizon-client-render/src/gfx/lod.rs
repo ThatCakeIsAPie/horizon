@@ -684,6 +684,12 @@ impl Renderer {
     /// set (`upload_cube_lods`) before it fades in. Whether the node is in and
     /// already shown; none if it has no mesh.
     fn upload_cube_lod(&mut self, key: CubeKey, mesh: &SectionMesh) -> Option<bool> {
+        let shown = self.install_cube_lod(key, mesh);
+        self.track_cube(key);
+        shown
+    }
+
+    fn install_cube_lod(&mut self, key: CubeKey, mesh: &SectionMesh) -> Option<bool> {
         let (old_slot, shown) = match self.lod_cubes.remove(&key) {
             Some(old) => {
                 let kept = (old.cull_slot, old.shown.filter(|_| old.dying.is_none()));
@@ -868,6 +874,7 @@ impl Renderer {
             self.lod_cull_free.push(tile.cull_slot);
             self.release_tile(tile);
         }
+        self.cube_overlap.set(key, false);
     }
 
     /// Drops every cube tile and what waits to upload.
@@ -886,6 +893,7 @@ impl Renderer {
             self.lod_cull_free.push(tile.cull_slot);
             self.release_tile(tile);
         }
+        self.cube_overlap.clear();
         if self.lods.is_empty() {
             self.lod_cull_free.clear();
             self.lod_cull_next = 0;
@@ -907,11 +915,11 @@ impl Renderer {
     }
 
     /// Uploads queued node meshes for about `budget` (at least one). A node
-    /// that replaces another fades in once nothing overlapping it waits and
-    /// no shown node covers it; a node removed stands whole until what
-    /// replaces it is in, then fades for `FADE` and goes (`Swap::step`):
-    /// nothing opens a hole while the new ones come in, and a set does not
-    /// wait for the rest of the queue.
+    /// removed stands whole until what replaces it is in; then, in one frame,
+    /// it goes and its replacements show whole (`Swap::step`): no frame draws
+    /// both (z-fighting) or neither (a hole), and a set does not wait for the
+    /// rest of the queue. Only a node over nothing fades in, and only one
+    /// leaving nothing behind fades out.
     pub fn upload_cube_lods(&mut self, budget: Duration) {
         let start = Instant::now();
         if let Some(far) = &mut self.cube_far {
@@ -925,6 +933,9 @@ impl Renderer {
             .collect();
         for key in faded {
             self.remove_cube_lod(key);
+            if let Some(pending) = &mut self.cube_pending {
+                pending.swap.forget(key);
+            }
         }
         while let Some(pending) = &mut self.cube_pending {
             let next = std::iter::from_fn(|| pending.order.pop_front())
@@ -947,24 +958,74 @@ impl Renderer {
             }
         }
         let Some(pending) = &mut self.cube_pending else {
+            self.cube_overlap.frame();
             return;
         };
-        let step = pending.swap.step();
+        let mut step = pending.swap.step();
+        // `HORIZON_FAR_CROSSFADE=1`: the old cross-fade, to measure it (the overlap
+        // counter): a replaced node fades out under what replaces it fading in.
+        if cross_fade() {
+            let drop = std::mem::take(&mut step.drop);
+            for key in drop {
+                if self.lod_cubes.get(&key).is_some_and(|t| t.shown.is_some()) {
+                    step.fade.push(key);
+                } else {
+                    step.drop.push(key);
+                }
+            }
+            step.fade_in.append(&mut step.show);
+        }
+        // Replaced, a fade cut short, or never shown: gone this frame.
+        for key in step.drop {
+            self.remove_cube_lod(key);
+        }
+        // Nothing drawn over their place: they fade out alone.
         for key in step.fade {
             let Some(tile) = self.lod_cubes.get_mut(&key) else {
                 continue;
             };
             if tile.shown.is_none() {
-                // Never drawn: nothing to fade.
                 self.remove_cube_lod(key);
             } else if tile.dying.is_none() {
                 tile.dying = Some(start);
+                tile.alone = true;
             }
         }
+        // In place of the nodes dropped above: whole at once, no cross-fade
+        // over them (two surfaces over the same ground fight for its pixels).
+        let whole = start.checked_sub(FADE).unwrap_or(start);
         for key in step.show {
             if let Some(tile) = self.lod_cubes.get_mut(&key) {
-                tile.shown.get_or_insert(start);
+                tile.shown = Some(whole);
             }
+            self.track_cube(key);
+        }
+        // Over nothing drawn: they fade in.
+        for key in step.fade_in {
+            if let Some(tile) = self.lod_cubes.get_mut(&key) {
+                tile.shown = Some(start);
+            }
+            self.track_cube(key);
+        }
+        self.cube_overlap.frame();
+    }
+
+    /// Notes whether cube node `key` draws now, for the overlap counter.
+    fn track_cube(&mut self, key: CubeKey) {
+        let drawn = self
+            .lod_cubes
+            .get(&key)
+            .is_some_and(|tile| tile.shown.is_some());
+        self.cube_overlap.set(key, drawn);
+    }
+
+    /// The far nodes drawn over one another (`lod::swap::Overlaps`), on the
+    /// CPU and GPU paths together: 0 every frame when the swaps hold.
+    pub fn cube_overlap_stats(&self) -> crate::lod::swap::OverlapStats {
+        let cpu = self.cube_overlap.stats();
+        match &self.cube_far {
+            Some(far) => cpu.plus(far.overlap_stats()),
+            None => cpu,
         }
     }
 
@@ -1558,4 +1619,11 @@ mod tests {
             &current,
         ));
     }
+}
+
+/// Whether `HORIZON_FAR_CROSSFADE=1` asks for the old cross-fade of replaced far nodes (a debug switch: it
+/// draws two far surfaces over the same ground while they fade, the z-fighting the single-cut swap removed).
+fn cross_fade() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HORIZON_FAR_CROSSFADE").is_ok_and(|v| v == "1"))
 }

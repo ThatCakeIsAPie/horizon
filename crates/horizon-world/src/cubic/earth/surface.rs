@@ -79,7 +79,7 @@ pub const SNOW_DEPTH: i64 = 2;
 pub const RULES: u32 = 2;
 /// The version of the land-cover surface rule and of the biome table ([`super::biome`]): it goes up when what a
 /// column with a known class is made of changes. It is in the terrain key only while land cover is on.
-pub const LAND_RULES: u32 = 9;
+pub const LAND_RULES: u32 = 10;
 /// With land cover, the lowest elevation (m) where the latitude snow line still turns a column that is not
 /// snow or ice on the map white. A map made from one summer's imagery misses seasonal snow on high peaks (Everest
 /// stays white), but the line falls to sea level at the poles, where lowland the map calls bare or moss is not

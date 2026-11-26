@@ -21,7 +21,7 @@ use super::refine::Pass;
 use super::*;
 use crate::lod::cube::{FluidTops, NO_FLUID_TOP, VOLUME};
 use horizon_world::cubic::earth::far_trees::FarDecor;
-use horizon_world::cubic::earth::{EarthGenerator, Fill, NotReady};
+use horizon_world::cubic::earth::{EarthGenerator, Fill, NotReady, SurfaceKind};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// What the Earth far view has done so far: classifications that pruned air, called rock or left a node mixed;
@@ -150,7 +150,8 @@ fn cover_of(key: CubeKey, surfaces: &[i32]) -> Option<Box<CoverMask>> {
     let look = EarthGenerator::voxel_floor(top.saturating_add(COVER_LOOKS[0]), step);
     let mut mask = Box::new([0u64; 4]);
     for (i, &s) in surfaces.iter().enumerate() {
-        if s >= look {
+        // The lowest top the far view draws for it (land rounds down within half a voxel).
+        if EarthGenerator::far_surface(s, step, SurfaceKind::Grass) >= look {
             mask[i >> 6] |= 1 << (i & 63);
         }
     }

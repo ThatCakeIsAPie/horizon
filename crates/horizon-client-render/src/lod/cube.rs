@@ -6648,17 +6648,17 @@ mod tests {
                 }
                 let step = swap.step();
                 let mut cover: FxHashSet<CubeKey> = shown.clone();
-                for k in &step.fade {
+                for k in step.fade.iter().chain(&step.drop) {
                     cover.remove(k);
                 }
-                cover.extend(step.show.iter().copied());
+                cover.extend(step.show.iter().chain(&step.fade_in).copied());
                 // Empty nodes handed out draw nothing and need nothing.
                 cover.extend(lod.empty.iter().copied());
                 // A node fades only with every planned node over its place
                 // drawn over (or empty); what the plan left out of range
                 // (far behind) needs nothing.
                 let planned: FxHashSet<CubeKey> = plan.iter().copied().collect();
-                for k in step.fade.iter().filter(|k| shown.contains(k)) {
+                for k in (step.fade.iter().chain(&step.drop)).filter(|k| shown.contains(k)) {
                     let over: Vec<CubeKey> = (planned.iter().copied())
                         .filter(|p| {
                             (p.level <= k.level && ancestor(*p, k.level) == *k)
@@ -6672,10 +6672,11 @@ mod tests {
                         );
                     }
                 }
-                for k in step.fade {
-                    shown.remove(&k);
+                for k in step.fade.iter().chain(&step.drop) {
+                    shown.remove(k);
                 }
                 shown.extend(step.show);
+                shown.extend(step.fade_in);
                 // One drawn node on every root-to-leaf path.
                 for &k in &shown {
                     let mut up = k;

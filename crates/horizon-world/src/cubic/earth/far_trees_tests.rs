@@ -208,7 +208,8 @@ fn node_tops(w: &World, level: u32, x: i32, z: i32, decor: FarDecor) -> Vec<Vec<
     let step = 1i32 << level;
     (0..256)
         .map(|i| {
-            let first = EarthGenerator::voxel_floor(cols.surfaces[i], step);
+            let top = EarthGenerator::far_surface(cols.surfaces[i], step, cols.kind(i));
+            let first = EarthGenerator::voxel_floor(top, step);
             (0..40)
                 .map(|v| w.g.far_voxel(&cols, i, first + v * step))
                 .collect()

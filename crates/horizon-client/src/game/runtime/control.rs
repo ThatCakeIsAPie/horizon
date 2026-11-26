@@ -1820,6 +1820,18 @@ impl Game<'_> {
                     },
                 })
             });
+        // Far nodes drawn over one another (one holding the other): the single-cut
+        // rule says never, so `now` and `max` stay 0 (lod::swap::Overlaps).
+        if let (Some(r), true) = (self.renderer.as_ref(), status["cube_lod"].is_object()) {
+            let o = r.cube_overlap_stats();
+            status["cube_lod"]["overlap"] = json!({
+                "now": o.now,
+                "max": o.max,
+                "frames": o.frames,
+                "frames_over": o.frames_over,
+                "drawn": o.drawn,
+            });
+        }
         status["pending_uploads"] = self.pending_uploads.len().into();
         // Near terrain in flight: generating, lighting or waiting for its meshes
         // (`Streaming::terrain_loading`; tools/cubic_far_bench.py's near fill).

@@ -207,6 +207,27 @@ impl WorldCoverFile {
     }
 }
 
+impl WorldCoverFile {
+    /// Where inside its pixel the point lies, `(0..1, 0..1)` from the pixel's north-west corner (east and south
+    /// are positive), for a level `width` by `height`. A point past the file's edge, where [`WorldCoverFile::pixel`]
+    /// takes the nearest pixel, gets the fraction it would have had (wrapped into the pixel); never NaN.
+    pub fn pixel_fraction(self, lat: f64, lon: f64, width: u32, height: u32) -> (f64, f64) {
+        let step = f64::from(FILE_DEGREES);
+        let east = crate::projection::wrap_longitude(lon - f64::from(self.west));
+        let x = east / step * f64::from(width);
+        let y = (self.north() - lat) / step * f64::from(height);
+        let fraction = |v: f64| {
+            let f = v - v.floor();
+            if f.is_finite() {
+                f.clamp(0.0, 1.0 - f64::EPSILON)
+            } else {
+                0.0
+            }
+        };
+        (fraction(x), fraction(y))
+    }
+}
+
 impl fmt::Display for WorldCoverFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.tile_name())
@@ -290,12 +311,18 @@ pub fn unbuild(pixels: &mut [u8], width: usize, height: usize) {
         }
     }
     let fallback = most(&tile_counts).unwrap_or(LandClass::Grass.code());
-    // `seen[i]`: the town (counted from 1) that last reached pixel i, so each ring is walked once.
+    // Every town reads the land as the tile was decoded, so what one town became is never counted by another
+    // and the order the towns are met in changes nothing.
+    let original = pixels.to_vec();
+    // `done[i]`: pixel i belongs to a town already given its class. `seen[i]`: the town (counted from 1) whose
+    // patch or ring last reached pixel i, so each ring is walked once. They are not the same thing: a ring runs
+    // over other towns' built-up pixels, which still have to be the start of a town of their own.
+    let mut done = vec![false; n];
     let mut seen = vec![0_u32; n];
     let mut town = 0_u32;
     let (mut patch, mut ring, mut next) = (Vec::new(), Vec::new(), Vec::new());
     for start in 0..n {
-        if pixels[start] != built || seen[start] != 0 {
+        if original[start] != built || done[start] {
             continue;
         }
         town += 1;
@@ -303,10 +330,12 @@ pub fn unbuild(pixels: &mut [u8], width: usize, height: usize) {
         patch.clear();
         patch.push(start);
         seen[start] = town;
+        done[start] = true;
         let mut k = 0;
         while k < patch.len() {
             neighbours(patch[k], &mut |j| {
-                if pixels[j] == built && seen[j] != town {
+                if original[j] == built && !done[j] {
+                    done[j] = true;
                     seen[j] = town;
                     patch.push(j);
                 }
@@ -323,7 +352,7 @@ pub fn unbuild(pixels: &mut [u8], width: usize, height: usize) {
                 neighbours(i, &mut |j| {
                     if seen[j] != town {
                         seen[j] = town;
-                        let code = pixels[j];
+                        let code = original[j];
                         if natural(code) {
                             counts[usize::from(code)] += 1;
                         }
@@ -341,6 +370,112 @@ pub fn unbuild(pixels: &mut [u8], width: usize, height: usize) {
             pixels[i] = class;
         }
     }
+}
+
+/// The most pixels of one class that [`soften_specks`] treats as a speck.
+pub const SPECK_MAX_PIXELS: usize = 2;
+/// The share of a speck's ground that keeps the speck's own class (the rest reads as the land around it), so a
+/// lone rock pixel in grass is some scattered rocks, not a solid slab one pixel wide.
+pub const SPECK_KEEP: f64 = 0.3;
+/// A speck pixel's ground is cut into this many cells each way, each one kept or not by a hash of the cell
+/// ([`SPECK_KEEP`]).
+pub const SPECK_GRID: u32 = 8;
+
+/// Gives specks the class of what surrounds them: each 8-connected component of at most [`SPECK_MAX_PIXELS`]
+/// pixels of one class (not water or no data, not touching the tile's edge, where the component may go on in
+/// the next tile) that is held by one class (more than half of the pixels around the component are of it, and
+/// it is not water or no data) takes that class. Returns `(pixel index, original code)` of each pixel changed,
+/// sorted by index, so a reader can bring the speck back in part ([`SPECK_KEEP`]).
+pub fn soften_specks(pixels: &mut [u8], width: usize, height: usize) -> Vec<(u32, u8)> {
+    let n = width.saturating_mul(height).min(pixels.len());
+    let mut out = Vec::new();
+    if width < 3 || height < 3 {
+        return out;
+    }
+    let pixels = &mut pixels[..n];
+    let solid = |code: u8| {
+        LandClass::from_code(code)
+            .is_some_and(|c| !matches!(c, LandClass::NoData | LandClass::Water))
+    };
+    let mut visited = vec![false; n];
+    let mut component: Vec<usize> = Vec::new();
+    let mut changes: Vec<(usize, u8)> = Vec::new();
+    let mut ring: Vec<usize> = Vec::new();
+    for start in 0..n {
+        if visited[start] {
+            continue;
+        }
+        let code = pixels[start];
+        visited[start] = true;
+        if !solid(code) {
+            continue;
+        }
+        component.clear();
+        component.push(start);
+        let mut k = 0;
+        let mut touches_edge = false;
+        let mut big = false;
+        while k < component.len() {
+            let i = component[k];
+            let (x, y) = (i % width, i / width);
+            touches_edge |= x == 0 || y == 0 || x + 1 == width || y + 1 == height;
+            for dy in -1_isize..=1 {
+                for dx in -1_isize..=1 {
+                    let (nx, ny) = (x as isize + dx, y as isize + dy);
+                    if (dx == 0 && dy == 0)
+                        || nx < 0
+                        || ny < 0
+                        || nx as usize >= width
+                        || ny as usize >= height
+                    {
+                        continue;
+                    }
+                    let j = ny as usize * width + nx as usize;
+                    if !visited[j] && pixels[j] == code {
+                        visited[j] = true;
+                        component.push(j);
+                    }
+                }
+            }
+            k += 1;
+            big |= component.len() > SPECK_MAX_PIXELS;
+        }
+        if big || touches_edge {
+            continue;
+        }
+        // The pixels around the component, each once.
+        ring.clear();
+        for &i in &component {
+            let (x, y) = (i % width, i / width);
+            for dy in -1_isize..=1 {
+                for dx in -1_isize..=1 {
+                    let j = (y as isize + dy) as usize * width + (x as isize + dx) as usize;
+                    if !component.contains(&j) && !ring.contains(&j) {
+                        ring.push(j);
+                    }
+                }
+            }
+        }
+        let mut counts = [0_usize; 256];
+        for &j in &ring {
+            counts[usize::from(pixels[j])] += 1;
+        }
+        let Some((best, count)) = (0..256_usize)
+            .map(|c| (c as u8, counts[c]))
+            .max_by_key(|&(c, count)| (count, std::cmp::Reverse(c)))
+        else {
+            continue;
+        };
+        if solid(best) && 2 * count > ring.len() {
+            changes.extend(component.iter().map(|&i| (i, best)));
+        }
+    }
+    for (i, best) in changes {
+        out.push((i as u32, pixels[i]));
+        pixels[i] = best;
+    }
+    out.sort_unstable();
+    out
 }
 
 #[cfg(test)]
@@ -593,5 +728,145 @@ mod tests {
         unbuild(&mut p, w, h);
         let (want, _, _) = tile(&["WGG", "GGW"]);
         assert_eq!(p, want);
+    }
+
+    #[test]
+    fn every_town_is_given_back_even_when_towns_are_within_each_others_rings() {
+        // Two towns ten pixels apart, so each is inside the other's ring: the north one in bare land, the south
+        // one in grass, the border between them 5 pixels from each.
+        let (w, h) = (20, 100);
+        let mut rows = vec![String::new(); h];
+        for (y, row) in rows.iter_mut().enumerate() {
+            *row = if y < 60 { "B" } else { "G" }.repeat(w);
+        }
+        rows[55].replace_range(10..11, "U");
+        rows[65].replace_range(10..11, "U");
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let (mut p, w, h) = tile(&rows);
+        unbuild(&mut p, w, h);
+        assert!(!p.contains(&LandClass::BuiltUp.code()));
+        assert_eq!(p[55 * w + 10], LandClass::Bare.code());
+        assert_eq!(p[65 * w + 10], LandClass::Grass.code());
+        // The order the towns are met in does not change what each becomes.
+        let (mut flipped, w, h) = tile(&rows);
+        let mut rows_rev = flipped.chunks(w).map(<[u8]>::to_vec).collect::<Vec<_>>();
+        rows_rev.reverse();
+        flipped = rows_rev.concat();
+        unbuild(&mut flipped, w, h);
+        assert_eq!(flipped[44 * w + 10], LandClass::Bare.code());
+        assert_eq!(flipped[34 * w + 10], LandClass::Grass.code());
+    }
+
+    #[test]
+    fn a_round_town_becomes_one_class_with_no_built_up_left() {
+        let (w, h) = (60, 60);
+        let mut rows = vec![vec!['G'; w]; h];
+        for (y, row) in rows.iter_mut().enumerate() {
+            for (x, c) in row.iter_mut().enumerate() {
+                let (dx, dy) = (x as f64 - 30.0, y as f64 - 30.0);
+                if dx * dx + dy * dy <= 8.0 * 8.0 {
+                    *c = 'U';
+                } else if dx * dx + dy * dy <= 12.0 * 12.0 && x % 2 == 0 {
+                    *c = 'T';
+                }
+            }
+        }
+        let rows: Vec<String> = rows.iter().map(|r| r.iter().collect()).collect();
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let (mut p, w, h) = tile(&rows);
+        let before = p
+            .iter()
+            .filter(|&&c| c == LandClass::BuiltUp.code())
+            .count();
+        assert!(before > 150);
+        unbuild(&mut p, w, h);
+        assert!(!p.contains(&LandClass::BuiltUp.code()));
+        // Every pixel of the disc is the one class.
+        let class = p[30 * w + 30];
+        for y in 0..h {
+            for x in 0..w {
+                let (dx, dy) = (x as f64 - 30.0, y as f64 - 30.0);
+                if dx * dx + dy * dy <= 8.0 * 8.0 {
+                    assert_eq!(p[y * w + x], class, "{x},{y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn specks_take_the_class_around_them_and_remember_their_own() {
+        let (mut p, w, h) = tile(&[
+            "GGGGGGGGGG",
+            "GGGGGGGGGG",
+            "GGGBGGGGGG",
+            "GGGGGGBBGG",
+            "GGGGGGGGGG",
+            "GGTTTGGGGG",
+            "GGTTTGGGGG",
+            "GGTTTGGGGG",
+            "GGGGGGGGGG",
+            "GGGGGGGGGG",
+        ]);
+        let at = |x: usize, y: usize| (y * w + x) as u32;
+        let specks = soften_specks(&mut p, w, h);
+        let grass = LandClass::Grass.code();
+        // The single bare pixel and the pair are grass now; the 3 by 3 trees stay.
+        assert_eq!(p[at(3, 2) as usize], grass);
+        assert_eq!(p[at(6, 3) as usize], grass);
+        assert_eq!(p[at(7, 3) as usize], grass);
+        assert_eq!(p[at(3, 6) as usize], LandClass::Tree.code());
+        let bare = LandClass::Bare.code();
+        assert_eq!(
+            specks,
+            vec![(at(3, 2), bare), (at(6, 3), bare), (at(7, 3), bare)]
+        );
+    }
+
+    #[test]
+    fn specks_are_left_alone_by_water_edges_and_busy_neighbourhoods() {
+        // A bare pixel in water, one at the tile's edge, one of a class beside many classes, and water.
+        let (mut p, w, h) = tile(&[
+            "BGGGGGGGGG",
+            "GGGGGGGGGG",
+            "GGWWWGGGGG",
+            "GGWBWGGGGG",
+            "GGWWWGGGGG",
+            "GGGGGGGGGG",
+            "GGGGTGBGGG",
+            "GGGGGGGGGG",
+            "GGGGGGGGGW",
+            "GGGGGGGGGG",
+        ]);
+        let before = p.clone();
+        let specks = soften_specks(&mut p, w, h);
+        // The pixel in the water and the one at the edge stay; the lone water pixel is not a speck.
+        assert_eq!(p[0], LandClass::Bare.code());
+        assert_eq!(p[3 * w + 3], LandClass::Bare.code());
+        assert_eq!(p[8 * w + 9], LandClass::Water.code());
+        // The tree and the rock in the grass are specks.
+        assert_eq!(specks.len(), 2);
+        assert_ne!(p, before);
+        // A pixel beside many classes is held by none of them.
+        let (mut q, w, h) = tile(&["GGGGG", "GTTTG", "GGBGG", "GWWWG", "GGGGG"]);
+        assert!(soften_specks(&mut q, w, h).is_empty());
+    }
+
+    #[test]
+    fn the_fraction_is_where_in_the_pixel_the_point_is() {
+        let f = WorldCoverFile::containing(1.0, 1.0).unwrap();
+        // 300 pixels over 3 degrees: 0.01 degree a pixel; the point is a quarter in from the north-west corner.
+        let (fx, fy) = f.pixel_fraction(2.9975, 0.0025, 300, 300);
+        assert!(
+            (fx - 0.25).abs() < 1e-6 && (fy - 0.25).abs() < 1e-6,
+            "{fx} {fy}"
+        );
+        assert_eq!(f.pixel(2.9975, 0.0025, 300, 300), (0, 0));
+        for (lat, lon) in [(0.0, 0.0), (3.0, 3.0), (-5.0, 99.0), (f64::NAN, 0.0)] {
+            let (fx, fy) = f.pixel_fraction(lat, lon, 300, 300);
+            assert!(
+                (0.0..1.0).contains(&fx) && (0.0..1.0).contains(&fy),
+                "{fx} {fy}"
+            );
+        }
     }
 }

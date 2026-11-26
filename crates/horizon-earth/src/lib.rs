@@ -30,6 +30,8 @@ pub mod height;
 pub mod landcover;
 pub mod landfield;
 pub mod landsource;
+#[cfg(test)]
+mod landwarp_tests;
 pub mod ore_richness;
 pub mod projection;
 pub mod source;
@@ -37,6 +39,7 @@ pub mod source;
 pub mod testing;
 pub mod tiff;
 pub mod tile;
+mod warp;
 pub mod water;
 pub mod waterfile;
 

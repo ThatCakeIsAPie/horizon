@@ -69,7 +69,7 @@ fn the_cache_keys_know_the_dry_rules() {
     settings.climate = true;
     let key = settings.terrain_key();
     assert!(key.contains("#landcover"), "{key}");
-    assert_eq!(surface::LAND_RULES, 9);
+    assert_eq!(surface::LAND_RULES, 10);
     assert_eq!(biome::CLIMATE_BIOME_RULES, 4);
     assert_eq!(vegetation::VEGETATION_RULES, 2);
     assert!(key.contains(&format!(".{}", surface::LAND_RULES)), "{key}");
@@ -939,7 +939,8 @@ fn grass_and_forest_never_get_dry_patch_blocks_near_or_far() {
             for i in [0, 9, 77, 200, 255] {
                 assert_eq!(cols.kind(i), SurfaceKind::Grass, "class {code} step {step}");
                 let s = cols.surfaces[i];
-                let lo = EarthGenerator::voxel_floor(s, step);
+                let top = EarthGenerator::far_surface(s, step, SurfaceKind::Grass);
+                let lo = EarthGenerator::voxel_floor(top, step);
                 assert_eq!(g.far_voxel(&cols, i, lo), b.grass_block);
             }
         }
@@ -1009,9 +1010,13 @@ fn far_band_colour_depends_on_the_height_alone_and_stays_level_at_every_step() {
             let want = table[band_index(i64::from(lo) + i64::from(step / 2))];
             // Columns whose surfaces lie anywhere in this voxel or up to the rock depth over it (a wall seen from
             // the side): the banded voxel is the same block for each, so a row of voxels is one level band.
-            for s in lo..lo + step + DRY_ROCK_DEPTH as i32 - step {
+            // (A surface in the voxel's lower half is drawn in the voxel under it: `far_surface`.)
+            let first = lo + if step > 2 { step / 2 - 1 } else { 0 };
+            for s in first..lo + step + DRY_ROCK_DEPTH as i32 - step {
                 for kind in kinds {
-                    if s < lo + step && !matches!(kind, SurfaceKind::Banded) {
+                    if EarthGenerator::far_surface(s, step, kind) < lo + step
+                        && !matches!(kind, SurfaceKind::Banded)
+                    {
                         continue;
                     }
                     assert_eq!(
@@ -1031,7 +1036,8 @@ fn far_band_colour_depends_on_the_height_alone_and_stays_level_at_every_step() {
         // The top voxel of a mixed dry top is the mix's main block whichever block the column picked.
         for t in [DryTop::GrassBlock, DryTop::CoarseDirt, DryTop::RedSand] {
             let s = 100;
-            let lo = EarthGenerator::voxel_floor(s, step);
+            let top = EarthGenerator::far_surface(s, step, SurfaceKind::Scrub(t));
+            let lo = EarthGenerator::voxel_floor(top, step);
             assert_eq!(
                 g.voxel_block(lo, step, s, SurfaceKind::Scrub(t)),
                 b.coarse_dirt
@@ -1046,4 +1052,37 @@ fn far_band_colour_depends_on_the_height_alone_and_stays_level_at_every_step() {
         (super::dry::SCRUB_FAR, super::dry::BARREN_FAR),
         (DryTop::CoarseDirt, DryTop::RedSand)
     );
+}
+
+/// The far ground lies within half a voxel of the real one: the voxel holding a land surface is ground only when
+/// the ground fills at least half of it. A voxel drawn whole for a shore a block over the sea stood a whole voxel
+/// tall out of the water (Lyle's floating sand box).
+#[test]
+fn far_land_stands_at_most_half_a_voxel_above_the_ground() {
+    let (rig, g, _dir) = dry_rig(36.0, |_, _| 2100.0, 30, 10.0, 430.0);
+    let b = rig.blocks;
+    for step in [2, 4, 8, 16, 32, 64] {
+        for s in -70..200 {
+            for kind in [SurfaceKind::Grass, SurfaceKind::Dune, SurfaceKind::Gravel] {
+                let top = EarthGenerator::far_surface(s, step, kind);
+                let lo = EarthGenerator::voxel_floor(top, step);
+                // The voxel drawn as the top is the surface block; the one over it is air.
+                assert_eq!(
+                    g.voxel_block(lo, step, s, kind),
+                    g.block_for(s, s, kind),
+                    "{kind:?} s {s} step {step}"
+                );
+                assert_eq!(g.voxel_block(lo + step, step, s, kind), b.air);
+                // Its top face is within half a voxel of the real top face (s + 1).
+                let face = lo + step;
+                assert!(
+                    (face - (s + 1)).abs() <= step / 2,
+                    "{kind:?} s {s} step {step}: face {face}"
+                );
+            }
+            // Water keeps its level: the far water is the near water's top.
+            let (top, sea) = SurfaceKind::sea_column(s.min(60), 63);
+            assert_eq!(EarthGenerator::far_surface(top, step, sea), top);
+        }
+    }
 }

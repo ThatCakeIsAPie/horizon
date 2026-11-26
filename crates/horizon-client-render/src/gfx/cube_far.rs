@@ -36,7 +36,7 @@ use crate::{
     fast_hash::FxHashMap,
     lod::{
         cube::{CubeKey, GpuContent, GpuNode},
-        swap::Swap,
+        swap::{OverlapStats, Overlaps, Swap},
     },
 };
 use glam::{DVec3, Vec4};
@@ -151,6 +151,8 @@ pub struct CubeFar {
     order: VecDeque<CubeKey>,
     /// Which nodes show and fade, and when: pending and meshing ones wait.
     swap: Swap,
+    /// The nodes drawn, and how many pairs of them overlap (`lod::swap`).
+    overlaps: Overlaps,
     /// The batch in the mesher belongs to a forgotten plan (`clear`).
     discard: bool,
     epoch: Instant,
@@ -399,6 +401,7 @@ impl CubeFar {
             pending: FxHashMap::default(),
             order: VecDeque::new(),
             swap: Swap::default(),
+            overlaps: Overlaps::default(),
             discard: false,
             epoch: Instant::now(),
             stats: FarStats::default(),
@@ -559,6 +562,21 @@ impl CubeFar {
         if self.pending.contains_key(&key) {
             self.swap.queued(key);
         }
+        self.track(key);
+    }
+
+    /// Notes whether `key` draws now, for the overlap counter.
+    fn track(&mut self, key: CubeKey) {
+        let drawn = self
+            .nodes
+            .get(&key)
+            .is_some_and(|held| held.id.is_some() && held.shown.is_some());
+        self.overlaps.set(key, drawn);
+    }
+
+    /// The overlap counter: pairs of drawn nodes one holding the other.
+    pub fn overlap_stats(&self) -> OverlapStats {
+        self.overlaps.stats()
     }
 
     fn drop_held(&mut self, held: &Held) {
@@ -573,6 +591,7 @@ impl CubeFar {
         if let Some(held) = self.nodes.remove(&key) {
             self.drop_held(&held);
         }
+        self.overlaps.set(key, false);
     }
 
     /// A uniform node needs no GPU work: air and fluid draw nothing, rock its
@@ -633,6 +652,7 @@ impl CubeFar {
             .collect();
         for key in faded {
             self.remove(key);
+            self.swap.forget(key);
         }
         if let Some(meshed) = self.mesher.poll() {
             for Meshed {
@@ -697,10 +717,12 @@ impl CubeFar {
             }
         }
         let step = self.swap.step();
-        if step.show.is_empty() && step.fade.is_empty() {
-            return;
-        }
         let now = self.now_ms();
+        // Replaced, a fade cut short, or never shown: gone this frame.
+        for key in step.drop {
+            self.remove(key);
+        }
+        // Nothing drawn over their place: they fade out alone.
         for key in step.fade {
             let Some(held) = self.nodes.get_mut(&key) else {
                 continue;
@@ -712,20 +734,28 @@ impl CubeFar {
                 Some(id) if held.shown.is_some() => {
                     held.dying = Some(now);
                     self.word(id, 5, now);
+                    // Live and alone (cube_cull.wgsl): it fades out.
+                    self.word(id, 6, 3);
                 }
                 // Nothing drawn, or never shown: nothing to fade.
                 _ => self.remove(key),
             }
         }
-        for key in step.show {
+        // In place of the nodes dropped above: whole at once, no cross-fade
+        // over them. Over nothing drawn: they fade in.
+        let whole = now.saturating_sub(FADE_MS);
+        let shows = step.show.iter().map(|&k| (k, whole));
+        for (key, since) in shows.chain(step.fade_in.iter().map(|&k| (k, now))) {
             let Some(held) = self.nodes.get_mut(&key) else {
                 continue;
             };
-            held.shown = Some(now);
+            held.shown = Some(since);
             if let Some(id) = held.id {
-                self.word(id, 4, now);
+                self.word(id, 4, since);
             }
+            self.track(key);
         }
+        self.overlaps.frame();
     }
 
     /// Whether `key` is meshed and in the table (drawn or known empty).
