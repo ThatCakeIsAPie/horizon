@@ -6,6 +6,14 @@
 //! ([`LateContent`]), and this hands out the coarse ones nearest the camera and in view first, a few at a
 //! time, so they go behind all other far work. A node made again is made whole (with its trees) and replaces
 //! the coarse one in place. Only whole nodes are kept in the far cache, so a revisit draws them refined at once.
+//!
+//! Coarse first is only for where nothing is drawn: the distance is never empty, so a hole (and the coverage
+//! nodes over it, or every node in a big fill, a join or a teleport) is made coarse at once. Anywhere else the
+//! node being made replaces something that is drawn and stays drawn until the new node is ready, so it is
+//! made whole at once: no blank frame, and one build instead of a coarse one and a whole one. The producer
+//! tells which nodes must come coarse first ([`LateContent::coarse_first`]); until it has, everything does.
+//! A node the producer is about to split into its children is not made whole now ([`LateContent::not_now`]):
+//! it goes back among the coarse ones, and is not handed out again for a short while.
 
 use crate::lod::cube::{CubeKey, LateContent, Look, job_score};
 use std::collections::{HashMap, HashSet};
@@ -16,6 +24,11 @@ use std::time::{Duration, Instant};
 const BATCH: usize = 48;
 /// A node handed out but not made in this long was not made again (the plan dropped it): forgotten.
 const HANDED_FOR: Duration = Duration::from_secs(30);
+/// A node given back ([`LateContent::not_now`]) is not handed out again for this long. Without it the
+/// producer, which splits the node a moment later, would be asked for it again at once and give it back
+/// again: a loop that fills every batch with the same nodes and starves the others. After it, if the node is
+/// still drawn (it did not split), it is made whole as any other.
+const DEFER_FOR: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 struct State {
@@ -25,15 +38,43 @@ struct State {
     handed: HashMap<CubeKey, Instant>,
     /// Made whole: made whole straight away when asked for again.
     whole: HashSet<CubeKey>,
+    /// Given back by the producer (it is about to split them) and when: not handed out for [`DEFER_FOR`].
+    deferred: HashMap<CubeKey, Instant>,
+    /// Nodes that must be made coarse first (nothing is drawn over their place), as the producer said.
+    urgent: HashSet<CubeKey>,
+    /// Every node must be made coarse first (a big fill, a join, a teleport, the coverage phase).
+    all: bool,
+    /// The producer has told [`State::urgent`] and [`State::all`] at least once; until then every node is
+    /// made coarse first (nothing is known of what is drawn).
+    heard: bool,
     camera: [f64; 3],
     forward: [f64; 3],
     max_distance: f64,
 }
 
 /// The coarse nodes and the order they are refined in, shared by every fork of the sampler.
-#[derive(Default)]
 pub struct Refine {
     state: Mutex<State>,
+    /// Make a node whole at once where something is drawn over its place ([`Refine::pass`]).
+    whole_when_covered: bool,
+}
+
+/// Whether [`Refine::pass`] makes nodes whole at once where something is drawn over their place
+/// (`HORIZON_FAR_WHOLE_WHEN_COVERED`). Off: measured on a 60 s forest walk (6 workers) it cut the far jobs
+/// from 28.5k to 20.4k but each whole build costs more, so the workers stayed as busy, the far view fell
+/// 3.7k nodes behind the walk (219 with it off) and the first fill took 220 s instead of 109 s.
+pub const WHOLE_WHEN_COVERED: u64 = 0;
+
+impl Default for Refine {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            whole_when_covered: crate::lod::cube::far_knob(
+                "HORIZON_FAR_WHOLE_WHEN_COVERED",
+                WHOLE_WHEN_COVERED,
+            ) != 0,
+        }
+    }
 }
 
 /// How node `key` should be made now.
@@ -44,10 +85,21 @@ pub enum Pass {
 }
 
 impl Refine {
-    /// Whether node `key` is made coarse (first) or whole (it was handed out, or was made whole before).
+    /// Whether node `key` is made coarse (first) or whole: whole when it was handed out, was made whole
+    /// before, or something is drawn over its place already.
+    ///
+    /// Distance is never empty, so where there is a hole a node comes coarse first (the producer lists those:
+    /// `urgent`, or everything with `all`). Elsewhere a drawn piece is swapped only when its replacement is
+    /// ready, so the node being made now replaces one that stays drawn until it is done: making it whole at
+    /// once costs no blank frame and saves the second build. (`HORIZON_FAR_WHOLE_WHEN_COVERED`, default off,
+    /// see [`WHOLE_WHEN_COVERED`]; off: coarse first always, as before.) Before the producer has said
+    /// anything, nothing is known to be drawn, so it is coarse.
     pub fn pass(&self, key: CubeKey) -> Pass {
         let s = self.state.lock().unwrap();
         if s.handed.contains_key(&key) || s.whole.contains(&key) {
+            return Pass::Whole;
+        }
+        if self.whole_when_covered && s.heard && !s.all && !s.urgent.contains(&key) {
             Pass::Whole
         } else {
             Pass::Coarse
@@ -57,15 +109,25 @@ impl Refine {
     /// Node `key` was made: coarse (`whole` false, to be refined), or whole. `made` false when a whole build
     /// could not be made yet (data missing): it goes back to the coarse ones and is handed out again.
     pub fn made(&self, key: CubeKey, whole: bool, made: bool) {
+        use crate::lod::cube::profile;
+        use std::sync::atomic::Ordering::Relaxed;
         let mut s = self.state.lock().unwrap();
         match (whole, made) {
             (false, true) => {
                 s.coarse.insert(key);
+                profile::R_COARSE.fetch_add(1, Relaxed);
             }
             (true, true) => {
-                s.handed.remove(&key);
+                let refresh = s.handed.remove(&key).is_some();
                 s.coarse.remove(&key);
+                s.deferred.remove(&key);
                 s.whole.insert(key);
+                let counter = if refresh {
+                    &profile::R_WHOLE_REFRESH
+                } else {
+                    &profile::R_WHOLE_DIRECT
+                };
+                counter.fetch_add(1, Relaxed);
             }
             (true, false) => {
                 if s.handed.remove(&key).is_some() {
@@ -81,6 +143,19 @@ impl Refine {
     pub fn counts(&self) -> (usize, usize) {
         let s = self.state.lock().unwrap();
         (s.coarse.len(), s.handed.len())
+    }
+
+    /// Boxes the producer gave back ([`LateContent::not_now`]): the handed-out nodes among them go back to the
+    /// coarse ones, deferred from `now`.
+    fn defer(s: &mut State, boxes: &[([i32; 3], [i32; 3])], now: Instant) {
+        for (min, max) in boxes {
+            if let Some(key) = CubeKey::of_box(*min, *max)
+                && s.handed.remove(&key).is_some()
+            {
+                s.coarse.insert(key);
+                s.deferred.insert(key, now);
+            }
+        }
     }
 
     /// The next coarse nodes to refine: by the far view's work order (the crosshair first, then the near).
@@ -99,6 +174,9 @@ impl Refine {
             });
         }
         let room = BATCH.saturating_sub(s.handed.len());
+        // Nodes given back a moment ago are skipped (see `DEFER_FOR`).
+        s.deferred
+            .retain(|_, at| now.duration_since(*at) < DEFER_FOR);
         if room == 0 || s.coarse.is_empty() {
             return Vec::new();
         }
@@ -108,7 +186,15 @@ impl Refine {
             ..Look::default()
         };
         let score = |key: &CubeKey| -job_score(camera, look, *key);
-        let mut keys: Vec<(f64, CubeKey)> = s.coarse.iter().map(|k| (score(k), *k)).collect();
+        let mut keys: Vec<(f64, CubeKey)> = s
+            .coarse
+            .iter()
+            .filter(|k| !s.deferred.contains_key(k))
+            .map(|k| (score(k), *k))
+            .collect();
+        if keys.is_empty() {
+            return Vec::new();
+        }
         let room = room.min(keys.len());
         keys.select_nth_unstable_by(room - 1, |a, b| a.0.total_cmp(&b.0));
         keys.truncate(room);
@@ -141,6 +227,30 @@ impl LateContent for Refine {
                 s.handed.remove(&key);
             }
         }
+    }
+
+    fn exact(&self) -> bool {
+        true
+    }
+
+    fn wants_coarse_first(&self) -> bool {
+        self.whole_when_covered
+    }
+
+    /// Nodes with nothing drawn over their place (or every node: `all`) are made coarse first, the rest whole
+    /// at once (see [`Refine::pass`]).
+    fn coarse_first(&self, keys: &[CubeKey], all: bool) {
+        let mut s = self.state.lock().unwrap();
+        s.urgent = keys.iter().copied().collect();
+        s.all = all;
+        s.heard = true;
+    }
+
+    /// Handed-out nodes the producer is about to split: not made now, back among the coarse ones, and not
+    /// handed out again for [`DEFER_FOR`] (they are made whole then if they are still drawn).
+    fn not_now(&self, boxes: &[([i32; 3], [i32; 3])]) {
+        let mut s = self.state.lock().unwrap();
+        Self::defer(&mut s, boxes, Instant::now());
     }
 
     fn take_refreshes(&self) -> Vec<([i32; 3], [i32; 3])> {
@@ -227,5 +337,141 @@ mod tests {
         // A box that is no node's extent changes nothing.
         refine.not_drawn(&[([1, 0, 0], [64, 63, 63])]);
         assert_eq!(refine.counts().1, BATCH);
+    }
+
+    fn view(refine: &Refine) {
+        refine.view([0.0, 32.0, 32.0], [1.0, 0.0, 0.0], 1e5, true);
+    }
+
+    #[test]
+    fn whole_when_covered_is_off_by_default_so_every_node_comes_coarse_first() {
+        assert_eq!(WHOLE_WHEN_COVERED, 0);
+        let refine = Refine {
+            whole_when_covered: false,
+            ..Refine::default()
+        };
+        assert!(!refine.wants_coarse_first());
+        let (hole, other) = (CubeKey::new(2, 0, 0, 0), CubeKey::new(2, 1, 0, 0));
+        refine.coarse_first(&[hole], false);
+        assert_eq!(refine.pass(hole), Pass::Coarse);
+        assert_eq!(
+            refine.pass(other),
+            Pass::Coarse,
+            "coarse first though covered"
+        );
+    }
+
+    #[test]
+    fn nodes_are_coarse_first_only_where_the_producer_says_nothing_is_drawn() {
+        let refine = Refine {
+            whole_when_covered: true,
+            ..Refine::default()
+        };
+        assert!(refine.exact());
+        assert!(refine.wants_coarse_first());
+        let (hole, other, third) = (
+            CubeKey::new(2, 0, 0, 0),
+            CubeKey::new(2, 1, 0, 0),
+            CubeKey::new(3, 5, 0, 0),
+        );
+        // The producer has not said what is drawn: everything comes coarse first.
+        for key in [hole, other, third] {
+            assert_eq!(refine.pass(key), Pass::Coarse);
+        }
+        // Only the hole is bare: the rest replaces what is drawn and is made whole at once.
+        refine.coarse_first(&[hole], false);
+        assert_eq!(refine.pass(hole), Pass::Coarse);
+        assert_eq!(refine.pass(other), Pass::Whole);
+        assert_eq!(refine.pass(third), Pass::Whole);
+        // A new list replaces the old one.
+        refine.coarse_first(&[other], false);
+        assert_eq!(refine.pass(hole), Pass::Whole);
+        assert_eq!(refine.pass(other), Pass::Coarse);
+        // A big fill: every node coarse first.
+        refine.coarse_first(&[], true);
+        for key in [hole, other, third] {
+            assert_eq!(refine.pass(key), Pass::Coarse);
+        }
+        // Handed-out and made-whole nodes are whole whatever the producer says.
+        refine.made(hole, false, true);
+        view(&refine);
+        assert_eq!(refine.take_refreshes().len(), 1);
+        assert_eq!(refine.pass(hole), Pass::Whole);
+        refine.made(other, true, true);
+        assert_eq!(refine.pass(other), Pass::Whole);
+        refine.coarse_first(&[hole, other, third], false);
+        assert_eq!(refine.pass(hole), Pass::Whole);
+        assert_eq!(refine.pass(other), Pass::Whole);
+        assert_eq!(refine.pass(third), Pass::Coarse);
+    }
+
+    #[test]
+    fn a_node_made_whole_directly_is_never_handed_out_to_be_made_again() {
+        let refine = Refine::default();
+        let (direct, coarse) = (CubeKey::new(2, 3, 0, 0), CubeKey::new(2, 4, 0, 0));
+        refine.coarse_first(&[], false);
+        // Whole straight away, though it was noted coarse earlier (before the producer spoke).
+        refine.made(direct, false, true);
+        refine.made(coarse, false, true);
+        refine.made(direct, true, true);
+        view(&refine);
+        assert_eq!(refine.take_refreshes(), vec![([256, 0, 0], [319, 63, 63])]);
+        assert_eq!(refine.pass(direct), Pass::Whole);
+        // And one never noted coarse is not handed out either.
+        let fresh = CubeKey::new(2, 9, 0, 0);
+        refine.made(fresh, true, true);
+        refine.made(CubeKey::new(2, 10, 0, 0), false, true);
+        assert_eq!(refine.counts(), (1, 1));
+        assert_eq!(
+            refine.take_refreshes(),
+            vec![([640, 0, 0], [703, 63, 63])],
+            "the coarse node, not the whole ones"
+        );
+    }
+
+    #[test]
+    fn a_node_given_back_is_handed_out_again_only_after_the_defer_time() {
+        let refine = Refine::default();
+        let (a, b) = (CubeKey::new(2, 0, 0, 0), CubeKey::new(2, 1, 0, 0));
+        for key in [a, b] {
+            refine.made(key, false, true);
+        }
+        view(&refine);
+        let boxes = refine.take_refreshes();
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(refine.counts(), (0, 2));
+        // Boxes that are no node's extent, and nodes not handed out, change nothing.
+        refine.not_now(&[([1, 0, 0], [64, 63, 63]), ([640, 0, 0], [703, 63, 63])]);
+        assert_eq!(refine.counts(), (0, 2));
+        // `a` is given back: it is coarse again, not handed out; `b` stays handed out.
+        let t0 = Instant::now();
+        {
+            let mut s = refine.state.lock().unwrap();
+            Refine::defer(&mut s, &[boxes[0]], t0);
+            assert_eq!((s.coarse.len(), s.handed.len()), (1, 1));
+            s.handed.clear();
+            assert!(
+                Refine::next(&mut s, t0).is_empty(),
+                "not handed out again at once"
+            );
+            assert!(
+                Refine::next(&mut s, t0 + DEFER_FOR / 2).is_empty(),
+                "nor within the defer time"
+            );
+            let again = Refine::next(&mut s, t0 + DEFER_FOR);
+            assert_eq!(again.len(), 1, "handed out again after it");
+            assert!(s.deferred.is_empty(), "the old entry is dropped");
+        }
+        // The public hook does the same with the clock.
+        let refine = Refine::default();
+        refine.made(a, false, true);
+        view(&refine);
+        let boxes = refine.take_refreshes();
+        refine.not_now(&boxes);
+        assert_eq!(refine.counts(), (1, 0));
+        assert!(refine.take_refreshes().is_empty());
+        // Other nodes are not held back by it.
+        refine.made(b, false, true);
+        assert_eq!(refine.take_refreshes(), vec![([64, 0, 0], [127, 63, 63])]);
     }
 }

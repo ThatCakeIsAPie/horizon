@@ -1767,7 +1767,7 @@ impl Game<'_> {
                 let ago = |t: Option<std::time::Instant>| {
                     t.map(|t| now.saturating_duration_since(t).as_secs_f64())
                 };
-                json!({
+                let mut out = json!({
                     "planned": s.planned,
                     "ready": s.ready,
                     "pending": s.pending,
@@ -1818,7 +1818,51 @@ impl Game<'_> {
                         }
                         _ => None,
                     },
-                })
+                });
+                // The waste counters in a second `json!` (one is past the macro's recursion limit).
+                let waste = json!({
+                    "jobs": s.jobs,
+                    "built": s.built,
+                    "built_uniform": s.built_uniform,
+                    "built_empty": s.built_empty,
+                    "failed_jobs": s.failed_jobs,
+                    "delivered": s.delivered,
+                    "rebuilt": s.rebuilt,
+                    "plan_installs": s.plan_installs,
+                    "plan_added": s.plan_added,
+                    "plan_removed": s.plan_removed,
+                    "plan_reused": s.plan_reused,
+                    "plan_readded": s.plan_readded,
+                    "plan_dropped_unbuilt": s.plan_dropped_unbuilt,
+                    "released": s.released,
+                    "short_lived": s.short_lived,
+                    "short_lived_levels": s.short_lived_levels,
+                    "late_skipped_held": s.late_skipped_held,
+                    "late_dropped": s.late_dropped,
+                    "late_wasted": s.late_wasted,
+                    "late_other": s.late_other,
+                    "retries": s.retries,
+                    "refills": s.refills,
+                    "refill_keys": s.refill_keys,
+                    "replans": s.replans,
+                    "replans_moved": s.replans_moved,
+                    "replans_classes": s.replans_classes,
+                    "replans_refine": s.replans_refine,
+                    "replans_timer": s.replans_timer,
+                    "cache_hits": s.cache_hits,
+                    "cache_misses": s.cache_misses,
+                    "cache_evicted": s.cache_evicted,
+                    "cache_forgotten": s.cache_forgotten,
+                    "cache_cleared": s.cache_cleared,
+                    "cache_nodes": s.cache_nodes,
+                    "cache_bytes": s.cache_bytes,
+                    "deliver_deferred": s.deliver_deferred,
+                    "deliver_frames_capped": s.deliver_frames_capped,
+                });
+                if let (Some(out), Some(waste)) = (out.as_object_mut(), waste.as_object()) {
+                    out.extend(waste.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+                out
             });
         // Far nodes drawn over one another (one holding the other): the single-cut
         // rule says never, so `now` and `max` stay 0 (lod::swap::Overlaps).

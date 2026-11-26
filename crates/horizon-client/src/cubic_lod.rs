@@ -699,8 +699,7 @@ impl Keeper {
         std::thread::Builder::new()
             .name("Cube far keeper".into())
             .spawn(move || {
-                horizon_threads::behind_server();
-                horizon_threads::far_terrain_current();
+                horizon_threads::far_below_main();
                 let kind = |state: BlockStateId| {
                     if state.0 == air {
                         Kind::Air
