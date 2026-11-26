@@ -502,6 +502,9 @@ pub(super) struct Visible {
     /// after theirs (`Renderer::render`'s water tiers), so depth leaves it only
     /// where they have none yet.
     pub old: bool,
+    /// The far tile's solid quads are drawn by the GPU (`far_cull`): the walk lists it for
+    /// its water alone, and draws no solid quads of it.
+    pub gpu_solid: bool,
 }
 
 impl Tile {
@@ -573,6 +576,7 @@ impl Tile {
             origin: origin.as_vec3().to_array(),
             fade,
             old: self.dying.is_some() || self.previous.is_some(),
+            gpu_solid: false,
         })
     }
 }
@@ -745,7 +749,15 @@ impl Renderer {
         shown
     }
 
+    /// The far tile at `key` changed: its GPU record is read again (`far_cull`).
+    fn far_touch(&mut self, key: CubeKey) {
+        if let Some(far) = &mut self.far_cull {
+            far.records.touch(key);
+        }
+    }
+
     fn install_cube_lod(&mut self, key: CubeKey, mesh: &SectionMesh) -> Option<bool> {
+        self.far_touch(key);
         let (old_slot, shown) = match self.lod_cubes.remove(&key) {
             Some(old) => {
                 let kept = (old.cull_slot, old.shown.filter(|_| old.dying.is_none()));
@@ -926,6 +938,7 @@ impl Renderer {
     }
 
     pub fn remove_cube_lod(&mut self, key: CubeKey) {
+        self.far_touch(key);
         if let Some(tile) = self.lod_cubes.remove(&key) {
             self.lod_cull_free.push(tile.cull_slot);
             self.release_tile(tile);
@@ -948,6 +961,9 @@ impl Renderer {
         for (_, tile) in std::mem::take(&mut self.lod_cubes) {
             self.lod_cull_free.push(tile.cull_slot);
             self.release_tile(tile);
+        }
+        if let Some(far) = &mut self.far_cull {
+            far.records.clear();
         }
         self.cube_overlap.clear();
         if self.lods.is_empty() {
@@ -1045,6 +1061,7 @@ impl Renderer {
             } else if tile.dying.is_none() {
                 tile.dying = Some(start);
                 tile.alone = true;
+                self.far_touch(key);
             }
         }
         // In place of the nodes dropped above: whole at once, no cross-fade
@@ -1054,6 +1071,7 @@ impl Renderer {
             if let Some(tile) = self.lod_cubes.get_mut(&key) {
                 tile.shown = Some(whole);
             }
+            self.far_touch(key);
             self.track_cube(key);
         }
         // Over nothing drawn: they fade in.
@@ -1061,6 +1079,7 @@ impl Renderer {
             if let Some(tile) = self.lod_cubes.get_mut(&key) {
                 tile.shown = Some(start);
             }
+            self.far_touch(key);
             self.track_cube(key);
         }
         self.cube_overlap.frame();

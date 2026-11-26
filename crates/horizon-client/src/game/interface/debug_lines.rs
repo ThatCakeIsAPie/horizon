@@ -342,6 +342,24 @@ impl Game<'_> {
                 (s.arena_bytes + s.pool_bytes) >> 20,
             ));
         }
+        // The far tiles drawn by the GPU's culling (`far_cull`).
+        if let Some(f) = self
+            .renderer
+            .as_ref()
+            .map(|r| r.far_cull_status())
+            .filter(|f| f.enabled)
+        {
+            d.line(format!(
+                "Far GPU: {} tiles, {} vis {} occl, {} draws, {:.1}M tris (+CPU {} draws){}",
+                f.tiles,
+                f.gpu_visible,
+                f.gpu_occluded,
+                f.gpu_draws,
+                f.gpu_triangles as f64 / 1e6,
+                f.cpu_draws,
+                if f.gpu_frame { "" } else { " off" },
+            ));
+        }
     }
 
     /// `LevelExtractor.entityStatistics`: the mobs drawn last frame of the

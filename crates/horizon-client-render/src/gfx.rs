@@ -1549,6 +1549,33 @@ impl AnimatedTickCache {
     }
 }
 
+/// What the far tiles' GPU culling did (`Renderer::far_cull_status`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FarCullStatus {
+    /// The device runs it (`far_cull`) and it is not turned off (`HORIZON_FAR_GPU_CULL=0`).
+    pub enabled: bool,
+    /// The last frame drew the whole far tiles' solid quads on the GPU.
+    pub gpu_frame: bool,
+    /// Far cube tiles resident, and records the GPU holds of them.
+    pub tiles: usize,
+    pub records: usize,
+    /// Tiles the CPU still walks (fading, dying, and whole ones with water).
+    pub cpu_listed: usize,
+    /// The newest GPU statistics that came back: records the frustum kept, boxes Hi-Z did
+    /// not see, draws and triangles (both phases).
+    pub gpu_visible: u32,
+    pub gpu_occluded: u32,
+    pub gpu_draws: u32,
+    pub gpu_triangles: u64,
+    /// The CPU's far solid draws and triangles of the last frame.
+    pub cpu_draws: usize,
+    pub cpu_triangles: u64,
+    /// Draw calls the far GPU path made last frame.
+    pub draw_calls: usize,
+    /// Frames since the frame the GPU statistics belong to.
+    pub stats_lag: u64,
+}
+
 pub struct Renderer {
     msaa: msaa::Msaa,
     instance: wgpu::Instance,
@@ -1658,6 +1685,15 @@ pub struct Renderer {
     gpu_culling: Option<gpu_culling::GpuCulling>,
     gpu_culling_offer: crate::graphics::GpuCullingOffer,
     gpu_frame: bool,
+    /// The far tiles of `lod_cubes` culled and drawn on the GPU (`far_cull`), whether the
+    /// last frame did so (`far_gpu_frame`), the newest statistics read back and the
+    /// frame's count they belong to, and the far draws and triangles the CPU made.
+    far_cull: Option<far_cull::FarCull>,
+    far_gpu_frame: bool,
+    far_stats: Option<far_cull::FarGpuStats>,
+    far_phases: usize,
+    far_cpu_draws: usize,
+    far_cpu_triangles: u64,
     /// GPU frames since GPU culling was switched on: the first and every 64th after it
     /// check its records (`check_gpu_records`).
     #[cfg(debug_assertions)]
@@ -4715,6 +4751,19 @@ impl Renderer {
                 }
                 Some(cull)
             });
+        // Earth's far tiles culled and drawn on the GPU (`far_cull`), with the Hi-Z pyramid of
+        // `cull` where it has one.
+        let far_cull = if far_cull::supported(
+            &adapter.get_info(),
+            device.features(),
+            adapter.get_downlevel_capabilities().flags,
+            &device.limits(),
+            multi_draw,
+        ) {
+            far_cull::FarCull::new(&device, cull.as_ref().and_then(|c| c.hiz_read_layout()))
+        } else {
+            None
+        };
         let depth = Self::depth(&device, &config);
         let world_post = world_post::Post::new(&device, frame_format);
         let uploads = upload::Uploads::new(&device);
@@ -4806,6 +4855,12 @@ impl Renderer {
             gpu_culling: None,
             gpu_culling_offer,
             gpu_frame: false,
+            far_cull,
+            far_gpu_frame: false,
+            far_stats: None,
+            far_phases: 0,
+            far_cpu_draws: 0,
+            far_cpu_triangles: 0,
             #[cfg(debug_assertions)]
             gpu_checks: 0,
             cull,
@@ -5221,6 +5276,9 @@ impl Renderer {
         if let Some(gpu) = &mut self.gpu_culling {
             gpu.forget();
         }
+        if let Some(far) = &mut self.far_cull {
+            far.records.forget();
+        }
         if let Some(vis) = &mut self.visbuf {
             vis.forget();
         }
@@ -5493,6 +5551,41 @@ impl Renderer {
     /// Whether the last frame drew them so.
     pub fn gpu_frame(&self) -> bool {
         self.gpu_frame
+    }
+    /// The far tiles' GPU culling (`far_cull`): whether it exists and the last frame used it,
+    /// the tiles and records, what the newest statistics that came back counted, and the CPU's
+    /// far draws of the last frame (on every frame, so a frame without it shows the
+    /// walk's cost).
+    pub fn far_cull_status(&self) -> FarCullStatus {
+        let stats = self.far_stats.unwrap_or_default();
+        let (records, cpu_listed) = self
+            .far_cull
+            .as_ref()
+            .map_or((0, 0), |f| {
+                (
+                    f.records.records(),
+                    f.records.cpu_len() + f.records.water_len(),
+                )
+            });
+        let draw_calls = self
+            .far_cull
+            .as_ref()
+            .map_or(0, |f| f.draw_calls() * self.far_phases);
+        FarCullStatus {
+            enabled: self.far_cull.is_some(),
+            gpu_frame: self.far_gpu_frame,
+            tiles: self.lod_cubes.len(),
+            records,
+            cpu_listed,
+            gpu_visible: stats.visible,
+            gpu_occluded: stats.occluded,
+            gpu_draws: stats.draws[0] + stats.draws[1],
+            gpu_triangles: u64::from(stats.triangles[0]) + u64::from(stats.triangles[1]),
+            cpu_draws: self.far_cpu_draws,
+            cpu_triangles: self.far_cpu_triangles,
+            draw_calls,
+            stats_lag: self.frame_serial.saturating_sub(stats.frame),
+        }
     }
     /// Of the sections GPU culling keeps records of, those it leaves to the CPU
     /// while they fade (`SectionGpu::gpu_fading`); `None` while it is off.
@@ -6102,7 +6195,7 @@ impl Renderer {
         let meshlets = self.mesh_terrain.as_mut().map(|m| &mut m.store);
         let split = self.translucent_arena.is_some();
         let (arena, part) = (&mut self.arena, Part::Section { split });
-        if !off_page::move_off_page_with_meshlets(
+        let moved = off_page::move_off_page_with_meshlets(
             arena,
             encoder,
             flat,
@@ -6112,7 +6205,12 @@ impl Renderer {
             page,
             part,
             &mut budget,
-        ) {
+        );
+        // The far tiles' records name their meshes' pages: read again what sat on this one.
+        if let Some(far) = &mut self.far_cull {
+            far.records.touch_page(page);
+        }
+        if !moved {
             // The other pages have no room after all.
             arena.reopen();
         }
@@ -6378,6 +6476,9 @@ impl Renderer {
         self.ray_clear();
         self.lods.clear();
         self.lod_cubes.clear();
+        if let Some(far) = &mut self.far_cull {
+            far.records.clear();
+        }
         self.cube_pending = None;
         self.cube_overlap.clear();
         self.lod_cutout.clear();
@@ -8696,6 +8797,11 @@ impl Renderer {
         {
             self.show_stats(frame, stats);
         }
+        if let Some(far) = &mut self.far_cull
+            && let Some(stats) = far.collect(&self.device)
+        {
+            self.far_stats = Some(stats);
+        }
         // The walk reads the graph GPU culling is given (checked after it).
         #[cfg(debug_assertions)]
         let graph_given = self.occlusion.generation();
@@ -8733,6 +8839,59 @@ impl Renderer {
             }
         }
         self.gpu_frame = gpu_frame;
+        // The far tiles of `lod_cubes` that are whole are culled and drawn on the GPU
+        // (`far_cull`), and the walk lists only those the CPU draws (fading, dying) and the
+        // water of the others. Only where the CPU's far draws below are the plain solid ones:
+        // no shader pack's terrain, shadow pass, mirror, displacement, flat draws, native
+        // material, split opaque/cutout passes or MSAA. The same `now` as the walk's.
+        let now = std::time::Instant::now();
+        let mut far_gpu_frame = self.far_cull.is_some()
+            && !frame.title
+            && !msaa_on
+            && !pack_terrain
+            && shadow_view.is_none()
+            && mirror_plane.is_none()
+            && !displaced
+            && self.flat.is_none()
+            && !tiled_solid_gpu(&self.info)
+            && self.executor.is_none_or(|c| !c.material)
+            && !self
+                .external
+                .as_deref()
+                .is_some_and(|n| n.terrain_layers().is_some())
+            && !gpu_culling::looks_lose_base_vertex(&self.info, self.terrain_looks)
+            && self.multi_draw;
+        if far_gpu_frame && let Some(far) = &mut self.far_cull {
+            far.records.sync(&self.lod_cubes, now, None);
+            #[cfg(debug_assertions)]
+            if serial.is_multiple_of(64) {
+                far.records.check(&self.lod_cubes, now);
+            }
+            // The Hi-Z pyramid (`cull`) is read by the far test between the world passes;
+            // near GPU culling's own raster test leaves none.
+            let occlude = self.cull_on
+                && self
+                    .cull
+                    .as_ref()
+                    .is_some_and(|c| c.hiz_read_group().is_some())
+                && !(gpu_frame
+                    && self
+                        .gpu_culling
+                        .as_ref()
+                        .is_some_and(|g| g.occluding() && !g.uses_hiz()));
+            let input = far_cull::FarInputs::new(camera, &view, eye, jittered, occlude);
+            far_gpu_frame = crate::spans::time("far culling", || {
+                far.prepare(
+                    &self.device,
+                    &mut self.uploads,
+                    &mut encoder,
+                    &input,
+                    self.own_timing.as_mut(),
+                )
+            });
+        }
+        self.far_gpu_frame = far_gpu_frame;
+        self.far_phases = 0;
         if !frame.title
             && let Some(far) = &mut self.cube_far
         {
@@ -8776,7 +8935,6 @@ impl Renderer {
             !gpu_frame || self.occlusion.generation() == graph_given,
             "the walk reads the graph GPU culling was given"
         );
-        let now = std::time::Instant::now();
         let mut visible_lods = std::mem::take(&mut self.visible_lods);
         visible_lods.clear();
         if frame.title {
@@ -8785,9 +8943,23 @@ impl Renderer {
             visible_lods.extend(self.lods.iter().filter_map(|(&key, tile)| {
                 tile.visible(lod::FarKey::Tile(key), camera, &view, now)
             }));
-            visible_lods.extend(self.lod_cubes.iter().filter_map(|(&key, tile)| {
-                tile.visible(lod::FarKey::Cube(key), camera, &view, now)
-            }));
+            match &self.far_cull {
+                // The GPU draws the whole far tiles' solid quads: the walk lists the others
+                // and the whole ones' water.
+                Some(far) if far_gpu_frame => {
+                    visible_lods.extend(far.records.cpu_keys().filter_map(|(key, solid)| {
+                        let tile = self.lod_cubes.get(&key)?;
+                        let mut v = tile.visible(lod::FarKey::Cube(key), camera, &view, now)?;
+                        v.gpu_solid = !solid;
+                        Some(v)
+                    }));
+                }
+                _ => {
+                    visible_lods.extend(self.lod_cubes.iter().filter_map(|(&key, tile)| {
+                        tile.visible(lod::FarKey::Cube(key), camera, &view, now)
+                    }));
+                }
+            }
             visible_lods.sort_unstable_by_key(|v| (v.distance, v.key));
         }
         let mut shadow_visible = std::mem::take(&mut self.shadow_visible);
@@ -8898,6 +9070,10 @@ impl Renderer {
                                     1_u64 << (layer % u64::BITS as usize);
                             }
                         }
+                    }
+                    // The far tiles the GPU draws are not in the walk's list.
+                    if far_gpu_frame && let Some(far) = &self.far_cull {
+                        far.records.animated_layers(&mut self.active_animated_layers);
                     }
                     // Visibility is collected before terrain draw commands are recorded,
                     // so upload the current mask here and keep animation updates ahead
@@ -9169,7 +9345,13 @@ impl Renderer {
         }
         // Distant terrain tiles are occlusion tested as sections are, with their meshes'
         // bounds, but for those fading or with a stand-in (`lod::Tile::cull_bounds`).
+        // The far cube tiles' solid draws and triangles the CPU makes (`far_cull_status`).
+        let (mut far_cpu_draws, mut far_cpu_triangles) = (0, 0u64);
         for (i, v) in visible_lods.iter().enumerate() {
+            // The GPU draws its solid quads; its instance (`i`) is still there for its water.
+            if v.gpu_solid {
+                continue;
+            }
             let tile =
                 lod::far_tile(&self.lods, &self.lod_cubes, v.key).expect("visible resident tile");
             let s = tile.drawn();
@@ -9197,6 +9379,10 @@ impl Renderer {
                 *run = (group, start, draws.len() - start);
             }
             let runs = &runs[..parts.len()];
+            if matches!(v.key, lod::FarKey::Cube(_)) {
+                far_cpu_draws += runs.iter().map(|r| r.2).sum::<usize>();
+                far_cpu_triangles += u64::from(indices) / 3;
+            }
             let (Some(bounds), Some(c)) = (tested, &mut cull) else {
                 for &(group, start, len) in runs {
                     if group == 0 {
@@ -9230,6 +9416,7 @@ impl Renderer {
                 }
             }
         }
+        (self.far_cpu_draws, self.far_cpu_triangles) = (far_cpu_draws, far_cpu_triangles);
         // Phase 2's draws are tested where grouping left them.
         let runs = self
             .phase2_runs
@@ -10456,7 +10643,9 @@ impl Renderer {
         };
         // GPU culling's occlusion test splits the world pass and shares `cull`'s Hi-Z pyramid.
         let gpu_occluding = gpu_frame && self.gpu_culling.as_ref().is_some_and(|g| g.occluding());
-        if (culling || gpu_occluding)
+        let far_occluding = far_gpu_frame && self.far_cull.as_ref().is_some_and(|f| f.occluding());
+        self.far_phases = if far_gpu_frame { 1 + usize::from(far_occluding) } else { 0 };
+        if (culling || gpu_occluding || far_occluding)
             && let Some(cull) = &mut self.cull
         {
             cull.bind_depth(&self.device, world_depth);
@@ -10820,7 +11009,8 @@ impl Renderer {
                         load: wgpu::LoadOp::Clear(0.0),
                         // The visibility buffer's passes, and those after an occlusion test,
                         // draw on after it.
-                        store: if cull.is_some() || gpu_occluding || keep_depth || vis_frame {
+                        store: if cull.is_some() || gpu_occluding || far_occluding || keep_depth || vis_frame
+                        {
                             wgpu::StoreOp::Store
                         } else {
                             wgpu::StoreOp::Discard
@@ -11261,6 +11451,10 @@ impl Renderer {
                     pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.set_vertex_buffer(1, self.instances.slice(..));
                     pass.stage(self.own_timing.as_mut(), "solid terrain");
+                    // The whole far tiles the GPU draws (`far_cull`), after the CPU's draws: its
+                    // phase 0 in the first pass, phase 1 (what its Hi-Z test saw) in the next.
+                    let far = self.far_cull.as_ref().filter(|_| far_gpu_frame);
+                    let far_group = |_: u32| None::<&wgpu::BindGroup>;
                     match cull {
                         Some(cull) => {
                             // Phase 1 and the boxes against its depth (in
@@ -11277,6 +11471,16 @@ impl Renderer {
                                     draws.len() as u32,
                                     pulled,
                                 );
+                                if let Some(far) = far {
+                                    far.draw(
+                                        &mut pass,
+                                        &self.arena,
+                                        far_group,
+                                        0,
+                                        self.look_groups.as_ref(),
+                                    );
+                                    pass.set_vertex_buffer(1, self.instances.slice(..));
+                                }
                             }
                             if cull.early() {
                                 if surface.is_some() {
@@ -11289,6 +11493,15 @@ impl Renderer {
                             }
                             drop(pass);
                             cull.test_pass(&mut encoder, self.own_timing.as_mut());
+                            // The far tiles' test reads the pyramid: `test_pass` builds it only
+                            // where it has boxes of its own.
+                            let far_test = far.filter(|f| f.occluding());
+                            if far_test.is_some() && !cull.test_pass_builds_hiz() {
+                                cull.build_hiz(&mut encoder, self.own_timing.as_mut());
+                            }
+                            if let (Some(far), Some(hiz)) = (far_test, cull.hiz_read_group()) {
+                                far.test(&mut encoder, hiz, self.own_timing.as_mut());
+                            }
                             pass = match &surface {
                                 Some(surface) => terrain_pass(&mut encoder, surface, false),
                                 None => world_pass_after_culling(
@@ -11319,6 +11532,16 @@ impl Renderer {
                                     draws.len() as u32,
                                     pulled,
                                 );
+                                if let Some(far) = far_test {
+                                    far.draw(
+                                        &mut pass,
+                                        &self.arena,
+                                        far_group,
+                                        1,
+                                        self.look_groups.as_ref(),
+                                    );
+                                    pass.set_vertex_buffer(1, self.instances.slice(..));
+                                }
                             }
                         }
                         // Without culling, phase 1 is all the solid draws; GPU culling's
@@ -11354,7 +11577,18 @@ impl Renderer {
                                         pulled,
                                     );
                                 }
+                                if let Some(far) = far {
+                                    far.draw(
+                                        &mut pass,
+                                        &self.arena,
+                                        far_group,
+                                        0,
+                                        self.look_groups.as_ref(),
+                                    );
+                                    pass.set_vertex_buffer(1, self.instances.slice(..));
+                                }
                             }
+                            let far_test = far.filter(|f| f.occluding());
                             // As cull.rs's arm: the boxes against phase 1's depth, then
                             // phase 2 and the CPU's draws in a pass that loads both targets.
                             if let Some(gpu) = gpu.filter(|_| occluding) {
@@ -11368,6 +11602,9 @@ impl Renderer {
                                                 hiz,
                                                 self.own_timing.as_mut(),
                                             );
+                                            if let Some(far) = far_test {
+                                                far.test(&mut encoder, hiz, self.own_timing.as_mut());
+                                            }
                                         }
                                     }
                                 } else {
@@ -11418,6 +11655,57 @@ impl Renderer {
                                         draws.len() as u32,
                                         pulled,
                                     );
+                                    if let Some(far) = far_test {
+                                        far.draw(
+                                            &mut pass,
+                                            &self.arena,
+                                            far_group,
+                                            1,
+                                            self.look_groups.as_ref(),
+                                        );
+                                        pass.set_vertex_buffer(1, self.instances.slice(..));
+                                    }
+                                }
+                            } else if let Some(far) = far_test {
+                                // Only the far tiles occlude: the boxes against phase 1's
+                                // depth (the pyramid), then what they saw, in a pass that
+                                // loads both targets.
+                                drop(pass);
+                                if let Some(cull) = self.cull.as_ref() {
+                                    cull.build_hiz(&mut encoder, self.own_timing.as_mut());
+                                    if let Some(hiz) = cull.hiz_read_group() {
+                                        far.test(&mut encoder, hiz, self.own_timing.as_mut());
+                                    }
+                                }
+                                pass = match &surface {
+                                    Some(surface) => terrain_pass(&mut encoder, surface, false),
+                                    None => world_pass_after_culling(
+                                        &mut encoder,
+                                        world_view,
+                                        world_depth,
+                                        keep_depth,
+                                        self.own_timing.as_mut(),
+                                        "World after culling",
+                                        world_pixels,
+                                    ),
+                                };
+                                pass.set_bind_group(0, &self.group, &[]);
+                                pack_frame(&mut pass);
+                                pass.set_index_buffer(
+                                    self.indices.slice(..),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                                pass.stage(self.own_timing.as_mut(), "solid terrain phase 2");
+                                for (pipeline, _, _) in passes {
+                                    pass.set_pipeline(pipeline);
+                                    far.draw(
+                                        &mut pass,
+                                        &self.arena,
+                                        far_group,
+                                        1,
+                                        self.look_groups.as_ref(),
+                                    );
+                                    pass.set_vertex_buffer(1, self.instances.slice(..));
                                 }
                             }
                         }
@@ -12406,6 +12694,9 @@ impl Renderer {
         // GPU culling's counts once its world passes are done (phase 2's too).
         if gpu_frame && let Some(gpu) = &mut self.gpu_culling {
             gpu.copy_stats(&mut encoder, serial, cpu);
+        }
+        if far_gpu_frame && let Some(far) = &mut self.far_cull {
+            far.copy_stats(&mut encoder, serial);
         }
         if let Some(timer) = &mut self.gpu_timer {
             timer.end(&self.device, &mut encoder, (&view_target, overlay_format));

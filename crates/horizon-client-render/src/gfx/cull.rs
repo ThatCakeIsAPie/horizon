@@ -927,6 +927,14 @@ impl Cull {
     pub fn hiz_read_group(&self) -> Option<&wgpu::BindGroup> {
         self.hiz.as_ref().map(Hiz::read_group)
     }
+    /// Whether `test_pass` builds the Hi-Z pyramid this frame (it has boxes to test and the
+    /// compute test); when not, `build_hiz` makes it for other readers (`far_cull`).
+    pub fn test_pass_builds_hiz(&self) -> bool {
+        !self.test_data.is_empty()
+            && self.group.is_some()
+            && self.compute_pipeline.is_some()
+            && self.hiz.is_some()
+    }
     /// Builds the reversed-Z min-depth Hi-Z pyramid from phase 1's depth, for GPU culling's
     /// compute occlusion test.
     pub fn build_hiz(

@@ -1616,6 +1616,7 @@ impl Game<'_> {
                 "drawn_sections": r.drawn_sections,
                 "section_draws": r.section_draws,
                 "section_draw_calls": r.section_draw_calls,
+                "far_cull": r.far_cull_status(),
                 "culled_sections": r.culled_sections(),
                 "gpu_culling": r.gpu_culling(),
                 "gpu_culling_mode": self.settings.horizon.gpu_culling.name(),

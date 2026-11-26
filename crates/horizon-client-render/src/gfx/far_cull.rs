@@ -318,6 +318,13 @@ impl FarRecords {
         self.dirty.insert(key);
     }
 
+    /// The meshes on arena page `page` move (compaction): the next `sync` reads each again.
+    pub fn touch_page(&mut self, page: u32) {
+        if let Some(keys) = self.page_keys.get(page as usize) {
+            self.dirty.extend(keys.iter().copied());
+        }
+    }
+
     /// Forgets everything (the tiles went); the GPU's table is written again as it fills.
     pub fn clear(&mut self) {
         *self = Self {
@@ -1962,6 +1969,37 @@ mod tests {
                 .is_err()
         );
         far.sync(&tiles, now, Some(2));
+        far.check(&tiles, now);
+        assert_eq!(far.page_records(), [3, 3]);
+        let (ids, whole) = ids_and_updates(&mut far);
+        assert!(!whole && ids.len() == 3, "{ids:?}");
+    }
+
+    /// The renderer touches every key on the page it compacts (`touch_page`), so the next
+    /// plain `sync` reads their moved meshes, whether or not the page is still closing.
+    #[test]
+    fn touching_a_page_makes_sync_read_its_moved_tiles() {
+        let now = Instant::now() + Duration::from_secs(10);
+        let mut tiles: FxHashMap<CubeKey, Tile> = FxHashMap::default();
+        let mut far = FarRecords::default();
+        for i in 0..6 {
+            tiles.insert(
+                key(i),
+                tile(2, 1 + i % 2, u64::from(i) * 16, false, &[], whole(now), None),
+            );
+            far.touch(key(i));
+        }
+        far.sync(&tiles, now, None);
+        ids_and_updates(&mut far);
+        for t in tiles.values_mut() {
+            if t.mesh.page == 2 {
+                t.mesh.page = 0;
+                t.mesh.start += 1000;
+            }
+        }
+        far.touch_page(2);
+        far.touch_page(7); // a page without records
+        far.sync(&tiles, now, None);
         far.check(&tiles, now);
         assert_eq!(far.page_records(), [3, 3]);
         let (ids, whole) = ids_and_updates(&mut far);
