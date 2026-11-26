@@ -1753,8 +1753,8 @@ pub const BUDGET_VAR: &str = "HORIZON_FAR_NODES";
 /// node there counts as mixed and the plan asks for the sky too.
 const DESCENT_WAIT: Duration = Duration::from_millis(300);
 const JUMP: f64 = 4096.0;
-/// The queue takes its sectors in a new order when the view turned this far
-/// (radians).
+/// The queue takes its buckets in a new order when the view turned this far
+/// (radians, 5 degrees) or zoomed ([`Look::moved`]).
 const TURN: f64 = 0.087;
 /// Above this many nodes, the passes over the whole plan (releasing nodes,
 /// looking for holes) run at most every [`SCAN_EVERY`].
@@ -1897,17 +1897,134 @@ pub struct GpuBatch {
     pub biomes: Option<Vec<u32>>,
 }
 
-// ---------------------------------------------------------------- sectors
+// ------------------------------------------------------------- work order
 
-/// The queue sorts the plan by direction from the camera: 16 azimuths in
-/// each of three bands (down, level, up), plus sector 0 for the nodes around
-/// the camera, which are in view whichever way it looks. Turning the camera
-/// only reorders the sectors ([`sector_order`]): no node is sorted again.
-const AZIMUTHS: usize = 16;
-const SECTORS: usize = 1 + 3 * AZIMUTHS;
+// The far view's work order (Lyle, 2026-11-25): "prioritize what is in your
+// actual vision, and half the priority based on proximity to the player ...
+// based on where the player's crosshair is". Every job scores
+//
+//     FAR_PRIORITY_VIEW x crosshair weight + FAR_PRIORITY_NEAR x nearness
+//
+// and the highest goes first; of equal scores, the bigger on-screen error.
+// Two kinds of job stay ahead of the score: nodes replacing far nodes drawn
+// over loaded near ground (those show through the near terrain), nearest
+// first, then holes (nothing drawn there at all), by score.
+//
+// The knobs for Lyle to tune are these five constants.
 
-/// The sector of `node` seen from `camera`.
-fn sector(camera: [f64; 3], node: CubeKey) -> u8 {
+/// The weight of where the crosshair is.
+pub const FAR_PRIORITY_VIEW: f64 = 1.0;
+/// The weight of how near the player a job is.
+pub const FAR_PRIORITY_NEAR: f64 = 0.5;
+/// The crosshair weight at the screen's corners (1 at the crosshair, falling
+/// smoothly to this) ...
+pub const FAR_PRIORITY_EDGE: f64 = 0.35;
+/// ... and straight behind the player (falling evenly from the corners).
+pub const FAR_PRIORITY_BEHIND: f64 = 0.05;
+/// Nearness: 1 at the player, a half this many blocks away, a fifth at four
+/// times it.
+pub const FAR_PRIORITY_NEAR_BLOCKS: f64 = 512.0;
+
+/// The crosshair weight of a job `angle` radians off the look direction, on
+/// a screen whose corners are `edge` radians off it.
+pub fn crosshair_weight(angle: f64, edge: f64) -> f64 {
+    let edge = edge.clamp(1e-3, std::f64::consts::PI - 1e-3);
+    let angle = angle.clamp(0.0, std::f64::consts::PI);
+    if angle <= edge {
+        let t = angle / edge;
+        1.0 - (1.0 - FAR_PRIORITY_EDGE) * t * t
+    } else {
+        let t = (angle - edge) / (std::f64::consts::PI - edge);
+        FAR_PRIORITY_EDGE + (FAR_PRIORITY_BEHIND - FAR_PRIORITY_EDGE) * t
+    }
+}
+
+/// How near the player a job `distance` blocks away is: 1 at the player.
+pub fn nearness(distance: f64) -> f64 {
+    1.0 / (1.0 + distance.max(0.0) / FAR_PRIORITY_NEAR_BLOCKS)
+}
+
+/// A job's score from its crosshair angle and distance.
+pub fn far_priority(angle: f64, edge: f64, distance: f64) -> f64 {
+    FAR_PRIORITY_VIEW * crosshair_weight(angle, edge) + FAR_PRIORITY_NEAR * nearness(distance)
+}
+
+/// What the queue's order was made for: the look direction (a unit vector)
+/// and the angle from it to the screen's corners ([`FarView::half_diagonal`],
+/// smaller when zoomed in).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Look {
+    pub forward: [f64; 3],
+    pub edge: f64,
+}
+
+impl Look {
+    pub fn of(view: &FarView) -> Self {
+        Self {
+            forward: view.forward,
+            edge: view.half_diagonal(),
+        }
+    }
+    /// Whether the order made for `self` is out of date for `now`: the view
+    /// turned past [`TURN`], or zoomed by a tenth.
+    fn moved(&self, now: &Look) -> bool {
+        angle_between(self.forward, now.forward) > TURN
+            || now.edge > self.edge * 1.1
+            || self.edge > now.edge * 1.1
+    }
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Self {
+            forward: [0.0, 0.0, 1.0],
+            edge: FarView::standard(1.0).half_diagonal(),
+        }
+    }
+}
+
+/// The angle from `look` to the nearest part of `node` seen from `camera`
+/// (0 when the node takes in the look direction or the camera).
+fn node_angle(camera: [f64; 3], forward: [f64; 3], node: CubeKey) -> f64 {
+    let size = f64::from(node.size());
+    let o = node.origin();
+    let d = [0, 1, 2].map(|a| f64::from(o[a]) + size / 2.0 - camera[a]);
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let radius = size * 0.866;
+    if len <= radius {
+        return 0.0;
+    }
+    (angle_between(forward, d) - (radius / len).asin()).max(0.0)
+}
+
+/// The score ([`far_priority`]) of a job `key` seen from `camera` with
+/// `look`: for other queues of far work (the Earth trees pass) to keep the
+/// same order.
+pub fn job_score(camera: [f64; 3], look: Look, key: CubeKey) -> f64 {
+    far_priority(
+        node_angle(camera, look.forward, key),
+        look.edge,
+        key.distance(camera),
+    )
+}
+
+/// A job's on-screen error: its voxels' size over their distance.
+fn screen_error(camera: [f64; 3], node: CubeKey) -> f64 {
+    f64::from(node.size()) / node.distance(camera).max(1.0)
+}
+
+/// The queue keeps its jobs in buckets of a direction cell and a nearness
+/// ring each, so a turn only reorders the buckets (no job is scored again):
+/// 48 azimuths by 24 elevation bands, 7.5 degrees a cell, plus cell 0 for the
+/// nodes round the camera, in view whichever way it looks; 16 rings.
+const AZIMUTHS: usize = 48;
+const BANDS: usize = 24;
+const CELLS: usize = 1 + AZIMUTHS * BANDS;
+const RINGS: usize = 16;
+const BUCKETS: usize = CELLS * RINGS;
+
+/// The direction cell of `node` seen from `camera`.
+fn cell(camera: [f64; 3], node: CubeKey) -> usize {
     let size = f64::from(node.size());
     let o = node.origin();
     let d = [0, 1, 2].map(|a| f64::from(o[a]) + size / 2.0 - camera[a]);
@@ -1915,44 +2032,61 @@ fn sector(camera: [f64; 3], node: CubeKey) -> u8 {
     if len <= size {
         return 0;
     }
-    let band = if d[1] < -0.5 * len {
-        0
-    } else if d[1] > 0.5 * len {
-        2
-    } else {
-        1
-    };
     let turn = (d[2].atan2(d[0]) + std::f64::consts::PI) / std::f64::consts::TAU;
     let azimuth = ((turn * AZIMUTHS as f64) as usize).min(AZIMUTHS - 1);
-    (1 + band * AZIMUTHS + azimuth) as u8
+    let rise = ((d[1] / len).clamp(-1.0, 1.0).asin() / std::f64::consts::PI) + 0.5;
+    let band = ((rise * BANDS as f64) as usize).min(BANDS - 1);
+    1 + band * AZIMUTHS + azimuth
 }
 
-/// The middle direction of sector `s` (not 0).
-fn sector_axis(s: usize) -> [f64; 3] {
-    let (band, azimuth) = ((s - 1) / AZIMUTHS, (s - 1) % AZIMUTHS);
+/// The middle direction of cell `c` (not 0).
+fn cell_axis(c: usize) -> [f64; 3] {
+    let (band, azimuth) = ((c - 1) / AZIMUTHS, (c - 1) % AZIMUTHS);
     let angle =
         (azimuth as f64 + 0.5) / AZIMUTHS as f64 * std::f64::consts::TAU - std::f64::consts::PI;
-    let y = [-0.8, 0.0, 0.8][band];
-    let h = (1.0f64 - y * y).sqrt();
+    let rise = ((band as f64 + 0.5) / BANDS as f64 - 0.5) * std::f64::consts::PI;
+    let (y, h) = (rise.sin(), rise.cos());
     [h * angle.cos(), y, h * angle.sin()]
 }
 
-/// The sectors in the order the queue takes them for a camera looking along
-/// `forward`: around the camera first, then by angle from the view's centre.
-fn sector_order(forward: [f64; 3]) -> Vec<u8> {
-    let mut by_angle: Vec<(f64, u8)> = (1..SECTORS)
-        .map(|s| {
-            let a = sector_axis(s);
-            (
-                -(a[0] * forward[0] + a[1] * forward[1] + a[2] * forward[2]),
-                s as u8,
-            )
+/// The nearness ring of a job `distance` blocks away.
+fn ring(distance: f64) -> usize {
+    ((nearness(distance) * RINGS as f64) as usize).min(RINGS - 1)
+}
+
+/// The bucket of `node` seen from `camera`.
+fn bucket(camera: [f64; 3], node: CubeKey) -> u16 {
+    (cell(camera, node) * RINGS + ring(node.distance(camera))) as u16
+}
+
+/// The buckets in the order the queue takes them for `look`: by the score of
+/// the cell's middle and the ring's middle, highest first.
+fn bucket_order(look: Look) -> Vec<u16> {
+    let cell_weight: Vec<f64> = (0..CELLS)
+        .map(|c| {
+            if c == 0 {
+                1.0
+            } else {
+                // A cell's nearest edge, not its middle: half a cell's width.
+                let half = std::f64::consts::PI / BANDS as f64 / 2.0;
+                let angle = (angle_between(look.forward, cell_axis(c)) - half).max(0.0);
+                crosshair_weight(angle, look.edge)
+            }
         })
         .collect();
-    by_angle.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    std::iter::once(0)
-        .chain(by_angle.into_iter().map(|(_, s)| s))
-        .collect()
+    // Scores to 1/65536 of the highest, then the bucket: one u32 to sort.
+    let top = (FAR_PRIORITY_VIEW + FAR_PRIORITY_NEAR).max(1e-9);
+    let mut by_score: Vec<u32> = (0..BUCKETS)
+        .map(|b| {
+            let (c, r) = (b / RINGS, b % RINGS);
+            let near = (r as f64 + 0.5) / RINGS as f64;
+            let score = FAR_PRIORITY_VIEW * cell_weight[c] + FAR_PRIORITY_NEAR * near;
+            let q = ((score / top).clamp(0.0, 1.0) * 65535.0) as u32;
+            (65535 - q) << 15 | b as u32
+        })
+        .collect();
+    by_score.sort_unstable();
+    by_score.into_iter().map(|e| (e & 0x7fff) as u16).collect()
 }
 
 fn angle_between(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -1967,13 +2101,18 @@ fn angle_between(a: [f64; 3], b: [f64; 3]) -> f64 {
 
 /// The jobs, in the order the workers take them.
 struct Queue {
-    /// Taken first, in order: the coverage layer, then holes, new nodes and
-    /// retries.
+    /// Taken first, in order: nodes replacing far nodes over near ground,
+    /// the coverage layer, holes, and (at the front) a worker's put-backs.
     first: VecDeque<CubeKey>,
-    /// The rest of the plan by sector, nearest first in each.
-    sectors: Vec<VecDeque<CubeKey>>,
-    /// The order the sectors are taken in: the ones the camera faces first.
-    order: Vec<u8>,
+    /// The rest by bucket ([`bucket`]), the bigger on-screen error first in
+    /// each.
+    buckets: Vec<VecDeque<CubeKey>>,
+    /// The order the buckets are taken in ([`bucket_order`]), and each
+    /// bucket's place in it.
+    order: Vec<u16>,
+    rank: Vec<u16>,
+    /// Every bucket before this place in `order` is empty.
+    cursor: usize,
     /// Queued keys the plan dropped since: skipped when taken.
     dropped: FxHashSet<CubeKey>,
     running: FxHashSet<CubeKey>,
@@ -1984,35 +2123,54 @@ struct Queue {
 
 impl Default for Queue {
     fn default() -> Self {
-        Self {
+        let mut queue = Self {
             first: VecDeque::new(),
-            sectors: (0..SECTORS).map(|_| VecDeque::new()).collect(),
-            order: (0..SECTORS as u8).collect(),
+            buckets: (0..BUCKETS).map(|_| VecDeque::new()).collect(),
+            order: Vec::new(),
+            rank: Vec::new(),
+            cursor: 0,
             dropped: FxHashSet::default(),
             running: FxHashSet::default(),
             later: VecDeque::new(),
-        }
+        };
+        queue.reorder(bucket_order(Look::default()));
+        queue
     }
 }
 
 impl Queue {
     fn clear(&mut self) {
         self.first.clear();
-        for s in &mut self.sectors {
-            s.clear();
+        for b in &mut self.buckets {
+            b.clear();
         }
+        self.cursor = 0;
         self.dropped.clear();
+    }
+    /// Takes the buckets in `order` from now on.
+    fn reorder(&mut self, order: Vec<u16>) {
+        let mut rank = vec![0u16; BUCKETS];
+        for (i, &b) in order.iter().enumerate() {
+            rank[usize::from(b)] = i as u16;
+        }
+        self.order = order;
+        self.rank = rank;
+        self.cursor = 0;
+    }
+    /// Queues `key` in bucket `b`, behind the others there.
+    fn push(&mut self, b: u16, key: CubeKey) {
+        self.buckets[usize::from(b)].push_back(key);
+        self.cursor = self.cursor.min(usize::from(self.rank[usize::from(b)]));
     }
     /// The next job.
     fn pop(&mut self) -> Option<CubeKey> {
         loop {
             let mut next = self.first.pop_front();
-            if next.is_none() {
-                for &s in &self.order {
-                    if let Some(key) = self.sectors[usize::from(s)].pop_front() {
-                        next = Some(key);
-                        break;
-                    }
+            while next.is_none() && self.cursor < self.order.len() {
+                let b = usize::from(self.order[self.cursor]);
+                next = self.buckets[b].pop_front();
+                if next.is_none() {
+                    self.cursor += 1;
                 }
             }
             if next.is_none() {
@@ -2273,10 +2431,9 @@ struct PlanJob {
     /// The nodes drawn (or failed: not to wait on), for the refining one
     /// level at a time ([`PlanInput::refined`]).
     drawn: Vec<CubeKey>,
-    /// Refine one level at a time from the coverage layer down (the
-    /// `HORIZON_FAR_STEP=1` knob, off by default: in play, after a flight it
-    /// left coarse nodes round the player for 20 s and more, where going
-    /// straight to the target, nearest first, refined them in a few seconds).
+    /// Refine one level at a time from the coverage layer down, so the far
+    /// view sharpens step by step in front of the player (Lyle's design). On
+    /// by default; `HORIZON_FAR_STEP=0` goes straight to the target instead.
     step: bool,
     /// Plan surface tiles at the coarse levels.
     surface: Option<SurfaceJob>,
@@ -2301,8 +2458,9 @@ struct PlanDone {
     tiles: Arc<Vec<TileKey>>,
     tiles_added: Vec<TileKey>,
     tiles_removed: Vec<TileKey>,
-    /// The plan with each node's sector, nearest first (empty when unchanged).
-    order: Vec<(u8, CubeKey)>,
+    /// The plan with each node's bucket ([`bucket`]), the bigger on-screen
+    /// error first (empty when unchanged).
+    order: Vec<(u16, CubeKey)>,
     /// The coverage layer's leaves and tiles (empty when unchanged).
     cover: FxHashSet<CubeKey>,
     cover_tiles: FxHashSet<TileKey>,
@@ -2461,11 +2619,13 @@ fn make_plan(
         elapsed: Duration::ZERO,
     };
     if changed {
-        done.order = plan
+        let mut order: Vec<(f64, u16, CubeKey)> = plan
             .leaves
             .iter()
-            .map(|&k| (sector(job.camera, k), k))
+            .map(|&k| (-screen_error(job.camera, k), bucket(job.camera, k), k))
             .collect();
+        order.sort_by(|a, b| a.0.total_cmp(&b.0));
+        done.order = order.into_iter().map(|(_, b, k)| (b, k)).collect();
         done.tree = plan.leaves.iter().map(|&k| (tree_order(k), k)).collect();
         done.tree.sort_unstable();
         done.footprints = plan
@@ -2672,8 +2832,9 @@ pub struct CubeLod {
     /// The current plan, nearest first.
     plan: Arc<Vec<CubeKey>>,
     wanted: FxHashSet<CubeKey>,
-    /// The plan with each node's sector, nearest first: the queue's source.
-    order: Vec<(u8, CubeKey)>,
+    /// The plan with each node's bucket, the bigger on-screen error first:
+    /// the queue's source.
+    order: Vec<(u16, CubeKey)>,
     /// The plan in tree order (`tree_order`).
     tree: Vec<(u128, CubeKey)>,
     /// The plan's leaves and tiles by footprint (`footprint_order`).
@@ -2717,8 +2878,12 @@ pub struct CubeLod {
     /// [`CubeLod::clear`]s so far.
     epoch: u64,
     camera: [f64; 3],
-    /// The direction the queue's sector order was made for.
-    facing: Option<[f64; 3]>,
+    /// The look the queue's bucket order was made for.
+    look: Option<Look>,
+    /// The far nodes over near ground ([`track_lingering`]) the queue was
+    /// last filled for: a new one fills it again, so the nodes replacing it
+    /// that were queued already go first.
+    linger_queued: FxHashSet<CubeKey>,
     budget: usize,
     /// The sampler's GPU generator, when it has one.
     backend: Option<GpuBackend>,
@@ -2885,7 +3050,8 @@ impl CubeLod {
             replan: false,
             epoch: 0,
             camera: [0.0; 3],
-            facing: None,
+            look: None,
+            linger_queued: FxHashSet::default(),
             budget: NODE_BUDGET,
             gpu_out: Vec::new(),
             context,
@@ -3284,7 +3450,7 @@ impl CubeLod {
         self.camera = camera;
         let now = Instant::now();
         let cube = cube_of(camera);
-        self.face(view.forward);
+        self.face(Look::of(view));
         let rule = view.rule(self.budget());
         self.stats.target_px = view.target_px as f32;
         self.stats.fov_deg = view.fov_y.to_degrees() as f32;
@@ -3344,11 +3510,8 @@ impl CubeLod {
                     loaded,
                     snapshot,
                     previous: self.plan.clone(),
-                    drawn: (self.delivered.iter())
-                        .chain(self.failed.keys())
-                        .copied()
-                        .collect(),
-                    step: far_knob("HORIZON_FAR_STEP", 0) != 0,
+                    drawn: self.drawn_for_steps(),
+                    step: far_knob("HORIZON_FAR_STEP", 1) != 0,
                     surface: self.tiles.on.then(|| SurfaceJob {
                         info: self.tiles.info.clone(),
                         sea_level: self.tiles.sea_level,
@@ -3629,44 +3792,108 @@ impl CubeLod {
         }
         if (big && holes * COVER_HOLES > planned) || holes > COVER_MIN_HOLES || covering {
             self.begin_cover(now);
-        } else if big {
+        } else if big
+            || self
+                .lingering
+                .keys()
+                .any(|k| !self.linger_queued.contains(k))
+        {
             self.fill_queue();
         } else {
-            // A small change: the new nodes go first, the dropped ones are
-            // skipped if they are queued.
-            let rank = self.rank();
-            let mut first: Vec<CubeKey> = done
-                .added
-                .iter()
-                .copied()
+            // A small change: the new nodes over near ground go first, then
+            // the new holes, the rest by score; the dropped ones are skipped
+            // if they are queued.
+            let added: Vec<CubeKey> = (done.added.iter().copied())
                 .filter(|k| !self.delivered.contains(k))
                 .collect();
-            first.sort_by(|a, b| self.priority(&rank, a).total_cmp(&self.priority(&rank, b)));
-            let mut queue = self.shared.queue.lock().unwrap();
-            for key in &first {
-                queue.dropped.remove(key);
-            }
-            queue.dropped.extend(dropped);
-            queue.first.extend(first);
-            drop(queue);
-            self.shared.wake.notify_all();
+            self.queue_jobs(added, dropped);
         }
     }
 
-    /// The rank of each sector in the queue's order now.
-    fn rank(&self) -> [u8; SECTORS] {
-        let order = sector_order(self.facing.unwrap_or([0.0, 0.0, 1.0]));
-        let mut rank = [0u8; SECTORS];
-        for (i, s) in order.into_iter().enumerate() {
-            rank[usize::from(s)] = i as u8;
-        }
-        rank
+    /// What a stepping plan counts as drawn ([`PlanJob::drawn`]): the nodes
+    /// handed out (or failed), except those inside a stale node (one the plan
+    /// dropped that stands until what replaces it is all in). Such a node is
+    /// not on screen yet: were it to split, its children would hold the
+    /// stale one up again, a level at a time, and a coarse node stood over
+    /// the near ground for many seconds after a flight.
+    fn drawn_for_steps(&self) -> Vec<CubeKey> {
+        let levels = self.stale.iter().fold(0u32, |m, k| m | 1 << k.level);
+        let inside_stale = |key: CubeKey| {
+            levels >> (key.level + 1) != 0
+                && (key.level + 1..=MAX_CUBE_LEVEL)
+                    .filter(|l| levels >> l & 1 == 1)
+                    .any(|l| self.stale.contains(&ancestor(key, l)))
+        };
+        (self.delivered.iter())
+            .chain(self.failed.keys())
+            .copied()
+            .filter(|&k| !inside_stale(k))
+            .collect()
     }
 
-    /// The order a short list is queued in: by sector rank, then distance.
-    fn priority(&self, rank: &[u8; SECTORS], key: &CubeKey) -> f64 {
-        f64::from(rank[usize::from(sector(self.camera, *key))]) * 1e9
-            + key.distance(self.camera).min(9e8)
+    /// The look the queue's order is for now.
+    fn look_now(&self) -> Look {
+        self.look.unwrap_or_default()
+    }
+
+    /// A job's score ([`far_priority`]) for the camera and the look now.
+    fn score(&self, key: CubeKey) -> f64 {
+        job_score(self.camera, self.look_now(), key)
+    }
+
+    /// `keys` by score, highest first, then the bigger on-screen error.
+    fn by_score(&self, keys: impl IntoIterator<Item = CubeKey>) -> Vec<CubeKey> {
+        let mut scored: Vec<(f64, f64, CubeKey)> = keys
+            .into_iter()
+            .map(|k| (-self.score(k), -screen_error(self.camera, k), k))
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        scored.into_iter().map(|e| e.2).collect()
+    }
+
+    /// Whether `key` lies inside a far node drawn over loaded near ground
+    /// ([`track_lingering`]): it is part of what replaces that node.
+    fn near_ground(&self) -> impl Fn(CubeKey) -> bool + '_ {
+        let levels = self.lingering.keys().fold(0u32, |m, k| m | 1 << k.level);
+        move |key: CubeKey| {
+            levels != 0
+                && (key.level + 1..=MAX_CUBE_LEVEL)
+                    .filter(|l| levels >> l & 1 == 1)
+                    .any(|l| self.lingering.contains_key(&ancestor(key, l)))
+        }
+    }
+
+    /// Queues `keys` (not handed out) where they belong: those over near
+    /// ground at the very front, nearest first; holes at the back of the
+    /// first ones, by score; the rest in their buckets. `dropped` are no
+    /// longer planned: skipped if queued.
+    fn queue_jobs(&self, keys: Vec<CubeKey>, dropped: Vec<CubeKey>) {
+        let camera = self.camera;
+        let near = self.near_ground();
+        let (mut urgent, rest): (Vec<CubeKey>, Vec<CubeKey>) =
+            keys.into_iter().partition(|&k| near(k));
+        urgent.sort_by(|a, b| a.distance(camera).total_cmp(&b.distance(camera)));
+        let hole: FxHashSet<CubeKey> = (self.holes.iter().map(|h| h.0))
+            .chain(self.holding.iter().copied())
+            .collect();
+        let (holes, mut rest): (Vec<CubeKey>, Vec<CubeKey>) =
+            rest.into_iter().partition(|k| hole.contains(k));
+        let holes = self.by_score(holes);
+        rest.sort_by_cached_key(|&k| std::cmp::Reverse((screen_error(camera, k) * 1e6) as u64));
+        let mut queue = self.shared.queue.lock().unwrap();
+        for key in urgent.iter().chain(&holes).chain(&rest) {
+            queue.dropped.remove(key);
+        }
+        queue.dropped.extend(dropped);
+        for key in urgent.into_iter().rev() {
+            queue.first.push_front(key);
+        }
+        queue.first.extend(holes);
+        for key in rest {
+            queue.push(bucket(camera, key), key);
+        }
+        drop(queue);
+        self.shared.wake.notify_all();
     }
 
     /// The planned nodes among `keys` with nothing drawn over their place:
@@ -3900,15 +4127,10 @@ impl CubeLod {
             .filter(|t| self.tiles.asked.insert(*t))
             .collect();
         self.tiles.work.request.splice(0..0, tiles);
-        let rank = self.rank();
-        let mut cubes: Vec<CubeKey> = wave
-            .iter()
-            .filter_map(|k| match *k {
-                FarKey::Cube(c) => Some(c),
-                FarKey::Tile(_) => None,
-            })
-            .collect();
-        cubes.sort_by(|a, b| self.priority(&rank, a).total_cmp(&self.priority(&rank, b)));
+        let cubes = self.by_score(wave.iter().filter_map(|k| match *k {
+            FarKey::Cube(c) => Some(c),
+            FarKey::Tile(_) => None,
+        }));
         self.cover = cubes
             .iter()
             .copied()
@@ -3957,26 +4179,40 @@ impl CubeLod {
         self.fill_queue();
     }
 
-    /// Queues every planned node not handed out: holes first, then by sector
-    /// (the view's first) and distance.
+    /// Queues every planned node not handed out: the ones over near ground
+    /// first (nearest first), then holes (by score), then the rest by bucket
+    /// ([`bucket_order`]: the crosshair's and the near ones first).
     fn fill_queue(&mut self) {
-        let rank = self.rank();
         let now = Instant::now();
+        {
+            let (wanted, cover) = (&self.wanted, &self.cover);
+            self.refreshing
+                .retain(|k| wanted.contains(k) || cover.contains(k));
+        }
         let waiting = |k: &CubeKey| {
             !self.delivered.contains(k)
                 && self.failed.get(k).is_none_or(|at| {
                     now.saturating_duration_since(*at) >= far_ms("HORIZON_FAR_RETRY_MS", RETRY)
                 })
         };
-        let mut firsts = FxHashSet::default();
-        let mut first: Vec<CubeKey> = self
-            .holes
-            .iter()
-            .map(|h| h.0)
+        self.linger_queued = self.lingering.keys().copied().collect();
+        let camera = self.camera;
+        let near = self.near_ground();
+        let mut urgent: Vec<CubeKey> = if self.lingering.is_empty() {
+            Vec::new()
+        } else {
+            (self.order.iter().map(|e| e.1))
+                .filter(|&k| waiting(&k) && near(k))
+                .collect()
+        };
+        urgent.sort_by(|a, b| a.distance(camera).total_cmp(&b.distance(camera)));
+        let mut firsts: FxHashSet<CubeKey> = urgent.iter().copied().collect();
+        let holes: Vec<CubeKey> = (self.holes.iter().map(|h| h.0))
             .chain(self.holding.iter().copied())
-            .filter(|k| waiting(k) && firsts.insert(*k))
+            .filter(|k| waiting(k) && !firsts.contains(k))
             .collect();
-        first.sort_by(|a, b| self.priority(&rank, a).total_cmp(&self.priority(&rank, b)));
+        let holes = self.by_score(holes);
+        firsts.extend(holes.iter().copied());
         let mut queue = self.shared.queue.lock().unwrap();
         queue.clear();
         // Nodes to make again that the new plan dropped: not worth making.
@@ -3984,15 +4220,13 @@ impl CubeLod {
         queue
             .later
             .retain(|k| wanted.contains(k) || cover.contains(k));
-        self.refreshing
-            .retain(|k| wanted.contains(k) || cover.contains(k));
-        queue.first.extend(first);
-        for &(s, key) in &self.order {
+        queue.first.extend(urgent);
+        queue.first.extend(holes);
+        for &(b, key) in &self.order {
             if waiting(&key) && !firsts.contains(&key) {
-                queue.sectors[usize::from(s)].push_back(key);
+                queue.push(b, key);
             }
         }
-        queue.order = sector_order(self.facing.unwrap_or([0.0, 0.0, 1.0]));
         drop(queue);
         self.shared.wake.notify_all();
     }
@@ -4020,23 +4254,18 @@ impl CubeLod {
         for key in &due {
             self.failed.remove(key);
         }
-        let mut queue = self.shared.queue.lock().unwrap();
-        queue.first.extend(due);
-        drop(queue);
-        self.shared.wake.notify_all();
+        self.queue_jobs(due, Vec::new());
     }
 
-    /// Reorders the queue's sectors when the view turned past [`TURN`].
-    fn face(&mut self, forward: [f64; 3]) {
-        if self
-            .facing
-            .is_some_and(|f| angle_between(f, forward) <= TURN)
-        {
+    /// Reorders the queue's buckets when the view turned past [`TURN`] or
+    /// zoomed ([`Look::moved`]): no job is scored again.
+    fn face(&mut self, look: Look) {
+        if self.look.is_some_and(|l| !l.moved(&look)) {
             return;
         }
-        self.facing = Some(forward);
-        let order = sector_order(forward);
-        self.shared.queue.lock().unwrap().order = order;
+        self.look = Some(look);
+        let order = bucket_order(look);
+        self.shared.queue.lock().unwrap().reorder(order);
     }
 
     /// The nodes the renderer can drop: handed out before, no longer in the
@@ -4255,7 +4484,6 @@ impl CubeLod {
     }
 }
 
-/// The node of `level` holding `key` (`level` at least `key.level`).
 /// Notes the drawn nodes (`delivered`, less the `empty` ones) that hold
 /// loaded near cubes (`snapshot`) and since when (`lingering`), for
 /// [`CubeLodStats::linger_nodes`] and `linger_ms`.
@@ -4283,6 +4511,7 @@ fn track_lingering(
     *lingering = next;
 }
 
+/// The node of `level` holding `key` (`level` at least `key.level`).
 fn ancestor(key: CubeKey, level: u8) -> CubeKey {
     let up = level - key.level;
     CubeKey::new(level, key.x >> up, key.y >> up, key.z >> up)
@@ -5510,7 +5739,7 @@ mod tests {
         let done = PlanDone {
             epoch: lod.epoch,
             tree,
-            order: leaves.iter().map(|&k| (sector(camera, k), k)).collect(),
+            order: leaves.iter().map(|&k| (bucket(camera, k), k)).collect(),
             leaves: Arc::new(leaves),
             changed: true,
             added,
@@ -6194,12 +6423,55 @@ mod tests {
         assert_eq!(queued.len(), 8);
     }
 
+    /// The look along `forward` of the standard view.
+    fn looking(forward: [f64; 3]) -> Look {
+        Look {
+            forward,
+            edge: FarView::standard(1.0).half_diagonal(),
+        }
+    }
+
     #[test]
-    fn the_queue_takes_what_the_camera_faces_first() {
+    fn the_crosshair_comes_first_then_half_as_much_the_near() {
+        let edge = FarView::standard(1.0).half_diagonal();
+        let deg = |d: f64| d.to_radians();
+        // The weights as given: crosshair 1, nearness a half.
+        assert!(
+            (far_priority(0.0, edge, 0.0) - (FAR_PRIORITY_VIEW + FAR_PRIORITY_NEAR)).abs() < 1e-9
+        );
+        // A far spot under the crosshair beats near land off to the side:
+        // nearest first is what kept the view from sharpening.
+        assert!(far_priority(0.0, edge, 3000.0) > far_priority(deg(60.0), edge, 300.0));
+        assert!(far_priority(0.0, edge, 3000.0) > far_priority(deg(35.0), edge, 300.0));
+        // Of two at the crosshair, the nearer; of two as far, the one nearer
+        // the crosshair; the weight falls smoothly to the screen's edge.
+        assert!(far_priority(0.0, edge, 300.0) > far_priority(0.0, edge, 3000.0));
+        let mut last = f64::INFINITY;
+        for d in (0..=180).step_by(5) {
+            let w = crosshair_weight(deg(f64::from(d)), edge);
+            assert!(w <= last, "{d}");
+            last = w;
+        }
+        assert!((crosshair_weight(edge, edge) - FAR_PRIORITY_EDGE).abs() < 1e-9);
+        assert!((crosshair_weight(std::f64::consts::PI, edge) - FAR_PRIORITY_BEHIND).abs() < 1e-9);
+        // Behind the player is last, unless it is near him.
+        assert!(far_priority(deg(180.0), edge, 3000.0) < far_priority(edge, edge, 3000.0));
+        assert!(far_priority(deg(180.0), edge, 0.0) > far_priority(edge, edge, 3000.0));
+        // Zoomed in (a spyglass), what is 10 degrees off counts for less.
+        let zoomed = FarView::standard(1.0)
+            .looking([0.0, 0.0, 1.0], deg(10.0))
+            .half_diagonal();
+        assert!(crosshair_weight(deg(10.0), zoomed) < crosshair_weight(deg(10.0), edge));
+    }
+
+    #[test]
+    fn the_queue_takes_the_crosshair_first_and_resorts_on_a_turn() {
         let mut lod = lod_for_test();
         let camera = [0.5, 70.5, 0.5];
         lod.camera = camera;
-        // Level-4 nodes (256 blocks) in a ring 2,000 blocks out, every 30 degrees.
+        // Level-4 nodes (256 blocks) in a ring 2,000 blocks out, every 30
+        // degrees, the node round the camera, and one 300 blocks off to the
+        // side (+X).
         let ring: Vec<CubeKey> = (0..12)
             .map(|i| {
                 let a = f64::from(i) * 30f64.to_radians();
@@ -6207,52 +6479,220 @@ mod tests {
             })
             .collect();
         let near = key(4, 0, 0, 0);
+        let side = CubeKey::containing(2, cube_of([300.0, 70.0, 0.0]));
         let mut all = ring.clone();
-        all.push(near);
-        all.sort_by(|a, b| a.distance(camera).total_cmp(&b.distance(camera)));
-        lod.order = all.iter().map(|&k| (sector(camera, k), k)).collect();
-        let first_of = |lod: &mut CubeLod, facing: [f64; 3]| {
-            lod.facing = None;
-            lod.face(facing);
+        all.extend([near, side]);
+        lod.order = all.iter().map(|&k| (bucket(camera, k), k)).collect();
+        let first_of = |lod: &mut CubeLod, forward: [f64; 3]| {
+            lod.face(looking(forward));
             lod.fill_queue();
             lod.shared.queue.lock().unwrap().drain()
         };
-        // Looking along +Z: the node around the camera, then the one ahead,
-        // the one behind last.
+        let at = |order: &[CubeKey], k: CubeKey| order.iter().position(|&o| o == k).unwrap();
+        // Looking along +Z: round the camera, then the crosshair's, the one
+        // behind last; the near one off to the side after the far ones in view.
         let order = first_of(&mut lod, [0.0, 0.0, 1.0]);
         assert_eq!(order.len(), all.len());
-        assert_eq!(order[0], near);
-        assert_eq!(order[1], ring[0], "{order:?}");
+        assert_eq!(order[..2], [near, ring[0]], "{order:?}");
         assert_eq!(*order.last().unwrap(), ring[6]);
-        // Turned around: behind comes first. Nothing is sorted again, the
-        // sectors are taken in another order.
+        assert!(at(&order, side) > at(&order, ring[1]), "{order:?}");
+        assert!(at(&order, side) > at(&order, ring[11]), "{order:?}");
+        // Turned around: behind comes first. A small turn changes nothing.
         let turned = first_of(&mut lod, [0.0, 0.0, -1.0]);
         assert_eq!(turned[1], ring[6]);
         assert_eq!(*turned.last().unwrap(), ring[0]);
-        // A hole comes before anything, whichever way the camera looks.
+        let nudged = first_of(&mut lod, [0.03, 0.0, -1.0]);
+        assert_eq!(nudged, turned);
+        // Turned to the side: the near node there comes right after.
+        let aside = first_of(&mut lod, [1.0, 0.0, 0.0]);
+        assert_eq!(aside[1], side, "{aside:?}");
+        // A hole comes before the score, whichever way the camera looks ...
         lod.holes = vec![(ring[6], None)];
         let holed = first_of(&mut lod, [0.0, 0.0, 1.0]);
         assert_eq!(holed[0], ring[6]);
         assert_eq!(holed.iter().filter(|&&k| k == ring[6]).count(), 1);
+        // ... and a node replacing a far node drawn over near ground before
+        // that.
+        lod.lingering.insert(ancestor(ring[3], 5), Instant::now());
+        let urgent = first_of(&mut lod, [0.0, 0.0, 1.0]);
+        assert_eq!(urgent[..2], [ring[3], ring[6]], "{urgent:?}");
     }
 
     #[test]
-    fn a_turn_reorders_the_queue_taken_from() {
+    fn of_equal_scores_the_bigger_on_screen_error_goes_first() {
+        let mut lod = lod_for_test();
+        let camera = [0.5, 70.5, 0.5];
+        lod.camera = camera;
+        lod.face(looking([0.0, 0.0, 1.0]));
+        let big = CubeKey::containing(5, cube_of([0.0, 70.0, 2100.0]));
+        let small = CubeKey::containing(3, cube_of([130.0, 192.0, 2100.0]));
+        assert_eq!(bucket(camera, big), bucket(camera, small));
+        lod.queue_jobs(vec![small, big], Vec::new());
+        assert_eq!(lod.shared.queue.lock().unwrap().drain(), [big, small]);
+    }
+
+    #[test]
+    fn a_turn_reorders_the_buckets_taken_from() {
         let mut queue = Queue::default();
         let camera = [0.5, 0.5, 0.5];
         let east = key(3, 20, 0, 0);
         let west = key(3, -21, 0, 0);
         for k in [east, west] {
-            queue.sectors[usize::from(sector(camera, k))].push_back(k);
+            queue.push(bucket(camera, k), k);
         }
-        queue.order = sector_order([1.0, 0.0, 0.0]);
+        queue.reorder(bucket_order(looking([1.0, 0.0, 0.0])));
         assert_eq!(queue.pop(), Some(east));
-        queue.sectors[usize::from(sector(camera, east))].push_back(east);
-        queue.order = sector_order([-1.0, 0.0, 0.0]);
+        queue.push(bucket(camera, east), east);
+        queue.reorder(bucket_order(looking([-1.0, 0.0, 0.0])));
         assert_eq!(queue.pop(), Some(west));
         // A key the plan dropped is skipped.
         queue.dropped.insert(east);
         assert_eq!(queue.pop(), None);
+        // A key pushed into a bucket taken earlier than the cursor comes next.
+        queue.push(bucket(camera, east), east);
+        queue.push(bucket(camera, west), west);
+        assert_eq!(queue.pop(), Some(west));
+    }
+
+    #[test]
+    fn a_stepped_node_splits_only_once_the_node_it_replaced_is_gone() {
+        let mut lod = lod_for_test();
+        let parent = key(5, 3, 0, 3);
+        put(&mut lod, &[parent], &[]);
+        lod.deliver(parent, false);
+        let children: Vec<CubeKey> = parent.children().to_vec();
+        put(&mut lod, &children, &[]);
+        for &c in &children[..7] {
+            lod.deliver(c, false);
+        }
+        // The parent stands (stale) until all eight are in: its children
+        // don't count as drawn, so none splits and holds it up again.
+        let drawn = lod.drawn_for_steps();
+        assert!(drawn.contains(&parent));
+        assert!(children.iter().all(|c| !drawn.contains(c)), "{drawn:?}");
+        lod.deliver(children[7], false);
+        assert_eq!(lod.removed(), vec![parent]);
+        let drawn = lod.drawn_for_steps();
+        assert!(children.iter().all(|c| drawn.contains(c)), "{drawn:?}");
+    }
+
+    /// Whether `node` is drawn over: it, a node holding it, or nodes inside
+    /// it filling it, are in `cover`.
+    fn filled(node: CubeKey, cover: &FxHashSet<CubeKey>) -> bool {
+        let mut up = node;
+        loop {
+            if cover.contains(&up) {
+                return true;
+            }
+            if up.level >= MAX_CUBE_LEVEL {
+                break;
+            }
+            up = up.parent();
+        }
+        let inside: f64 = (cover.iter())
+            .filter(|c| c.level < node.level && ancestor(**c, node.level) == node)
+            .map(|c| 8f64.powi(i32::from(c.level)))
+            .sum();
+        (inside - 8f64.powi(i32::from(node.level))).abs() < 0.5
+    }
+
+    #[test]
+    fn refining_and_merging_draw_one_node_on_every_path_with_no_gap() {
+        use crate::lod::swap::Swap;
+        let nowhere = |_: SectionPos| false;
+        let mut lod = lod_for_test();
+        let mut swap = Swap::default();
+        let mut queued = FxHashSet::default();
+        let mut shown: FxHashSet<CubeKey> = FxHashSet::default();
+        let mut mix = 0x9e37_79b9_7f4a_7c15u64;
+        let mut hash = |k: CubeKey| {
+            mix = mix.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let v =
+                (k.x as u64) ^ (k.y as u64) << 21 ^ (k.z as u64) << 42 ^ u64::from(k.level) << 60;
+            (v ^ mix >> 17).wrapping_mul(0xff51_afd7_ed55_8ccd)
+        };
+        // Refine at one place, then fly away so it merges back.
+        for camera in [[100.5, 64.5, -40.5], [2100.5, 64.5, -40.5]] {
+            lod.camera = camera;
+            let mut rounds = 0;
+            loop {
+                let drawn = lod.drawn_for_steps();
+                let plan = stepped(camera, Some(&drawn), &nowhere);
+                put(&mut lod, &plan, &[]);
+                for &k in &plan {
+                    if !lod.delivered.contains(&k) && queued.insert(k) {
+                        swap.queued(k);
+                    }
+                }
+                // About half of what waits comes in, in a scrambled order; a
+                // fifth of it empty.
+                let mut waiting: Vec<(u64, CubeKey)> = (plan.iter().copied())
+                    .filter(|k| !lod.delivered.contains(k))
+                    .map(|k| (hash(k), k))
+                    .collect();
+                waiting.sort_unstable();
+                let take = waiting.len().div_ceil(2);
+                for (h, k) in waiting.into_iter().take(take) {
+                    let empty = h % 5 == 0;
+                    lod.deliver(k, empty);
+                    queued.remove(&k);
+                    if empty {
+                        swap.unwait(k);
+                        swap.forget(k);
+                    } else {
+                        swap.installed(k, false);
+                    }
+                }
+                for k in lod.removed() {
+                    swap.retire(k);
+                }
+                let step = swap.step();
+                let mut cover: FxHashSet<CubeKey> = shown.clone();
+                for k in &step.fade {
+                    cover.remove(k);
+                }
+                cover.extend(step.show.iter().copied());
+                // Empty nodes handed out draw nothing and need nothing.
+                cover.extend(lod.empty.iter().copied());
+                // A node fades only with every planned node over its place
+                // drawn over (or empty); what the plan left out of range
+                // (far behind) needs nothing.
+                let planned: FxHashSet<CubeKey> = plan.iter().copied().collect();
+                for k in step.fade.iter().filter(|k| shown.contains(k)) {
+                    let over: Vec<CubeKey> = (planned.iter().copied())
+                        .filter(|p| {
+                            (p.level <= k.level && ancestor(*p, k.level) == *k)
+                                || (p.level > k.level && ancestor(*k, p.level) == *p)
+                        })
+                        .collect();
+                    for p in over {
+                        assert!(
+                            filled(p, &cover),
+                            "{k:?} faded with {p:?} not drawn (camera {camera:?}, round {rounds})"
+                        );
+                    }
+                }
+                for k in step.fade {
+                    shown.remove(&k);
+                }
+                shown.extend(step.show);
+                // One drawn node on every root-to-leaf path.
+                for &k in &shown {
+                    let mut up = k;
+                    while up.level < MAX_CUBE_LEVEL {
+                        up = up.parent();
+                        assert!(!shown.contains(&up), "{k:?} drawn with {up:?}");
+                    }
+                }
+                let done = plan.iter().all(|k| lod.delivered.contains(k)) && swap.is_idle();
+                if done && stepped(camera, Some(&plan), &nowhere) == plan {
+                    break;
+                }
+                rounds += 1;
+                assert!(rounds < 400);
+            }
+            assert!(rounds >= 3, "{rounds}");
+        }
     }
 }
 

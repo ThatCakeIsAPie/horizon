@@ -31,6 +31,17 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 static CLASSED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static BUILT: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static LATER: AtomicU64 = AtomicU64::new(0);
+/// Time spent making nodes (microseconds), by how: level 0 as a cube, level 1 from eight cubes, from surfaces
+/// (levels 2 and up, and coarse levels 0 and 1: [`coarse_from_surfaces`]); and the number of each.
+static SPENT: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static MADE: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Whether the coarse pass makes levels 0 and 1 from the columns' surfaces as the far levels are, not from
+/// the generator's whole cubes (eight for level 1): a fraction of the cost, and the cubes come with the whole
+/// pass. `HORIZON_FAR_COARSE_CUBES=1` makes them as cubes in both passes.
+fn coarse_from_surfaces() -> bool {
+    crate::lod::cube::far_knob("HORIZON_FAR_COARSE_CUBES", 0) == 0
+}
 
 fn log_stats() {
     if !crate::lod::cube::profile::on() {
@@ -41,8 +52,10 @@ fn log_stats() {
     if built == 0 || built % 4096 != 0 {
         return;
     }
+    let each = |i: usize| n(&SPENT[i]) as f64 / 1000.0 / n(&MADE[i]).max(1) as f64;
     log::info!(
-        "Horizon Earth far view so far: classified air {} rock {} mixed {}; built uniform {} from surfaces {} as cubes {}; later {}",
+        "Horizon Earth far view so far: classified air {} rock {} mixed {}; built uniform {} from surfaces {} as cubes {}; later {}; \
+         time: cubes {} ms ({} at {:.2} ms), level-1 {} ms ({} at {:.2} ms), surfaces {} ms ({} at {:.2} ms)",
         n(&CLASSED[0]),
         n(&CLASSED[1]),
         n(&CLASSED[2]),
@@ -50,6 +63,15 @@ fn log_stats() {
         n(&BUILT[1]),
         n(&BUILT[2]),
         n(&LATER),
+        n(&SPENT[0]) / 1000,
+        n(&MADE[0]),
+        each(0),
+        n(&SPENT[1]) / 1000,
+        n(&MADE[1]),
+        each(1),
+        n(&SPENT[2]) / 1000,
+        n(&MADE[2]),
+        each(2),
     );
 }
 
@@ -194,13 +216,8 @@ pub(super) fn node(
     // With land cover the biomes read the map at a coarse level: have them before building, never wait for them.
     match key.level {
         0 => earth.biomes_ready(origin[0], origin[2], 1)?,
-        1 => {}
-        level => {
-            // The columns' middles, and the node's own corner for a node that is one voxel.
-            let step = 1i32 << level;
-            earth.biomes_ready(origin[0] + step / 2, origin[2] + step / 2, step)?;
-            earth.biomes_ready(origin[0], origin[2], step)?;
-        }
+        // Level 1 is made of level 0's; the others read theirs in `from_surfaces`.
+        _ => {}
     }
     let state = |id: u32| BlockStateId(if id == 0 { air } else { id });
     let uniform = |id: u32| {
@@ -243,38 +260,60 @@ pub(super) fn node(
             let refs: [&CubeNode; 8] = std::array::from_fn(|i| &nodes[i]);
             Ok(downsample(refs, BlockStateId(air), kind))
         }
-        level => {
-            let fill = if decor.trees {
-                earth.classify_node_above(u32::from(level), key.x, key.y, key.z)?
-            } else {
-                earth.classify_node(u32::from(level), key.x, key.y, key.z)?
-            };
-            if let Some(id) = earth.fill_block(fill) {
-                BUILT[0].fetch_add(1, Relaxed);
-                return Ok(uniform(id));
-            }
-            BUILT[1].fetch_add(1, Relaxed);
-            let mut cols = earth.node_columns(u32::from(level), key.x, key.z)?;
-            earth.decorate_columns(&mut cols, decor)?;
-            let step = 1i32 << level;
-            let biomes: Vec<u16> = (0..256)
-                .map(|i| {
-                    biome(
-                        origin[0] + (i & 15) * step + step / 2,
-                        origin[2] + (i >> 4) * step + step / 2,
-                    )
-                })
-                .collect();
-            Ok(CubeNode::from_fn(key, |x, y, z| {
-                let column = z << 4 | x;
-                let lo = origin[1].saturating_add(y as i32 * step);
-                Voxel {
-                    state: state(earth.far_voxel(&cols, column, lo)),
-                    biome: biomes[column],
-                }
-            }))
-        }
+        _ => from_surfaces(earth, key, air, biome, decor),
     }
+}
+
+/// Node `key` from its columns' surfaces at the zoom of its step (levels 2 and up; levels 0 and 1 too in the
+/// coarse pass, [`coarse_from_surfaces`]): its class first, uniform when the class says so.
+fn from_surfaces(
+    earth: &EarthGenerator,
+    key: CubeKey,
+    air: u32,
+    biome: &dyn Fn(i32, i32) -> u16,
+    decor: FarDecor,
+) -> Result<CubeNode, NotReady> {
+    let origin = key.origin();
+    let level = key.level;
+    let step = 1i32 << level;
+    // The biomes are read at the columns' middles: have them first, never wait for them.
+    earth.biomes_ready(origin[0] + step / 2, origin[2] + step / 2, step)?;
+    earth.biomes_ready(origin[0], origin[2], step)?;
+    let state = |id: u32| BlockStateId(if id == 0 { air } else { id });
+    let fill = if decor.trees {
+        earth.classify_node_above(u32::from(level), key.x, key.y, key.z)?
+    } else {
+        earth.classify_node(u32::from(level), key.x, key.y, key.z)?
+    };
+    if let Some(id) = earth.fill_block(fill) {
+        BUILT[0].fetch_add(1, Relaxed);
+        return Ok(CubeNode::uniform(
+            key,
+            Voxel {
+                state: state(id),
+                biome: biome(origin[0], origin[2]),
+            },
+        ));
+    }
+    BUILT[1].fetch_add(1, Relaxed);
+    let mut cols = earth.node_columns(u32::from(level), key.x, key.z)?;
+    earth.decorate_columns(&mut cols, decor)?;
+    let biomes: Vec<u16> = (0..256)
+        .map(|i| {
+            biome(
+                origin[0] + (i & 15) * step + step / 2,
+                origin[2] + (i >> 4) * step + step / 2,
+            )
+        })
+        .collect();
+    Ok(CubeNode::from_fn(key, |x, y, z| {
+        let column = z << 4 | x;
+        let lo = origin[1].saturating_add(y as i32 * step);
+        Voxel {
+            state: state(earth.far_voxel(&cols, column, lo)),
+            biome: biomes[column],
+        }
+    }))
 }
 
 impl CubicLodSampler {
@@ -330,7 +369,22 @@ impl CubicLodSampler {
             },
             Pass::Whole => decor,
         };
-        let made = node(earth, key, self.air, &biome, &|s| self.kind(s), made_with);
+        let started = std::time::Instant::now();
+        let shallow = pass == Pass::Coarse && key.level < 2 && coarse_from_surfaces();
+        let made = if shallow {
+            from_surfaces(earth, key, self.air, &biome, made_with)
+        } else {
+            node(earth, key, self.air, &biome, &|s| self.kind(s), made_with)
+        };
+        if crate::lod::cube::profile::on() && made.is_ok() {
+            let how = if shallow || key.level >= 2 {
+                2
+            } else {
+                usize::from(key.level)
+            };
+            SPENT[how].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+            MADE[how].fetch_add(1, Relaxed);
+        }
         if decor.trees
             && let Some(refine) = &self.refine
         {

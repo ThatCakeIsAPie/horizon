@@ -7,7 +7,7 @@
 //! time, so they go behind all other far work. A node made again is made whole (with its trees) and replaces
 //! the coarse one in place. Only whole nodes are kept in the far cache, so a revisit draws them refined at once.
 
-use crate::lod::cube::{CubeKey, LateContent};
+use crate::lod::cube::{CubeKey, LateContent, Look, job_score};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -83,7 +83,7 @@ impl Refine {
         (s.coarse.len(), s.handed.len())
     }
 
-    /// The next coarse nodes to refine: nearest first, those in front of the camera before those behind.
+    /// The next coarse nodes to refine: by the far view's work order (the crosshair first, then the near).
     fn next(s: &mut State, now: Instant) -> Vec<CubeKey> {
         s.handed
             .retain(|_, at| now.duration_since(*at) < HANDED_FOR);
@@ -102,18 +102,12 @@ impl Refine {
         if room == 0 || s.coarse.is_empty() {
             return Vec::new();
         }
-        let score = |key: &CubeKey| {
-            let (o, size) = (key.origin(), f64::from(key.size()));
-            let d: [f64; 3] = std::array::from_fn(|i| f64::from(o[i]) + size / 2.0 - camera[i]);
-            let distance = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-            let along = d[0] * forward[0] + d[1] * forward[1] + d[2] * forward[2];
-            // Behind the camera (beyond the node's own size): as if three times as far.
-            if along < -size {
-                distance * 3.0
-            } else {
-                distance
-            }
+        // The far view's work order (`job_score`: the crosshair first, half as much the near), highest first.
+        let look = Look {
+            forward,
+            ..Look::default()
         };
+        let score = |key: &CubeKey| -job_score(camera, look, *key);
         let mut keys: Vec<(f64, CubeKey)> = s.coarse.iter().map(|k| (score(k), *k)).collect();
         let room = room.min(keys.len());
         keys.select_nth_unstable_by(room - 1, |a, b| a.0.total_cmp(&b.0));
@@ -178,10 +172,11 @@ mod tests {
         refine.view([10.0, 32.0, 32.0], [1.0, 0.0, 0.0], 4096.0, true);
         let first = refine.take_refreshes();
         assert_eq!(first.len(), BATCH);
-        // Nearest first; a node behind the camera counts three times its distance (node -2, 106
-        // blocks behind, comes after node 4, 278 ahead, and before node 5, 342 ahead).
-        let order: Vec<i32> = first.iter().take(8).map(|(min, _)| min[0] >> 6).collect();
-        assert_eq!(order, [0, -1, 1, 2, 3, 4, -2, 5]);
+        // The far view's work order: the node round the camera and the one touching it (10 blocks behind, its
+        // edge under the crosshair), then the ones ahead, nearest first; the rest behind come after all ahead.
+        let order: Vec<i32> = first.iter().map(|(min, _)| min[0] >> 6).collect();
+        let expected: Vec<i32> = [0, -1].into_iter().chain(1..=46).collect();
+        assert_eq!(order, expected);
         assert_eq!(first[0].1, [63, 63, 63], "the box is the node's blocks");
         // Nothing more until the batch is made.
         assert!(refine.take_refreshes().is_empty());
