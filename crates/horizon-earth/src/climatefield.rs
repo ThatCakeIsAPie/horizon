@@ -144,7 +144,7 @@ type TileKey = (ClimateVar, u8, u32);
 
 struct Memory {
     files: HashMap<ClimateVar, FileState>,
-    tiles: HashMap<TileKey, (Arc<ClimateTile>, u64)>,
+    tiles: crate::fastmap::FastMap<TileKey, (Arc<ClimateTile>, u64)>,
     absent: HashSet<ClimateVar>,
     /// Tiles the source will not give this session: read as "no data", never stored.
     blank: HashSet<TileKey>,
@@ -186,7 +186,7 @@ impl ClimateStore {
             grid,
             memory: Mutex::new(Memory {
                 files: HashMap::new(),
-                tiles: HashMap::new(),
+                tiles: Default::default(),
                 absent: HashSet::new(),
                 blank: HashSet::new(),
                 clock: 0,

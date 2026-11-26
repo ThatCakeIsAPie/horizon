@@ -70,7 +70,7 @@ impl fmt::Display for LoadError {
 impl std::error::Error for LoadError {}
 
 struct Memory {
-    tiles: HashMap<TileId, (Arc<Tile>, u64)>,
+    tiles: crate::fastmap::FastMap<TileId, (Arc<Tile>, u64)>,
     clock: u64,
 }
 
@@ -124,7 +124,7 @@ impl TileStore {
             fetcher,
             capacity: memory_tiles,
             memory: Mutex::new(Memory {
-                tiles: HashMap::new(),
+                tiles: Default::default(),
                 clock: 0,
             }),
             inflight: Mutex::default(),

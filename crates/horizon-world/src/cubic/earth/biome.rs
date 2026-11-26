@@ -76,8 +76,9 @@
 //!
 //! [`EarthBiomes`] gives this to the cubic generator as its biome source.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use horizon_earth::fastmap::FastMap;
 use horizon_earth::{Climate, ClimateLookup, LandClass, LoadError, Lookup};
 
 use super::dry::{DESERT_ARIDITY, ERODED_M, RUGGED_M, SAVANNA_FROM_C, aridity, is_dry};
@@ -653,6 +654,16 @@ impl EarthGenerator {
     /// The biome of the 4 by 4 column `(qx, qz)` (block `x >> 2`), read at its middle: the class and the height
     /// at [`BIOME_SAMPLE_M`] of ground. Without land cover, `plains`.
     pub(super) fn biome_core(&self, a: Access, qx: i32, qz: i32) -> Result<Biome, Gap> {
+        if let Some(biome) = self.biome_memo.get(qx, qz) {
+            return Ok(biome);
+        }
+        let biome = self.biome_uncached(a, qx, qz)?;
+        self.biome_memo.put(qx, qz, biome);
+        Ok(biome)
+    }
+
+    /// [`EarthGenerator::biome_core`] without the memo: reads the maps.
+    pub(super) fn biome_uncached(&self, a: Access, qx: i32, qz: i32) -> Result<Biome, Gap> {
         let Some(land) = self.land_source() else {
             return Ok(Biome::Plains);
         };
@@ -849,5 +860,63 @@ impl BiomeColumns for EarthBiomes {
 
     fn possible_biomes(&self) -> Vec<BiomeId> {
         (0..Biome::ALL.len() as u32).map(BiomeId).collect()
+    }
+}
+
+/// Biomes already read, by 4 by 4 column: a far node asks for each column's biome several times (the readiness
+/// check, the trees, the client's biome ids), and every read walks the class, climate, height and river maps.
+/// Only answers that were made are kept, so a column whose map data is missing is asked for again.
+///
+/// Sharded so the far workers do not queue on one lock.
+pub(super) struct BiomeMemo {
+    shards: [Mutex<FastMap<(i32, i32), Biome>>; MEMO_SHARDS],
+}
+
+const MEMO_SHARDS: usize = 16;
+/// Biomes kept per shard before it starts over (about 2 million columns in all).
+const MEMO_SHARD_CAP: usize = 1 << 17;
+
+impl Default for BiomeMemo {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(FastMap::default())),
+        }
+    }
+}
+
+impl BiomeMemo {
+    fn shard(&self, qx: i32, qz: i32) -> MutexGuard<'_, FastMap<(i32, i32), Biome>> {
+        let h = (qx as u32).wrapping_mul(0x9E37_79B1) ^ (qz as u32).wrapping_mul(0x85EB_CA6B);
+        self.shards[(h >> 24) as usize % MEMO_SHARDS]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(super) fn get(&self, qx: i32, qz: i32) -> Option<Biome> {
+        self.shard(qx, qz).get(&(qx, qz)).copied()
+    }
+
+    pub(super) fn put(&self, qx: i32, qz: i32, biome: Biome) {
+        let mut shard = self.shard(qx, qz);
+        if shard.len() >= MEMO_SHARD_CAP {
+            shard.clear();
+        }
+        shard.insert((qx, qz), biome);
+    }
+
+    /// Forgets every biome (for timing the reads cold).
+    pub(super) fn clear(&self) {
+        for shard in &self.shards {
+            shard.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        }
+    }
+}
+
+impl EarthGenerator {
+    /// Forgets what the far-view reads kept (biomes), so the next reads cost what a first one does: for
+    /// benchmarks (`examples/far_node_bench.rs`).
+    #[doc(hidden)]
+    pub fn clear_far_memos(&self) {
+        self.biome_memo.clear();
     }
 }

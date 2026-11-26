@@ -250,6 +250,8 @@ pub struct EarthGenerator {
     climate: Option<Arc<horizon_earth::ClimateSource>>,
     /// The water atlas and the river indexes built from it ([`super::water_gen`]).
     pub(super) water: super::water_gen::WaterState,
+    /// Biomes the far view already read ([`super::biome`]).
+    pub(super) biome_memo: super::biome::BiomeMemo,
 }
 
 impl EarthGenerator {
@@ -278,6 +280,7 @@ impl EarthGenerator {
             climate_on: settings.land_cover && settings.climate,
             climate: None,
             water: super::water_gen::WaterState::default(),
+            biome_memo: super::biome::BiomeMemo::default(),
         })
     }
 

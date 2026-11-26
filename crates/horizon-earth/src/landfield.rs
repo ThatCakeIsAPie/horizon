@@ -11,7 +11,7 @@
 //! written under a folder named by [`cache_key`], so a new rule version starts with an empty cache, and it is
 //! found again without a fetch by the next run. The store is safe to share between threads.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
@@ -231,11 +231,11 @@ fn check_land_cover(index: &TiffIndex) -> Result<(), TiffError> {
 }
 
 struct Memory {
-    files: HashMap<WorldCoverFile, FileState>,
-    tiles: HashMap<TileKey, (Arc<LandTile>, u64)>,
-    absent: HashSet<WorldCoverFile>,
+    files: crate::fastmap::FastMap<WorldCoverFile, FileState>,
+    tiles: crate::fastmap::FastMap<TileKey, (Arc<LandTile>, u64)>,
+    absent: crate::fastmap::FastSet<WorldCoverFile>,
     /// Tiles the source will not give this session: read as "no data", never stored.
-    blank: HashSet<TileKey>,
+    blank: crate::fastmap::FastSet<TileKey>,
     clock: u64,
 }
 
@@ -271,10 +271,10 @@ impl LandCoverStore {
             dir: dir.into().join(cache_key()),
             capacity: memory_tiles,
             memory: Mutex::new(Memory {
-                files: HashMap::new(),
-                tiles: HashMap::new(),
-                absent: HashSet::new(),
-                blank: HashSet::new(),
+                files: Default::default(),
+                tiles: Default::default(),
+                absent: Default::default(),
+                blank: Default::default(),
                 clock: 0,
             }),
         }

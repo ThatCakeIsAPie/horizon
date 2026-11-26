@@ -26,6 +26,7 @@ pub mod clean;
 pub mod climate;
 pub mod climatefield;
 pub mod climatesource;
+pub mod fastmap;
 pub mod height;
 pub mod landcover;
 pub mod landfield;
