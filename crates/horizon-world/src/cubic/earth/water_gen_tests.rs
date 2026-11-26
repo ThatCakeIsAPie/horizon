@@ -74,7 +74,7 @@ fn east_west_reach(
 
 /// Gentle ground rising 1 m every 500 m to the east from 30 m, all grass, with one river of discharge `q`
 /// whose level is 1 m under the ground at its ends.
-fn river_rig(q: f32) -> LandRig {
+pub(super) fn river_rig(q: f32) -> LandRig {
     water_rig(
         45.0,
         |lat, lon| {

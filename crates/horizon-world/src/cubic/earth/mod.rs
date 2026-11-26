@@ -30,6 +30,8 @@ mod dry_tests;
 pub mod far;
 pub mod far_trees;
 #[cfg(test)]
+mod far_speed_tests;
+#[cfg(test)]
 mod far_trees_tests;
 pub mod generator;
 #[cfg(test)]

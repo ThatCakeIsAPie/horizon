@@ -69,7 +69,6 @@
 //! * [`WindowInput`] holds a [`VerticalMap`] instead of `mpb` and `vpm` (the rules need neither once rivers and
 //!   lakes are in blocks).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use horizon_earth::{Lake, LandClass, LatLon, RiverReach, VerticalMap};
@@ -258,7 +257,7 @@ struct ReachInfo {
 #[derive(Debug, Default)]
 struct BinLevel {
     side: f64,
-    bins: HashMap<(i32, i32), Vec<u32>>,
+    bins: horizon_earth::fastmap::FastMap<(i32, i32), Vec<u32>>,
 }
 
 /// The reaches of an area, projected into blocks and binned for nearest queries. Built once per area and shared
@@ -299,7 +298,7 @@ impl RiverIndex {
             levels: (0..BIN_LEVELS)
                 .map(|k| BinLevel {
                     side: BIN_BLOCKS * 8f64.powi(k as i32),
-                    bins: HashMap::new(),
+                    bins: Default::default(),
                 })
                 .collect(),
             mpb,

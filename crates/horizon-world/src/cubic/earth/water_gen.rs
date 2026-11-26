@@ -33,9 +33,9 @@
 //! * Any other dry column takes its land kind on its final height. A water class column the rules left dry is
 //!   shore.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use horizon_earth::fastmap::FastMap;
 use horizon_earth::{Lake, LandClass, LandCoverSource, WaterAtlas};
 
 use super::generator::{Access, EarthGenerator, Gap, Rect};
@@ -55,7 +55,10 @@ const CELL_RING: i32 = 1;
 #[derive(Default)]
 pub(super) struct WaterState {
     pub atlas: Option<&'static WaterAtlas>,
-    rivers: Mutex<HashMap<(i32, i32), Arc<RiverIndex>>>,
+    rivers: Mutex<FastMap<(i32, i32), Arc<RiverIndex>>>,
+    /// The river indexes [`EarthGenerator::rivers_near`] gives for a point, by the degree cell of the point:
+    /// what a column's channel test reads, without walking the cells of the ring each time.
+    near: Mutex<FastMap<(i32, i32), Arc<Vec<Arc<RiverIndex>>>>>,
 }
 
 /// What the water rules made of a lattice of columns: one answer and one class per column.
@@ -126,7 +129,7 @@ impl EarthGenerator {
 
     /// The river indexes of the atlas cells the box of `r` meets, and the ring around them; empty without the
     /// atlas.
-    fn rivers_near(&self, r: Rect) -> Vec<Arc<RiverIndex>> {
+    pub(super) fn rivers_near(&self, r: Rect) -> Vec<Arc<RiverIndex>> {
         let Some(atlas) = self.water.atlas else {
             return Vec::new();
         };
@@ -151,7 +154,7 @@ impl EarthGenerator {
 
     /// The nearest river at block `(x, z)` for a lattice of `step` over `indexes`: the hit whose channel edge
     /// is nearest, ties to the lower reach id ([`RiverIndex::nearest`]'s choice).
-    fn river_hit(indexes: &[Arc<RiverIndex>], x: f64, z: f64, step: f64) -> Option<RiverHit> {
+    pub(super) fn river_hit(indexes: &[Arc<RiverIndex>], x: f64, z: f64, step: f64) -> Option<RiverHit> {
         let mut best: Option<RiverHit> = None;
         for index in indexes {
             if let Some(hit) = index.nearest(x, z, step) {
@@ -175,9 +178,35 @@ impl EarthGenerator {
             return None;
         }
         let r = self.point_rect(x, z, 1);
-        let indexes = self.rivers_near(r);
+        let indexes = self.rivers_at_point(r);
         Self::river_hit(&indexes, f64::from(x) + 0.5, f64::from(z) + 0.5, 1.0)
             .filter(|h| h.distance <= h.half_width)
+    }
+
+    /// [`EarthGenerator::rivers_near`] of the one-block rectangle `r`, kept by the degree cell of its point:
+    /// the answer depends on that cell alone.
+    fn rivers_at_point(&self, r: Rect) -> Arc<Vec<Arc<RiverIndex>>> {
+        let (s, w, _, _) = self.lat_lon_box(r);
+        let cell = (s.floor() as i32, w.floor() as i32);
+        let kept = |m: &Mutex<FastMap<(i32, i32), Arc<Vec<Arc<RiverIndex>>>>>| {
+            m.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&cell)
+                .cloned()
+        };
+        if let Some(found) = kept(&self.water.near) {
+            return found;
+        }
+        let made = Arc::new(self.rivers_near(r));
+        let mut near = self
+            .water
+            .near
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if near.len() >= RIVER_CELLS_KEPT * 4 {
+            near.clear();
+        }
+        Arc::clone(near.entry(cell).or_insert(made))
     }
 
     /// The elevation surfaces of `width` by `depth` samples `stride` blocks apart from `(x0, z0)` at `zoom`.
