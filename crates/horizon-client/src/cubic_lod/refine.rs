@@ -5,7 +5,8 @@
 //! noted here as coarse; once every planned node is drawn the producer asks for the nodes to make again
 //! ([`LateContent`]), and this hands out the coarse ones nearest the camera and in view first, a few at a
 //! time, so they go behind all other far work. A node made again is made whole (with its trees) and replaces
-//! the coarse one in place. Only whole nodes are kept in the far cache, so a revisit draws them refined at once.
+//! the coarse one in place. Whole nodes are kept in the far cache as final, coarse ones as coarse
+//! (`lod::cube_cache`): a revisit draws what was refined whole at once, and the rest coarse at once, refined again.
 
 use crate::lod::cube::{CubeKey, LateContent, Look, job_score};
 use std::collections::{HashMap, HashSet};

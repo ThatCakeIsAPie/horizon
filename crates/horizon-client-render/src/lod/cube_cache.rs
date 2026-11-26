@@ -7,7 +7,9 @@
 //! One append-only file per bucket of 8 x 8 x 8 nodes of one level. A record is
 //! `[u32 length][kind u8][level u8][x i32][y i32][z i32][body][u32 checksum]`
 //! (`length` counts everything after itself): kind 0 stores a node, kind 1
-//! erases it. A newer record of a key replaces the older (a node made whole
+//! erases it, kind 2 stores a coarse node (an Earth node's tree-less first
+//! pass: drawn at once on a revisit, never read as whole, never replacing a
+//! whole one; the whole node replaces it once made). A newer record of a key replaces the older (a node made whole
 //! later, a refreshed node). A record cut short by a crash ends the file there
 //! when it is opened; a damaged body fails its checksum and reads as missing.
 //! A file mostly made of dead records is rewritten on open. The folder holds a
@@ -55,7 +57,7 @@ pub const MAX_CACHED_LEVEL: u8 = 14;
 const _: () = assert!(MAX_CACHED_LEVEL <= MAX_CUBE_LEVEL);
 /// A world's cache size when `HORIZON_FAR_CACHE_MB` does not say.
 pub const DEFAULT_CAP_MB: u64 = 1024;
-const FORMAT: u32 = 3;
+const FORMAT: u32 = 4;
 const FINGERPRINT: &str = "fingerprint.txt";
 /// Nodes along one side of a bucket file.
 const BUCKET: i32 = 8;
@@ -64,6 +66,9 @@ const HEAD: usize = 14;
 const TAIL: usize = 4;
 const NODE: u8 = 0;
 const ERASE: u8 = 1;
+/// A coarse node: the tree-less first pass of an Earth node (`cubic_lod::refine`), drawn at once on a revisit
+/// and replaced by the whole node once that is made. Never read as whole ([`CubeLodCache::get`]).
+const COARSE: u8 = 2;
 /// Cubes remembered for [`CubeLodCache::changes_since`] before it says "all".
 const LOG: usize = 4096;
 /// A bucket file this large with mostly dead records is rewritten on open.
@@ -123,8 +128,8 @@ struct Bucket {
     /// `None` once closed to keep the open files few: opened again on use.
     file: Option<fs::File>,
     /// Each key's latest record: where its content (after the length) starts
-    /// and how long it is. `None`: erased.
-    index: FxHashMap<CubeKey, Option<(u64, u32)>>,
+    /// and how long it is, and whether it is a coarse node. `None`: erased.
+    index: FxHashMap<CubeKey, Option<(u64, u32, bool)>>,
     end: u64,
     /// When it was last used (the cache's tick), to close the least recent.
     used: u64,
@@ -137,7 +142,7 @@ impl Bucket {
             .index
             .values()
             .flatten()
-            .map(|&(_, len)| 4 + u64::from(len))
+            .map(|&(_, len, _)| 4 + u64::from(len))
             .sum();
         if bucket.end > COMPACT_ABOVE && live * 2 < bucket.end {
             // Rewritten beside it and swapped in with the file closed.
@@ -180,7 +185,8 @@ impl Bucket {
                 let int = |at: usize| i32::from_le_bytes(head[at..at + 4].try_into().unwrap());
                 let key = CubeKey::new(head[1], int(2), int(6), int(10));
                 match head[0] {
-                    NODE => index.insert(key, Some((content, length))),
+                    NODE => index.insert(key, Some((content, length, false))),
+                    COARSE => index.insert(key, Some((content, length, true))),
                     ERASE => index.insert(key, None),
                     _ => break,
                 };
@@ -231,7 +237,7 @@ impl Bucket {
 
     /// The body of `key`'s latest record, if it is intact.
     fn read(&mut self, key: CubeKey) -> Option<Vec<u8>> {
-        let (offset, length) = (*self.index.get(&key)?)?;
+        let (offset, length, _) = (*self.index.get(&key)?)?;
         let mut content = vec![0; length as usize];
         let file = self.handle().ok()?;
         file.seek(SeekFrom::Start(offset)).ok()?;
@@ -279,7 +285,10 @@ impl Bucket {
         // Writing is using: the file goes to the back of the eviction line.
         let _ = file.set_modified(SystemTime::now());
         for (&(kind, key, _), at) in records.iter().zip(placed) {
-            self.index.insert(key, (kind == NODE).then_some(at));
+            self.index.insert(
+                key,
+                (kind != ERASE).then_some((at.0, at.1, kind == COARSE)),
+            );
         }
         self.end += out.len() as u64;
         Ok(())
@@ -473,23 +482,36 @@ impl CubeLodCache {
         self.with_id(BucketId::of(key), create, f)
     }
 
-    /// Whether `key` is stored.
+    /// Whether `key` is stored whole (a coarse node does not count).
     pub fn contains(&self, key: CubeKey) -> bool {
         key.level <= MAX_CACHED_LEVEL
             && self
                 .with_bucket(key, false, |b| {
-                    Some(matches!(b.index.get(&key), Some(Some(_))))
+                    Some(matches!(b.index.get(&key), Some(Some((_, _, false)))))
                 })
                 .unwrap_or(false)
     }
 
-    /// The stored node `key`, if there is one and it is intact.
+    /// The stored whole node `key`, if there is one and it is intact (a
+    /// coarse one is not: see [`Self::get_any`]).
     pub fn get(&self, key: CubeKey) -> Option<CubeNode> {
+        match self.get_any(key)? {
+            (node, false) => Some(node),
+            (_, true) => None,
+        }
+    }
+
+    /// The stored node `key`, whole or coarse (`true`), if there is one and
+    /// it is intact.
+    pub fn get_any(&self, key: CubeKey) -> Option<(CubeNode, bool)> {
         if key.level > MAX_CACHED_LEVEL {
             return None;
         }
-        let body = self.with_bucket(key, false, |b| b.read(key))?;
-        decode(key, &body)
+        let (body, coarse) = self.with_bucket(key, false, |b| {
+            let coarse = (*b.index.get(&key)?)?.2;
+            Some((b.read(key)?, coarse))
+        })?;
+        Some((decode(key, &body)?, coarse))
     }
 
     /// Stores `node` (levels 0 to [`MAX_CACHED_LEVEL`]), replacing any older.
@@ -501,6 +523,18 @@ impl CubeLodCache {
     /// bucket, each bucket's records appended in one write. Encoding is done
     /// before the cache is locked. Then the folder is brought under its cap.
     pub fn put_many(&self, nodes: &[CubeNode]) {
+        self.put_kind(nodes, false);
+    }
+
+    /// Stores `nodes` as coarse ([`COARSE`]): drawn on a revisit until the
+    /// whole node is made. A coarse node never replaces a stored whole one;
+    /// a whole one always replaces a coarse one.
+    pub fn put_coarse(&self, nodes: &[CubeNode]) {
+        self.put_kind(nodes, true);
+    }
+
+    fn put_kind(&self, nodes: &[CubeNode], coarse: bool) {
+        let kind = if coarse { COARSE } else { NODE };
         let mut groups: FxHashMap<BucketId, Vec<(CubeKey, Vec<u8>)>> = FxHashMap::default();
         for node in nodes {
             if node.key.level <= MAX_CACHED_LEVEL {
@@ -511,11 +545,17 @@ impl CubeLodCache {
             }
         }
         for (id, items) in groups {
-            let records: Vec<(u8, CubeKey, &[u8])> = items
-                .iter()
-                .map(|(k, b)| (NODE, *k, b.as_slice()))
-                .collect();
             self.with_id(id, true, |b| {
+                let records: Vec<(u8, CubeKey, &[u8])> = items
+                    .iter()
+                    .filter(|(k, _)| {
+                        !(coarse && matches!(b.index.get(k), Some(Some((_, _, false)))))
+                    })
+                    .map(|(k, body)| (kind, *k, body.as_slice()))
+                    .collect();
+                if records.is_empty() {
+                    return Some(());
+                }
                 match b.append_many(&records) {
                     Ok(()) => {
                         self.writes.fetch_add(1, Relaxed);
@@ -1065,6 +1105,52 @@ mod tests {
         drop(cache);
         let cache = CubeLodCache::open(&dir, "a").unwrap();
         same(&cache.get(key).unwrap(), &later);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_coarse_node_is_kept_apart_from_whole_ones_and_the_whole_one_wins() {
+        let dir = scratch("coarse");
+        let key = CubeKey::new(3, 1, 0, -2);
+        let other = CubeKey::new(3, 2, 0, -2);
+        let (coarse, whole) = (dense(key, 1), dense(key, 5));
+        {
+            let cache = CubeLodCache::open_with_cap(&dir, "a", 0).unwrap();
+            cache.put_coarse(&[coarse.clone()]);
+            // Never read or counted as whole.
+            assert!(!cache.contains(key));
+            assert!(cache.get(key).is_none());
+            let (got, is_coarse) = cache.get_any(key).unwrap();
+            assert!(is_coarse);
+            same(&got, &coarse);
+        }
+        // Across a reopen, still coarse.
+        let cache = CubeLodCache::open_with_cap(&dir, "a", 0).unwrap();
+        let (got, is_coarse) = cache.get_any(key).unwrap();
+        assert!(is_coarse);
+        same(&got, &coarse);
+        // The whole node replaces it.
+        cache.put(&whole);
+        assert!(cache.contains(key));
+        same(&cache.get(key).unwrap(), &whole);
+        // A coarse node never replaces a whole one (a late coarse write), in a batch with a new one.
+        cache.put_coarse(&[dense(key, 2), dense(other, 3)]);
+        let (got, is_coarse) = cache.get_any(key).unwrap();
+        assert!(!is_coarse);
+        same(&got, &whole);
+        assert!(cache.get_any(other).unwrap().1);
+        drop(cache);
+        let cache = CubeLodCache::open_with_cap(&dir, "a", 0).unwrap();
+        same(&cache.get(key).unwrap(), &whole);
+        // A saved cube under a coarse node erases it too.
+        let cube = SectionPos::new(other.x * 8, other.y * 8, other.z * 8);
+        assert!(other.contains_cube(cube));
+        cache.invalidate(cube);
+        assert!(cache.get_any(other).is_none());
+        drop(cache);
+        let cache = CubeLodCache::open_with_cap(&dir, "a", 0).unwrap();
+        assert!(cache.get_any(other).is_none());
+        same(&cache.get(key).unwrap(), &whole);
         let _ = fs::remove_dir_all(&dir);
     }
 

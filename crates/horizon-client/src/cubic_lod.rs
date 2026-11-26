@@ -688,6 +688,15 @@ impl CubicLodSampler {
         }
     }
 
+    /// [`Self::keep`] for a coarse node (an Earth node's tree-less first pass):
+    /// stored as coarse, so a revisit draws it at once from disk; never as
+    /// final (the whole node replaces it once made).
+    fn keep_coarse(&mut self, node: &CubeNode, since: u64) {
+        if let Some(keeper) = &self.keeper {
+            keeper.queue_coarse(node.clone(), since);
+        }
+    }
+
     /// [`Self::keep`] for a far generator's answer: a node the CPU made is
     /// kept, a slot of the GPU pool never (see the module's docs).
     fn keep_answer(&mut self, answer: Option<Resident>, since: u64) -> Option<Resident> {
@@ -723,8 +732,13 @@ impl CubicLodSampler {
     /// `Rock` (a closed shell) and `Air` for water from the elevation once the
     /// tiles come.
     fn cached_class(&self, key: CubeKey) -> Option<NodeClass> {
-        let node = self.cache.as_ref()?.get(key)?;
-        Some(stored_class(&node, self.air))
+        let (node, coarse) = self.cache.as_ref()?.get_any(key)?;
+        // A coarse node lacks the trees the whole one may stand in its air.
+        Some(if coarse {
+            NodeClass::Mixed
+        } else {
+            stored_class(&node, self.air)
+        })
     }
 }
 
@@ -755,6 +769,14 @@ fn final_node(in_band: bool, coarse: bool, cancelled: bool) -> bool {
     !in_band && !coarse && !cancelled
 }
 
+/// Whether a stored node is drawn as it is: a whole one always; a coarse one
+/// (`record_coarse`) only while the node is still to be made coarse
+/// (`pass_coarse`: not handed out to be refined), so a node being refined is
+/// built whole instead of drawn coarse again.
+fn draw_stored(record_coarse: bool, pass_coarse: bool) -> bool {
+    !record_coarse || pass_coarse
+}
+
 /// The writes of [`CubicLodSampler::keep`] on a thread of their own ("Cube far
 /// writer"): the far workers queue each node they made, the thread takes
 /// whatever is queued (up to `BATCH`), stores them with one append per bucket
@@ -764,10 +786,14 @@ fn final_node(in_band: bool, coarse: bool, cancelled: bool) -> bool {
 /// is needed for the nodes being made, only by later lookups. A full queue
 /// (`QUEUE`) drops the write and counts it: a worker never writes.
 pub struct Keeper {
-    tx: Option<std::sync::mpsc::SyncSender<(CubeNode, u64)>>,
+    tx: Option<std::sync::mpsc::SyncSender<Queued>>,
     thread: Option<std::thread::JoinHandle<()>>,
     dropped: std::sync::atomic::AtomicU64,
 }
+
+/// A node for the writer: the node, the cache's cursor when its building
+/// started, and whether it is coarse.
+type Queued = (CubeNode, u64, bool);
 
 impl Keeper {
     const QUEUE: usize = 4096;
@@ -792,9 +818,9 @@ impl Keeper {
     /// A writer thread that hands each batch it takes to `work`.
     fn spawn(
         queue: usize,
-        mut work: impl FnMut(Vec<(CubeNode, u64)>) + Send + 'static,
+        mut work: impl FnMut(Vec<Queued>) + Send + 'static,
     ) -> Option<Arc<Self>> {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(CubeNode, u64)>(queue);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Queued>(queue);
         let thread = std::thread::Builder::new()
             .name("Cube far writer".into())
             .spawn(move || {
@@ -822,10 +848,19 @@ impl Keeper {
     /// Hands `node` to the thread without waiting: false (and counted) when
     /// its queue is full, and the write is dropped.
     fn queue(&self, node: CubeNode, since: u64) -> bool {
+        self.send((node, since, false))
+    }
+
+    /// [`Self::queue`] for a coarse node (stored as coarse).
+    fn queue_coarse(&self, node: CubeNode, since: u64) -> bool {
+        self.send((node, since, true))
+    }
+
+    fn send(&self, item: Queued) -> bool {
         let sent = self
             .tx
             .as_ref()
-            .is_some_and(|tx| tx.try_send((node, since)).is_ok());
+            .is_some_and(|tx| tx.try_send(item).is_ok());
         if !sent {
             let n = self
                 .dropped
@@ -862,13 +897,19 @@ fn keep_batch(
     cache: &CubeLodCache,
     air: u32,
     kind: &impl Fn(BlockStateId) -> Kind,
-    batch: Vec<(CubeNode, u64)>,
+    batch: Vec<Queued>,
 ) {
     let mut nodes = Vec::with_capacity(batch.len());
+    let mut coarse = Vec::new();
     // The parents to look at, with the oldest `since` of the children.
     let mut parents: std::collections::HashMap<CubeKey, u64> = std::collections::HashMap::new();
-    for (node, since) in batch {
+    for (node, since, is_coarse) in batch {
         if !unchanged(cache, node.key, since) {
+            continue;
+        }
+        // Coarse nodes complete no parent (parents are made of whole ones).
+        if is_coarse {
+            coarse.push(node);
             continue;
         }
         let key = node.key;
@@ -879,6 +920,9 @@ fn keep_batch(
         nodes.push(node);
     }
     cache.put_many(&nodes);
+    if !coarse.is_empty() {
+        cache.put_coarse(&coarse);
+    }
     while !parents.is_empty() {
         let mut built = Vec::new();
         let mut next: std::collections::HashMap<CubeKey, u64> = std::collections::HashMap::new();
@@ -966,9 +1010,18 @@ fn cover_columns(
 impl CubeSampler for CubicLodSampler {
     fn node(&mut self, key: CubeKey) -> Option<CubeNode> {
         let since = self.cache.as_ref().map_or(0, |c| c.cursor());
-        // Kept nodes are whole (`refine`: a coarse one is never kept).
-        if let Some(node) = self.cache.as_ref().and_then(|c| c.get(key)) {
-            self.made_whole(key);
+        // A stored whole node; a stored coarse one while the node is still to be
+        // drawn coarse (`refine` hands it out to be made whole later).
+        if let Some((node, coarse)) = self.cache.as_ref().and_then(|c| c.get_any(key))
+            && draw_stored(coarse, self.is_coarse(key))
+        {
+            if coarse {
+                if let Some(refine) = &self.refine {
+                    refine.made(key, false, true);
+                }
+            } else {
+                self.made_whole(key);
+            }
             return Some(node);
         }
         if let Some(node) = self.of_cached_children(key, since) {
@@ -1009,6 +1062,13 @@ impl CubeSampler for CubicLodSampler {
             self.level.generation_cancelled(),
         ) {
             self.keep(&node, since);
+        } else if final_node(
+            self.in_band(key),
+            false,
+            self.level.generation_cancelled(),
+        ) {
+            // Coarse: kept as coarse, drawn at once on a revisit.
+            self.keep_coarse(&node, since);
         }
         Some(node)
     }
@@ -1397,6 +1457,71 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_coarse_node_is_drawn_until_it_is_handed_out_then_built_whole() {
+        let refine = refine::Refine::default();
+        let key = CubeKey::new(2, 7, 1, -4);
+        let pass_coarse = |r: &refine::Refine| r.pass(key) == refine::Pass::Coarse;
+        // A stored whole node is always drawn.
+        assert!(draw_stored(false, pass_coarse(&refine)));
+        // A reopen: the stored coarse node is drawn (and noted coarse, to be refined).
+        assert!(draw_stored(true, pass_coarse(&refine)));
+        refine.made(key, false, true);
+        assert!(draw_stored(true, pass_coarse(&refine)));
+        // Handed out to be made whole: built, not drawn coarse again.
+        crate::lod::cube::LateContent::view(&refine, [0.0; 3], [1.0, 0.0, 0.0], 1e6, true);
+        let handed = crate::lod::cube::LateContent::take_refreshes(&refine);
+        assert_eq!(handed.len(), 1);
+        assert!(!draw_stored(true, pass_coarse(&refine)));
+        // Made whole: a coarse record left behind is never drawn again; the whole one is.
+        refine.made(key, true, true);
+        assert!(!draw_stored(true, pass_coarse(&refine)));
+        assert!(draw_stored(false, pass_coarse(&refine)));
+    }
+
+    #[test]
+    fn the_writer_stores_coarse_nodes_as_coarse_and_makes_no_parent_of_them() {
+        let dir = scratch("writer-coarse");
+        let cache = CubeLodCache::open_with_cap(&dir, "t", 0).unwrap();
+        let parent = CubeKey::new(3, 0, 0, 0);
+        let since = cache.cursor();
+        let batch: Vec<Queued> = parent
+            .children()
+            .into_iter()
+            .map(|c| (dense(c, 1), since, true))
+            .collect();
+        keep_batch(&cache, 0, &kind, batch);
+        for child in parent.children() {
+            let (node, coarse) = cache.get_any(child).unwrap();
+            assert!(coarse);
+            same(&node, &dense(child, 1));
+            assert!(cache.get(child).is_none());
+        }
+        assert!(cache.get_any(parent).is_none(), "no parent of coarse nodes");
+        // The whole children replace them and complete the parent.
+        let batch: Vec<Queued> = parent
+            .children()
+            .into_iter()
+            .map(|c| (dense(c, 2), since, false))
+            .collect();
+        keep_batch(&cache, 0, &kind, batch);
+        for child in parent.children() {
+            same(&cache.get(child).unwrap(), &dense(child, 2));
+        }
+        assert!(cache.contains(parent));
+        // A late coarse write does not undo a whole node.
+        let child = parent.children()[0];
+        keep_batch(&cache, 0, &kind, vec![(dense(child, 3), since, true)]);
+        same(&cache.get(child).unwrap(), &dense(child, 2));
+        // Through the thread too.
+        let keeper = Keeper::start(cache.clone(), 0, Vec::new()).unwrap();
+        let fresh = CubeKey::new(2, 40, 0, 40);
+        assert!(keeper.queue_coarse(dense(fresh, 4), cache.cursor()));
+        drop(keeper);
+        assert!(cache.get_any(fresh).unwrap().1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_stored_node_classifies_as_air_or_mixed_never_as_rock_or_water() {
         let key = CubeKey::new(4, 0, 0, 0);
         let voxel = |state| Voxel {
@@ -1468,10 +1593,10 @@ mod tests {
         let dir = scratch("batch");
         let cache = CubeLodCache::open_with_cap(&dir, "t", 0).unwrap();
         let parent = CubeKey::new(3, 0, 0, 0);
-        let batch: Vec<(CubeNode, u64)> = parent
+        let batch: Vec<Queued> = parent
             .children()
             .into_iter()
-            .map(|c| (dense(c, 1), cache.cursor()))
+            .map(|c| (dense(c, 1), cache.cursor(), false))
             .collect();
         keep_batch(&cache, 0, &kind, batch);
         // The eight share a bucket (one write); the parent is another (one more).
@@ -1479,11 +1604,11 @@ mod tests {
         assert!(cache.contains(parent));
         // Seven of eight: no parent.
         let other = CubeKey::new(3, 1, 0, 0);
-        let batch: Vec<(CubeNode, u64)> = other
+        let batch: Vec<Queued> = other
             .children()
             .into_iter()
             .take(7)
-            .map(|c| (dense(c, 1), cache.cursor()))
+            .map(|c| (dense(c, 1), cache.cursor(), false))
             .collect();
         keep_batch(&cache, 0, &kind, batch);
         assert!(!cache.contains(other));
