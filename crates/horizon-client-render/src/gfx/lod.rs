@@ -440,6 +440,17 @@ pub(super) fn fade_out_code(since: Instant, level: u8, now: Instant) -> u32 {
     1 + u32::from(level) * 129 + 64 + ((faded * 64.0) as u32 + 1).min(64)
 }
 
+/// Who draws a far tile's solid quads (`Tile::far_class`, gfx/far_cull.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FarClass {
+    /// Not drawn: its replacement is not whole yet (`shown` unset).
+    Hidden,
+    /// The CPU's walk: fading in or out, dying, or standing in.
+    Cpu,
+    /// GPU culling and indirect draws: whole.
+    Gpu,
+}
+
 #[derive(Clone, Copy)]
 struct Bounds {
     min: Vec3,
@@ -518,6 +529,23 @@ impl Tile {
             ]
         })
     }
+    /// Who draws this far tile's solid quads at `now` (`far_cull`): nobody while it is
+    /// hidden, the CPU while it fades in or out, is dying or has a stand-in, else
+    /// GPU-driven culling, whole.
+    pub fn far_class(&self, level: u8, now: Instant) -> FarClass {
+        if self.dying.is_some() || self.previous.is_some() {
+            return FarClass::Cpu;
+        }
+        match fade_code(self.shown, level, now) {
+            None => FarClass::Hidden,
+            Some(0) => FarClass::Gpu,
+            Some(_) => FarClass::Cpu,
+        }
+    }
+    /// The box of its quads (`SectionMesh::bounds`) around its origin: (min, max).
+    pub fn bounds_box(&self) -> [Vec3; 2] {
+        [self.bounds.min, self.bounds.max]
+    }
     /// Whether either mesh it holds is in the compact layout: a stand-in drawn in its place can
     /// hide a compact replacement (`Renderer::follow_packed_layout`).
     pub fn holds_packed(&self) -> bool {
@@ -546,6 +574,34 @@ impl Tile {
             fade,
             old: self.dying.is_some() || self.previous.is_some(),
         })
+    }
+}
+
+#[cfg(test)]
+impl Tile {
+    /// A tile for tests (`far_cull`): `mesh`, its box `bounds` around its origin,
+    /// shown since `shown`, dying since `dying`.
+    pub(super) fn for_test(
+        mesh: SectionGpu,
+        bounds: [Vec3; 2],
+        shown: Option<Instant>,
+        dying: Option<Instant>,
+    ) -> Self {
+        Self {
+            mesh: Box::new(mesh),
+            bounds: Bounds {
+                min: bounds[0],
+                max: bounds[1],
+            },
+            shown,
+            dying,
+            alone: false,
+            previous: None,
+            cull_slot: 0,
+        }
+    }
+    pub(super) fn set_times_for_test(&mut self, shown: Option<Instant>, dying: Option<Instant>) {
+        (self.shown, self.dying) = (shown, dying);
     }
 }
 

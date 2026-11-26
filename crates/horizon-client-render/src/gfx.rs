@@ -543,6 +543,7 @@ mod frame_gen;
 pub use frame_export::{ExportFrame, FRAME_EXPORT_STALL_TIMEOUT};
 pub(crate) mod frame_targets;
 mod frustum;
+mod far_cull;
 mod gpu_culling;
 mod hdr;
 mod hdr_icc;

@@ -1560,7 +1560,7 @@ pub(super) fn occlusion_culling_requested(info: &wgpu::AdapterInfo, env: Option<
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::gfx) mod tests {
     use super::*;
 
     /// Culling while the newest result hid enough; else one frame in `PROBE`
@@ -1715,7 +1715,7 @@ mod tests {
     }
 
     /// Reference CPU implementation of the full Hi-Z mip pyramid.
-    fn cpu_build_hiz(depth: &[f32], depth_size: [usize; 2]) -> Vec<(Vec<f32>, [usize; 2])> {
+    pub(in crate::gfx) fn cpu_build_hiz(depth: &[f32], depth_size: [usize; 2]) -> Vec<(Vec<f32>, [usize; 2])> {
         let mut pyramid = Vec::new();
         let (mut cur, mut size) = cpu_hiz_downsample(depth, depth_size);
         loop {
@@ -1733,7 +1733,7 @@ mod tests {
     }
 
     /// Reference CPU implementation of `cs_box_test`'s conservative 2x2 Hi-Z query.
-    fn cpu_query_hiz(
+    pub(in crate::gfx) fn cpu_query_hiz(
         pyramid: &[(Vec<f32>, [usize; 2])],
         uv_min: [f32; 2],
         uv_max: [f32; 2],
