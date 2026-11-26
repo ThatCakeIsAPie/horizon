@@ -1556,6 +1556,8 @@ pub struct FarCullStatus {
     pub enabled: bool,
     /// The last frame drew the whole far tiles' solid quads on the GPU.
     pub gpu_frame: bool,
+    /// Why it did not ("" when it did).
+    pub off_because: &'static str,
     /// Far cube tiles resident, and records the GPU holds of them.
     pub tiles: usize,
     pub records: usize,
@@ -1690,6 +1692,7 @@ pub struct Renderer {
     /// frame's count they belong to, and the far draws and triangles the CPU made.
     far_cull: Option<far_cull::FarCull>,
     far_gpu_frame: bool,
+    far_block: &'static str,
     far_stats: Option<far_cull::FarGpuStats>,
     far_phases: usize,
     far_cpu_draws: usize,
@@ -4857,6 +4860,7 @@ impl Renderer {
             gpu_frame: false,
             far_cull,
             far_gpu_frame: false,
+            far_block: "",
             far_stats: None,
             far_phases: 0,
             far_cpu_draws: 0,
@@ -5574,6 +5578,7 @@ impl Renderer {
         FarCullStatus {
             enabled: self.far_cull.is_some(),
             gpu_frame: self.far_gpu_frame,
+            off_because: self.far_block,
             tiles: self.lod_cubes.len(),
             records,
             cpu_listed,
@@ -8845,22 +8850,48 @@ impl Renderer {
         // no shader pack's terrain, shadow pass, mirror, displacement, flat draws, native
         // material, split opaque/cutout passes or MSAA. The same `now` as the walk's.
         let now = std::time::Instant::now();
-        let mut far_gpu_frame = self.far_cull.is_some()
-            && !frame.title
-            && !msaa_on
-            && !pack_terrain
-            && shadow_view.is_none()
-            && mirror_plane.is_none()
-            && !displaced
-            && self.flat.is_none()
-            && !tiled_solid_gpu(&self.info)
-            && self.executor.is_none_or(|c| !c.material)
-            && !self
-                .external
-                .as_deref()
-                .is_some_and(|n| n.terrain_layers().is_some())
-            && !gpu_culling::looks_lose_base_vertex(&self.info, self.terrain_looks)
-            && self.multi_draw;
+        // Why the far tiles' GPU path is off this frame (`far_cull_status`), or "".
+        let far_block = if self.far_cull.is_none() {
+            "unsupported"
+        } else if frame.title {
+            "title"
+        } else if msaa_on {
+            "msaa"
+        } else if pack_terrain {
+            "pack_terrain"
+        } else if shadow_view.is_some() {
+            "shadow"
+        } else if mirror_plane.is_some() {
+            "mirror"
+        } else if displaced {
+            "displaced"
+        } else if self.mesh_terrain.is_some()
+            || self
+                .flat
+                .as_ref()
+                .is_some_and(|f| f.min_sections != usize::MAX)
+        {
+            // Vanilla frames may draw flat (or by mesh shader) from the CPU's lists: they
+            // would lack the far tiles. Flat page groups alone (pulled pipelines) are fine.
+            "flat"
+        } else if tiled_solid_gpu(&self.info) {
+            "tiled_solid"
+        } else if self.executor.is_some_and(|c| c.material) {
+            "material"
+        } else if self
+            .external
+            .as_deref()
+            .is_some_and(|n| n.terrain_layers().is_some())
+        {
+            "terrain_layers"
+        } else if gpu_culling::looks_lose_base_vertex(&self.info, self.terrain_looks) {
+            "looks"
+        } else if !self.multi_draw {
+            "multi_draw"
+        } else {
+            ""
+        };
+        let mut far_gpu_frame = far_block.is_empty();
         if far_gpu_frame && let Some(far) = &mut self.far_cull {
             far.records.sync(&self.lod_cubes, now, None);
             #[cfg(debug_assertions)]
@@ -8891,6 +8922,7 @@ impl Renderer {
             });
         }
         self.far_gpu_frame = far_gpu_frame;
+        self.far_block = if far_block.is_empty() && !far_gpu_frame { "prepare" } else { far_block };
         self.far_phases = 0;
         if !frame.title
             && let Some(far) = &mut self.cube_far
@@ -10468,6 +10500,10 @@ impl Renderer {
             }
             _ => false,
         };
+        debug_assert!(
+            !(far_gpu_frame && (flat_frame || mesh_frame)),
+            "far tiles drawn by the GPU are not in flat lists"
+        );
         if mesh_frame
             && !flat_frame
             && let Some(flat) = &mut self.flat
@@ -11454,7 +11490,12 @@ impl Renderer {
                     // The whole far tiles the GPU draws (`far_cull`), after the CPU's draws: its
                     // phase 0 in the first pass, phase 1 (what its Hi-Z test saw) in the next.
                     let far = self.far_cull.as_ref().filter(|_| far_gpu_frame);
-                    let far_group = |_: u32| None::<&wgpu::BindGroup>;
+                    // Pulled pipelines read the page's vertices through its flat group.
+                    let far_group = |page: u32| {
+                        pulled
+                            .then(|| self.flat.as_ref()?.page_group(page))
+                            .flatten()
+                    };
                     match cull {
                         Some(cull) => {
                             // Phase 1 and the boxes against its depth (in
