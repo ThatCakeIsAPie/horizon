@@ -1062,6 +1062,7 @@ impl LandCoverField {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use crate::testing::{
         SyntheticTiff, TempDir, TiffSpec, encode_tiff, encode_tiff_u16, serve_range,
     };

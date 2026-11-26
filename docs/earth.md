@@ -637,8 +637,10 @@ The standing rule for all far-view work, Cubic and Earth:
 
 - **Coarse first, refine later.** The distance is never empty. A far node is first drawn coarse, as fast as the
   far view was before the detail; the detail comes later on the same low-priority background builder, nearest and in
-  view first, and each refined node replaces its coarse one in place (the old one stays drawn until then). Only
-  refined nodes are kept in the far cache, so a revisit draws them refined straight away.
+  view first, and each refined node replaces its coarse one in place (the old one stays drawn until then). Every
+  final far node (all levels, generated ones too) is kept in the far disk cache (`lod/cube_cache.rs`, under the
+  world's `horizon_cube_lod/`), refined ones as final and coarse ones marked coarse, so a revisit or a reopened world
+  draws at once (refined where it was refined) and only refines what is left.
 - **As much as possible on the GPU.** Generation, meshing, culling and drawing already run there where they can
   (`gfx/cube_gen`, `cube_mesh`, `cube_far`); new far work goes through the same material stage and inputs shader
   packs hook (real block states, normals and light), never a private pass.
@@ -646,6 +648,15 @@ The standing rule for all far-view work, Cubic and Earth:
   once every planned node is drawn (`cubic_lod/refine.rs`, a `LateContent`: up to 48 nodes at a time, nearest first,
   those behind the camera counted at three times their distance). `HORIZON_FAR_TWO_PASS=0` makes nodes whole at
   once, to compare.
+- **Frame cost.** Whole far tiles are culled and drawn on the GPU (`gfx/far_cull.rs`: frustum and a two-phase
+  Hi-Z test on the previous frame's depth, indirect draws through the same terrain pipelines); the CPU lists only
+  tiles that fade or carry water. Far threads run below the game (nice +10, `HORIZON_FAR_PRIORITY=2` leaves them as
+  spawned), there are at most `threads - 2` far workers, and results are handed over within a per-frame budget.
+  Knobs, for tuning: `HORIZON_FAR_WORKERS` (default threads - 2, max 8), `HORIZON_FAR_DELIVER_MAX` (256 nodes),
+  `HORIZON_FAR_DELIVER_BYTES` (4 MiB), `HORIZON_FAR_DELIVER_US` (1000 us), `HORIZON_FAR_CACHE_MB` (in-memory node
+  cache, 192), `HORIZON_FAR_DISK_MB` (disk cache per world, 1024), `HORIZON_FAR_GPU_CULL=0` and `HORIZON_FAR_HIZ=0`
+  (CPU culling, no occlusion; to compare), `HORIZON_FAR_WHOLE_WHEN_COVERED=1` (skip the coarse pass where something
+  is drawn; measured slower, off).
 - **Grass sides.** The far mesher (`lod::mesh::far_style`, which the GPU material table shares) draws the side faces
   of a grass block with its top sprite, grass-tinted: on a far terraced slope a voxel's side stands for slope covered
   in grass, and the dirt side with its thin green strip made forested and grassy hills read brown. A snowy grass

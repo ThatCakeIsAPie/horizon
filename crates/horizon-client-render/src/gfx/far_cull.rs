@@ -1985,7 +1985,15 @@ mod tests {
         for i in 0..6 {
             tiles.insert(
                 key(i),
-                tile(2, 1 + i % 2, u64::from(i) * 16, false, &[], whole(now), None),
+                tile(
+                    2,
+                    1 + i % 2,
+                    u64::from(i) * 16,
+                    false,
+                    &[],
+                    whole(now),
+                    None,
+                ),
             );
             far.touch(key(i));
         }

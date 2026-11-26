@@ -102,7 +102,12 @@ struct Stages {
 
 impl Stages {
     fn total(&self) -> f64 {
-        self.classify + self.biomes_ready + self.columns + self.decorate + self.biome_fn + self.voxels
+        self.classify
+            + self.biomes_ready
+            + self.columns
+            + self.decorate
+            + self.biome_fn
+            + self.voxels
     }
     fn min(&mut self, o: &Stages) {
         self.classify = self.classify.min(o.classify);
@@ -164,7 +169,10 @@ fn main() {
     ));
     let land = settings
         .land_cover_source(
-            Arc::new(LandCoverStore::new(keyed(&cache.join("earth-landcover")), 256)),
+            Arc::new(LandCoverStore::new(
+                keyed(&cache.join("earth-landcover")),
+                256,
+            )),
             Arc::new(Curl),
         )
         .expect("land cover");
@@ -252,7 +260,8 @@ fn main() {
                     let _ = g.classify_node_above(level, nx, ny, nz).unwrap();
                     s.classify = ms(t);
                     let t = Instant::now();
-                    g.biomes_ready(nx * side + step / 2, nz * side + step / 2, step).unwrap();
+                    g.biomes_ready(nx * side + step / 2, nz * side + step / 2, step)
+                        .unwrap();
                     g.biomes_ready(nx * side, nz * side, step).unwrap();
                     s.biomes_ready = ms(t);
                     let t = Instant::now();

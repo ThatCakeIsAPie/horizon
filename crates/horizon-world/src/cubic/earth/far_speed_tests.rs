@@ -32,7 +32,10 @@ fn elevation(lat: f64, lon: f64) -> f64 {
 /// dozen blocks: many class edges.
 fn class(lat: f64, lon: f64) -> u8 {
     const CODES: [u8; 10] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 95];
-    let (a, b) = (((lat - LAT0) * 3000.0).floor() as i64, ((lon - LON0) * 3000.0).floor() as i64);
+    let (a, b) = (
+        ((lat - LAT0) * 3000.0).floor() as i64,
+        ((lon - LON0) * 3000.0).floor() as i64,
+    );
     let h = (a.wrapping_mul(73_856_093) ^ b.wrapping_mul(19_349_663)).rem_euclid(1000) as usize;
     CODES[h * h % 7 * 10 / 7 % 10]
 }
@@ -94,7 +97,9 @@ fn reference_biomes(g: &EarthGenerator, cols: &NodeColumns) -> Vec<Biome> {
     (0..cols.width * cols.width)
         .map(|i| {
             let (x, z) = cols.block_of(i);
-            g.biome_uncached(Access::Local, x >> 2, z >> 2).ok().unwrap()
+            g.biome_uncached(Access::Local, x >> 2, z >> 2)
+                .ok()
+                .unwrap()
         })
         .collect()
 }
@@ -199,12 +204,20 @@ fn far_nodes_are_the_same_whether_the_memo_is_cold_or_warm() {
                             g.clear_far_memos();
                         }
                         ready(&rig, &g, |g| {
-                            g.biomes_ready(nx * 16 * step + step / 2, nz * 16 * step + step / 2, step)?;
+                            g.biomes_ready(
+                                nx * 16 * step + step / 2,
+                                nz * 16 * step + step / 2,
+                                step,
+                            )?;
                             g.biomes_ready(nx * 16 * step, nz * 16 * step, step)?;
                             let mut cols = g.node_columns(level, nx, nz)?;
                             g.decorate_columns(&mut cols, SNOWY)?;
                             let biomes = g.column_biomes(&cols)?;
-                            Ok((node_contents(g, &cols, ny, level), biomes, reference_biomes(g, &cols)))
+                            Ok((
+                                node_contents(g, &cols, ny, level),
+                                biomes,
+                                reference_biomes(g, &cols),
+                            ))
                         })
                     };
                     let (cold, cold_biomes, reference) = build(true);
