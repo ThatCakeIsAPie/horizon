@@ -1391,6 +1391,29 @@ pub fn plan_far(input: &PlanInput) -> Plan {
         _ => None,
     };
     let center = cube_of(camera);
+    // Whether `node`, a child of a node of `region`, would be left out (`Fate::Out` or `Fate::Pruned`, below)
+    // when its parent splits.
+    let bare = |node: CubeKey, region: Region| -> bool {
+        if !in_world(node) || node.distance(camera) > max_distance {
+            return true;
+        }
+        let region = match (&quadtree, region) {
+            (None, _) | (Some(_), Region::Cubes) => Region::Cubes,
+            (Some(q), _) => q.region(node),
+        };
+        if region == Region::Tiles {
+            return true;
+        }
+        match loaded_state(node, center, loaded, is_loaded) {
+            Loaded::All => true,
+            Loaded::Some => false,
+            Loaded::None => match class(node) {
+                NodeClass::Air => true,
+                NodeClass::Rock => region == Region::Split,
+                NodeClass::Mixed => false,
+            },
+        }
+    };
     let fate = |node: CubeKey, parent: Option<Region>| -> Fate {
         if !in_world(node) {
             return Fate::Out;
@@ -1438,7 +1461,12 @@ pub fn plan_far(input: &PlanInput) -> Plan {
                     };
                     let ratio =
                         rule.factor(camera, node) * f64::from(node.size()) * merge / distance;
-                    if ratio > 1.0 && !may_split(node) {
+                    if ratio > 1.0 && !may_split(node) && node.children().iter().all(|&c| bare(c, region)) {
+                        // Nothing of it would be planned once it splits (its eight are air, or drawn by
+                        // tiles or near cubes): left out now. Held, it was drawn, split into nothing, left
+                        // the drawn nodes and was held again: the plan went back and forth every replan.
+                        Fate::Out
+                    } else if ratio > 1.0 && !may_split(node) {
                         held.set(held.get() + 1);
                         held_keys.borrow_mut().push(node);
                         Fate::Leaf(distance, node)
@@ -6926,6 +6954,54 @@ mod tests {
         // It ends at the plan without stepping, after several visible steps.
         assert_eq!(drawn.into_iter().collect::<FxHashSet<_>>(), target);
         assert!(steps >= 3, "{steps}");
+    }
+
+    #[test]
+    fn a_node_whose_eight_are_air_is_left_out_not_held_back_and_forth() {
+        let camera = [100.5, 64.5, -40.5];
+        let nowhere = |_: SectionPos| false;
+        // A mixed node the target splits, whose children are all air (its class is coarser than theirs).
+        let lone = stepped(camera, None, &nowhere)
+            .into_iter()
+            .filter(|k| k.level >= 3)
+            .max_by(|a, b| a.distance(camera).total_cmp(&b.distance(camera)))
+            .unwrap()
+            .parent();
+        let class = |k: CubeKey| {
+            if k.level < lone.level && ancestor(k, lone.level) == lone {
+                NodeClass::Air
+            } else {
+                NodeClass::Mixed
+            }
+        };
+        let plan = |drawn: &[CubeKey]| {
+            let refined = refined_set(drawn);
+            plan_far(&PlanInput {
+                camera,
+                max_distance: 3000.0,
+                rule: &Rule::distance(DETAIL),
+                loaded: BOX,
+                is_loaded: &nowhere,
+                previous: drawn,
+                class: &class,
+                surface: None,
+                refined: Some(&refined),
+            })
+            .leaves
+        };
+        let mut drawn = plan(&[]);
+        let mut seen = vec![drawn.clone()];
+        for _ in 0..40 {
+            let next = plan(&drawn);
+            if next == drawn {
+                break;
+            }
+            assert!(!seen.contains(&next), "the plan went back to an earlier one");
+            seen.push(next.clone());
+            drawn = next;
+        }
+        assert_eq!(plan(&drawn), drawn, "the plan settles");
+        assert!(!drawn.iter().any(|k| ancestor(*k, lone.level.max(k.level)) == lone || *k == lone));
     }
 
     #[test]
