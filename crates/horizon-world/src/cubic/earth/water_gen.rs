@@ -115,7 +115,7 @@ impl EarthGenerator {
     }
 
     /// The latitude and longitude box `(south, west, north, east)` of the block rectangle `r`.
-    fn lat_lon_box(&self, r: Rect) -> (f64, f64, f64, f64) {
+    pub(super) fn lat_lon_box(&self, r: Rect) -> (f64, f64, f64, f64) {
         let projection = self.field.projection();
         let (mut s, mut w, mut n, mut e) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for (x, z) in [(r.x0, r.z0), (r.x1, r.z0), (r.x0, r.z1), (r.x1, r.z1)] {

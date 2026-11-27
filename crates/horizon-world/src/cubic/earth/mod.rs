@@ -28,6 +28,8 @@ pub mod dry;
 #[cfg(test)]
 mod dry_tests;
 pub mod far;
+#[doc(hidden)]
+pub mod far_profile;
 pub mod far_trees;
 #[cfg(test)]
 mod far_speed_tests;
