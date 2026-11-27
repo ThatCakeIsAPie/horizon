@@ -83,6 +83,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 mod earth;
+pub mod earth_window;
 mod refine;
 
 /// Node columns of vanilla far terrain kept per sampler.
@@ -350,6 +351,9 @@ impl CubicLodSampler {
     /// without reading them back). Without compute shaders there it stays
     /// the CPU reference.
     pub fn with_device(mut self, device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        if let Some(earth) = self.wg.generator.earth_generator() {
+            earth_window::install(earth, &device, &queue);
+        }
         if let Some(f) = &self.far_setup {
             let sampler = GpuCubeSampler::new(device, queue, f.params.clone(), f.columns.clone());
             // The sparse descent proves subtrees uniform from CubicWorldGen's

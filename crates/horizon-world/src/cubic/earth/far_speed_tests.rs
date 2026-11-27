@@ -278,3 +278,157 @@ fn cubes_are_the_same_whether_the_column_memo_is_cold_or_warm() {
     }
     assert!(mixed > total / 8, "too few mixed cubes: {mixed} of {total}");
 }
+
+/// A stand-in for the GPU hook: computes the window with the CPU plan (plus `offset` metres) and counts what it
+/// was given; `mode` makes it decline, fail the wait or answer with a list of the wrong length.
+struct MockWindowGpu {
+    mode: MockMode,
+    offset: f32,
+    submits: std::sync::atomic::AtomicUsize,
+    waits: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MockMode {
+    Answer,
+    Decline,
+    FailWait,
+    WrongLength,
+}
+
+struct MockTicket {
+    heights: Vec<f32>,
+    mode: MockMode,
+    gpu: Arc<MockWindowGpu>,
+}
+
+impl MockWindowGpu {
+    fn new(mode: MockMode, offset: f32) -> Arc<Self> {
+        Arc::new(Self {
+            mode,
+            offset,
+            submits: Default::default(),
+            waits: Default::default(),
+        })
+    }
+}
+
+impl WindowTicket for MockTicket {
+    fn wait(self: Box<Self>) -> Option<WindowResult> {
+        self.gpu.waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.mode {
+            MockMode::FailWait => None,
+            MockMode::WrongLength => Some(WindowResult {
+                heights_m: self.heights[1..].to_vec(),
+            }),
+            _ => Some(WindowResult {
+                heights_m: self.heights,
+            }),
+        }
+    }
+}
+
+/// `MockWindowGpu` is shared: the `Arc` is the hook.
+struct SharedMock(Arc<MockWindowGpu>);
+
+impl WindowGpu for SharedMock {
+    fn submit(&self, job: WindowJob) -> Option<Box<dyn WindowTicket>> {
+        let me = &self.0;
+        me.submits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if me.mode == MockMode::Decline {
+            return None;
+        }
+        let heights = job.plan.heights_m().into_iter().map(|h| h + me.offset).collect();
+        Some(Box::new(MockTicket {
+            heights,
+            mode: me.mode,
+            gpu: Arc::clone(me),
+        }))
+    }
+}
+
+#[test]
+fn the_window_hook_changes_nothing_when_it_answers_like_the_cpu_and_any_failure_falls_back() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (rig, g, _dir) = world(9.0, 900);
+    let nodes = [(2u32, 0, 0), (3, -1, 0), (4, 0, -1), (5, 1, 1), (6, -1, -1)];
+    let read = |g: &EarthGenerator| {
+        nodes
+            .iter()
+            .map(|&(level, nx, nz)| {
+                let cols = ready(&rig, g, |g| g.node_columns(level, nx, nz));
+                (cols.surfaces.clone(), node_contents(g, &cols, 0, level))
+            })
+            .collect::<Vec<_>>()
+    };
+    // Warm everything first (the loads), then the baseline with no hook at all.
+    let baseline = read(&g);
+    assert_eq!(read(&g), baseline);
+    assert!(!g.window_gpu_enabled() || std::env::var("HORIZON_EARTH_GPU_WINDOW").is_ok());
+
+    // A hook installed but switched off is never asked.
+    let mock = MockWindowGpu::new(MockMode::Answer, 0.0);
+    g.set_window_gpu(Some(Arc::new(SharedMock(Arc::clone(&mock)))));
+    if std::env::var("HORIZON_EARTH_GPU_WINDOW").is_err() {
+        g.set_window_gpu_enabled(false);
+        assert_eq!(read(&g), baseline);
+        assert_eq!(mock.submits.load(SeqCst), 0);
+    }
+
+    // Switched on and answering like the CPU: every window goes through it, the nodes are the same.
+    g.set_window_gpu_enabled(true);
+    assert_eq!(read(&g), baseline);
+    assert_eq!(mock.submits.load(SeqCst), nodes.len());
+    assert_eq!(mock.waits.load(SeqCst), nodes.len());
+
+    // Declining, failing the wait, a list of the wrong length: the CPU answer, the same nodes.
+    for mode in [MockMode::Decline, MockMode::FailWait, MockMode::WrongLength] {
+        let bad = MockWindowGpu::new(mode, 0.0);
+        g.set_window_gpu(Some(Arc::new(SharedMock(Arc::clone(&bad)))));
+        assert_eq!(read(&g), baseline);
+        assert_eq!(bad.submits.load(SeqCst), nodes.len());
+    }
+
+    // The hook's heights really are the ones used: 5000 m more moves the nodes.
+    let high = MockWindowGpu::new(MockMode::Answer, 5000.0);
+    g.set_window_gpu(Some(Arc::new(SharedMock(Arc::clone(&high)))));
+    assert_ne!(read(&g), baseline);
+
+    // Removing the hook goes back to the CPU.
+    g.set_window_gpu(None);
+    assert_eq!(read(&g), baseline);
+}
+
+#[test]
+fn the_nodes_own_surfaces_are_the_inner_part_of_its_window() {
+    use super::water::WINDOW_PAD;
+    let (rig, g, _dir) = world(9.0, 900);
+    let land = g.land_source().unwrap().clone();
+    let mut checked = 0;
+    for level in [0u32, 1, 2, 3, 5, 7] {
+        let stride = 1i32 << level;
+        for (nx, nz) in [(0, 0), (-1, 0), (0, -1), (1, 1), (-2, 3)] {
+            let (x0, z0) = (nx * 16 * stride + stride / 2, nz * 16 * stride + stride / 2);
+            let zoom = g.zoom_for_step(stride);
+            let water = ready(&rig, &g, |g| {
+                g.water_columns(Access::Local, &land, [x0, z0], [16, 16], stride, stride)
+                    .map_err(|_| NotReady {
+                        tiles: g.missing_tiles_for_step(
+                            x0 - 12 * stride,
+                            z0 - 12 * stride,
+                            x0 + 28 * stride,
+                            z0 + 28 * stride,
+                            stride,
+                        ),
+                    })
+            });
+            assert!(water.aligned);
+            assert_eq!(water.dem.len(), (16 + 2 * WINDOW_PAD).pow(2));
+            let own = water.own_surfaces(16, 16).unwrap();
+            let separate = g.field().surface_ys_strided_reference(x0, z0, 16, 16, stride, zoom).unwrap();
+            assert_eq!(own, separate, "level {level} node {nx},{nz}");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 20);
+}

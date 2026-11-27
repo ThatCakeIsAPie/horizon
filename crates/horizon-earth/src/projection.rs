@@ -42,10 +42,19 @@ pub fn world_pixels(zoom: u8) -> f64 {
 /// Latitude and longitude to fractional pixel coordinates over the whole world at `zoom`: `(0, 0)` is the north-west
 /// corner of tile `(0, 0)`, and pixel `i` spans `[i, i + 1)`. Latitude is clamped to the Mercator limit.
 pub fn latlon_to_pixel(lat: f64, lon: f64, zoom: u8) -> (f64, f64) {
+    (pixel_x(lon, zoom), pixel_y(lat, zoom))
+}
+
+/// The pixel column of a longitude ([`latlon_to_pixel`]'s `x`, which depends on the longitude alone).
+pub(crate) fn pixel_x(lon: f64, zoom: u8) -> f64 {
     let size = world_pixels(zoom);
-    let x = (lon + 180.0) / 360.0 * size;
-    let y = (1.0 - clamp_latitude(lat).to_radians().tan().asinh() / PI) / 2.0 * size;
-    (x, y)
+    (lon + 180.0) / 360.0 * size
+}
+
+/// The pixel row of a latitude ([`latlon_to_pixel`]'s `y`, which depends on the latitude alone).
+pub(crate) fn pixel_y(lat: f64, zoom: u8) -> f64 {
+    let size = world_pixels(zoom);
+    (1.0 - clamp_latitude(lat).to_radians().tan().asinh() / PI) / 2.0 * size
 }
 
 /// The inverse of [`latlon_to_pixel`], with the longitude in `[-180, 180)` when the pixel is inside the world.

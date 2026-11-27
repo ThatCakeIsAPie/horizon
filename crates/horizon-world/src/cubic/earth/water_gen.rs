@@ -36,9 +36,10 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use horizon_earth::fastmap::FastMap;
-use horizon_earth::{Lake, LandClass, LandCoverSource, WaterAtlas};
+use horizon_earth::{Lake, LandClass, LandCoverSource, WaterAtlas, WindowPlan, WindowPlanError};
 
 use super::generator::{Access, EarthGenerator, Gap, Rect};
+use super::gpu_window::{WindowJob, WindowTicket};
 use super::surface::SurfaceKind;
 use super::water::{
     Bed, ColumnWater, LAKE_BOX_MARGIN_DEG, LakeLevel, RiverHit, RiverIndex, WINDOW_PAD,
@@ -65,6 +66,38 @@ pub(super) struct WaterState {
 pub(super) struct WaterColumns {
     pub columns: Vec<ColumnWater>,
     pub classes: Vec<LandClass>,
+    /// The window's elevation surfaces (the padded `width + 2 * WINDOW_PAD` square, row by row), before the
+    /// rules changed any. Its inner part is the columns' own elevation surfaces ([`WaterColumns::own_surfaces`]).
+    pub dem: Vec<i32>,
+    /// Samples per row of `dem`.
+    pub dem_width: usize,
+    /// Whether the window starts exactly [`WINDOW_PAD`] samples before the columns on both axes (it does not
+    /// when the padding saturated at the edge of the integer range).
+    pub aligned: bool,
+}
+
+impl WaterColumns {
+    /// The `width` by `depth` elevation surfaces of the columns themselves: the window without its padding. They
+    /// are the same samples a separate strided read of the columns takes (same points, same zoom). `None` when
+    /// the window was not aligned with the columns.
+    #[allow(dead_code)]
+    pub(super) fn own_surfaces(&self, width: usize, depth: usize) -> Option<Vec<i32>> {
+        if !self.aligned {
+            return None;
+        }
+        let mut out = Vec::with_capacity(width * depth);
+        for row in WINDOW_PAD..WINDOW_PAD + depth {
+            let from = row * self.dem_width + WINDOW_PAD;
+            out.extend_from_slice(self.dem.get(from..from + width)?);
+        }
+        Some(out)
+    }
+}
+
+/// The window's elevation, either already read or being computed by the hook.
+enum WindowDem {
+    Ready(Result<Vec<i32>, Gap>),
+    Pending(Arc<WindowPlan>, Box<dyn WindowTicket>),
 }
 
 impl EarthGenerator {
@@ -247,6 +280,68 @@ impl EarthGenerator {
         got.ok_or(Gap::Missing)
     }
 
+    /// Starts reading the window's elevation. A local read goes through the separable plan: offered to the hook
+    /// when one is on (the answer is fetched by [`EarthGenerator::finish_window_dem`]), else read on the CPU at
+    /// once. A fetching read, and a window too wide for a plan, use [`EarthGenerator::window_surfaces`].
+    fn start_window_dem(
+        &self,
+        a: Access,
+        origin: [i32; 2],
+        size: [usize; 2],
+        stride: i32,
+        zoom: u8,
+    ) -> WindowDem {
+        if a == Access::Fetch {
+            return WindowDem::Ready(self.window_surfaces(a, origin, size, stride, zoom));
+        }
+        let [x0, z0] = origin;
+        let [width, depth] = size;
+        match self.field.window_plan(x0, z0, width, depth, stride, zoom) {
+            Ok(plan) => {
+                let plan = Arc::new(plan);
+                let ticket = self
+                    .window_gpu
+                    .active()
+                    .and_then(|gpu| gpu.submit(WindowJob { plan: Arc::clone(&plan) }));
+                match ticket {
+                    Some(ticket) => WindowDem::Pending(plan, ticket),
+                    None => WindowDem::Ready(Ok(self.plan_surfaces(&plan.heights_m()))),
+                }
+            }
+            Err(WindowPlanError::TooManyTiles) => {
+                WindowDem::Ready(self.window_surfaces(a, origin, size, stride, zoom))
+            }
+            Err(WindowPlanError::NotFinite | WindowPlanError::Missing(_)) => {
+                WindowDem::Ready(Err(Gap::Missing))
+            }
+        }
+    }
+
+    /// The window's elevation surfaces: waits for the hook's answer, and reads the window on the CPU from the same
+    /// plan when the hook has none (or one of the wrong size).
+    fn finish_window_dem(&self, dem: WindowDem) -> Result<Vec<i32>, Gap> {
+        match dem {
+            WindowDem::Ready(dem) => dem,
+            WindowDem::Pending(plan, ticket) => {
+                let expected = plan.cols.len() * plan.rows.len();
+                match ticket.wait() {
+                    Some(result) if result.heights_m.len() == expected => {
+                        Ok(self.plan_surfaces(&result.heights_m))
+                    }
+                    _ => Ok(self.plan_surfaces(&plan.heights_m())),
+                }
+            }
+        }
+    }
+
+    /// The block heights of elevations in metres.
+    fn plan_surfaces(&self, heights_m: &[f32]) -> Vec<i32> {
+        heights_m
+            .iter()
+            .map(|&h| self.field.block_y_of(h))
+            .collect()
+    }
+
     /// The water rules over the `width` by `depth` columns `stride` blocks apart from `(x0, z0)`, read at the
     /// zoom and land cover level of `zoom_step`: each column's answer and class.
     pub(super) fn water_columns(
@@ -264,9 +359,14 @@ impl EarthGenerator {
         let (w, h) = (width + 2 * WINDOW_PAD, depth + 2 * WINDOW_PAD);
         let zoom = self.zoom_for_step(zoom_step);
         // Both are asked for before either failure is reported, so one pass names everything the window lacks.
-        let dem = self.window_surfaces(a, [px, pz], [w, h], stride, zoom);
+        let dem = self.start_window_dem(a, [px, pz], [w, h], stride, zoom);
         let class = self.classes_core(a, land, [px, pz], [w, h], stride, zoom_step);
-        let (dem, class) = (dem?, class?);
+        // A failed elevation read is reported before a failed class read, as it always was.
+        let dem = match dem {
+            WindowDem::Ready(Err(gap)) => return Err(gap),
+            dem => dem,
+        };
+        let class = class?;
         let span = |n: usize| (n.saturating_sub(1) as i64 * i64::from(stride)) as i32;
         let r = Rect {
             x0: px,
@@ -281,6 +381,7 @@ impl EarthGenerator {
                 pz.saturating_add((i / w) as i32 * stride),
             )
         };
+        // The river search needs coordinates only, so it runs while the hook computes the elevation.
         let indexes = self.rivers_near(r);
         let river: Vec<Option<RiverHit>> = if indexes.is_empty() {
             vec![None; w * h]
@@ -297,6 +398,7 @@ impl EarthGenerator {
                 })
                 .collect()
         };
+        let dem = self.finish_window_dem(dem)?;
         let vertical = *self.field.vertical();
         let lakes: Vec<Arc<Lake>> = match self.water.atlas {
             Some(atlas) if class.contains(&LandClass::Water) => {
@@ -334,7 +436,14 @@ impl EarthGenerator {
         for row in WINDOW_PAD..WINDOW_PAD + depth {
             classes.extend_from_slice(&class[row * w + WINDOW_PAD..row * w + WINDOW_PAD + width]);
         }
-        Ok(WaterColumns { columns, classes })
+        let aligned = x0.checked_sub(pad) == Some(px) && z0.checked_sub(pad) == Some(pz);
+        Ok(WaterColumns {
+            columns,
+            classes,
+            dem,
+            dem_width: w,
+            aligned,
+        })
     }
 
     /// The column `(s, kind)` the water rules' answer `cw` makes at block `(x, z)` of land cover `class`.

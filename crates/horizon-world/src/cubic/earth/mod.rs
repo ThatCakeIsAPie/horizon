@@ -36,6 +36,7 @@ mod far_speed_tests;
 #[cfg(test)]
 mod far_trees_tests;
 pub mod generator;
+pub mod gpu_window;
 #[cfg(test)]
 mod land_tests;
 pub mod ores;
@@ -63,6 +64,10 @@ mod water_tests;
 pub use biome::{Biome, EarthBiomes};
 pub use far_trees::{FAR_TREE_RULES, FarBlocks, FarDecor, MAX_TREE_UP};
 pub use generator::{BIOME, EarthBlocks, EarthGenerator, Fill, NotReady};
+pub use gpu_window::{
+    WINDOW_GPU_DEFAULT_ON, WINDOW_GPU_ENV, WindowGpu, WindowJob, WindowResult, WindowTicket,
+    window_gpu_env_override, window_gpu_possible, window_gpu_wanted,
+};
 pub use settings::EarthSettings;
 pub use surface::SurfaceKind;
 pub use vegetation::{EarthVegetationMask, FeatureKind, SNOW_RULES, VEGETATION_RULES};

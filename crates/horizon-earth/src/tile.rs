@@ -219,6 +219,11 @@ impl Tile {
         }
     }
 
+    /// All 256 by 256 heights in metres, row by row from the north-west corner (index `py * 256 + px`).
+    pub fn heights(&self) -> &[f32] {
+        &self.heights
+    }
+
     /// The height in metres of pixel `(px, py)`, counted from the tile's north-west corner.
     ///
     /// # Panics

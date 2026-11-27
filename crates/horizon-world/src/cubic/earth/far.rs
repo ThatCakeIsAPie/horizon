@@ -148,14 +148,35 @@ impl EarthGenerator {
             z1: sz.saturating_add(span),
             zoom,
         };
-        let mut surfaces = self
-            .field
-            .surface_ys_strided(sx, sz, width, width, stride, zoom)
-            .ok_or_else(|| NotReady {
-                tiles: self.missing_in(rect),
-            })?;
-        let not_ready = |_| NotReady {
-            tiles: self.missing_in(self.kind_rect(rect, stride)),
+        // With land cover the water window reads the elevation of the columns itself (its inner part is exactly
+        // the columns' own surfaces) and every final surface comes out of the rules, so the columns are not read
+        // twice: `surfaces` is only the buffer the final ones are written into.
+        let land = self.land_cover_active();
+        let mut surfaces = if land {
+            vec![0; width * width]
+        } else {
+            self.field
+                .surface_ys_strided(sx, sz, width, width, stride, zoom)
+                .ok_or_else(|| NotReady {
+                    tiles: self.missing_in(rect),
+                })?
+        };
+        let not_ready = |_| {
+            // As before, a node whose own elevation tiles are missing names those, a node whose padding or land
+            // cover lacks something names the padded rectangle's.
+            if land
+                && self
+                    .field
+                    .surface_ys_strided(sx, sz, width, width, stride, zoom)
+                    .is_none()
+            {
+                return NotReady {
+                    tiles: self.missing_in(rect),
+                };
+            }
+            NotReady {
+                tiles: self.missing_in(self.kind_rect(rect, stride)),
+            }
         };
         let (kinds, classes) = self
             .kinds_classes_core(

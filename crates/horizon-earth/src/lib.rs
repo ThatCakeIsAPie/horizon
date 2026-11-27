@@ -43,6 +43,7 @@ pub mod tile;
 mod warp;
 pub mod water;
 pub mod waterfile;
+pub mod window;
 
 pub use climate::{CLIMATE_RULES, Climate, ClimateVar};
 pub use climatefield::{ClimateFetch, ClimateField, ClimateGrid, ClimateLookup, ClimateStore};
@@ -54,4 +55,5 @@ pub use landsource::{LandCoverFetcher, LandCoverSource};
 pub use projection::{LatLon, LocalTangent, Projection, VerticalMap};
 pub use source::{FetchError, LoadError, SEA_FLOOR_M, TileFetcher, TileStore};
 pub use tile::{Tile, TileError, TileId};
+pub use window::{AxisIndex, AxisSample, WindowPlan, WindowPlanError};
 pub use water::{Lake, RiverReach, WATER_RULES, WaterAtlas, WaterAtlasError};

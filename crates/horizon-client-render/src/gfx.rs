@@ -534,6 +534,7 @@ pub mod cube_gen;
 pub mod cube_mesh;
 mod cull;
 mod dx12_compiler;
+pub mod earth_window;
 mod end_sky;
 pub mod entity_skin;
 pub mod external;
