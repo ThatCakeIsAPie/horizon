@@ -1912,6 +1912,10 @@ pub struct Renderer {
     lod_cubes: FxHashMap<crate::lod::cube::CubeKey, lod::Tile>,
     /// Finished node meshes `upload_cube_lods` has yet to upload.
     cube_pending: Option<lod::CubePending>,
+    /// `lod_cubes` that started dying, oldest first, with the time they did:
+    /// `upload_cube_lods` drops the faded ones without walking every tile. An entry
+    /// whose tile is gone or dies since another time is stale and skipped.
+    cube_dying: std::collections::VecDeque<(std::time::Instant, crate::lod::cube::CubeKey)>,
     /// Which `lod_cubes` draw, and how many pairs of them overlap: the far
     /// view's single-cut rule, counted (`Renderer::cube_overlap_stats`).
     cube_overlap: crate::lod::swap::Overlaps,
@@ -5015,6 +5019,7 @@ impl Renderer {
             lods: FxHashMap::default(),
             lod_cubes: FxHashMap::default(),
             cube_pending: None,
+            cube_dying: Default::default(),
             cube_overlap: Default::default(),
             cube_far: None,
             surface_tiles: None,
@@ -6481,6 +6486,7 @@ impl Renderer {
         self.ray_clear();
         self.lods.clear();
         self.lod_cubes.clear();
+        self.cube_dying.clear();
         if let Some(far) = &mut self.far_cull {
             far.records.clear();
         }

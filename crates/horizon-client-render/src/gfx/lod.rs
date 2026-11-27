@@ -958,6 +958,7 @@ impl Renderer {
                 tiles.free(key);
             }
         }
+        self.cube_dying.clear();
         for (_, tile) in std::mem::take(&mut self.lod_cubes) {
             self.lod_cull_free.push(tile.cull_slot);
             self.release_tile(tile);
@@ -997,12 +998,22 @@ impl Renderer {
         if let Some(far) = &mut self.cube_far {
             far.upload();
         }
-        let faded: Vec<_> = self
-            .lod_cubes
-            .iter()
-            .filter(|(_, tile)| tile.dying.is_some_and(|d| start - d >= FADE))
-            .map(|(&key, _)| key)
-            .collect();
+        // Dying times only grow (`start` of the frame it began), so the faded ones
+        // are a prefix of `cube_dying`.
+        let mut faded = Vec::new();
+        while let Some(&(since, key)) = self.cube_dying.front() {
+            if start.saturating_duration_since(since) < FADE {
+                break;
+            }
+            self.cube_dying.pop_front();
+            if self
+                .lod_cubes
+                .get(&key)
+                .is_some_and(|tile| tile.dying == Some(since))
+            {
+                faded.push(key);
+            }
+        }
         for key in faded {
             self.remove_cube_lod(key);
             if let Some(pending) = &mut self.cube_pending {
@@ -1061,6 +1072,7 @@ impl Renderer {
             } else if tile.dying.is_none() {
                 tile.dying = Some(start);
                 tile.alone = true;
+                self.cube_dying.push_back((start, key));
                 self.far_touch(key);
             }
         }
