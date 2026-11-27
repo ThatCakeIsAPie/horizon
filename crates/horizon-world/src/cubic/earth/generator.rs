@@ -39,11 +39,12 @@
 //! box called uniform is the same block everywhere.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use horizon_core::position::SectionPos;
+use horizon_earth::fastmap::FastMap;
 use horizon_earth::{
     ClimateLookup, ElevationField, Fetch, FetchError, LandClass, LandCoverSource, LoadError,
     TileId, TileStore,
@@ -252,6 +253,58 @@ pub struct EarthGenerator {
     pub(super) water: super::water_gen::WaterState,
     /// Biomes the far view already read ([`super::biome`]).
     pub(super) biome_memo: super::biome::BiomeMemo,
+    /// The surfaces and kinds of the cube columns already made, so the cubes stacked in a column share them.
+    pub(super) column_memo: ColumnMemo,
+}
+
+/// The final surfaces and the kinds of one cube column's 16 by 16 blocks (`z << 4 | x`).
+pub(super) type CubeColumn = Arc<(Vec<i32>, Vec<SurfaceKind>)>;
+
+/// Cube columns already worked out, by cube `(x, z)`: the surfaces and kinds do not depend on the cube's height,
+/// and a column has about five mixed cubes stacked. Only answers that were made are kept, so a column whose data
+/// is missing is asked for again. Sharded so the workers do not queue on one lock.
+pub(super) struct ColumnMemo {
+    shards: [Mutex<FastMap<(i32, i32), CubeColumn>>; COLUMN_MEMO_SHARDS],
+}
+
+const COLUMN_MEMO_SHARDS: usize = 16;
+/// Columns kept per shard before it starts over (8192 in all, a few KB each).
+const COLUMN_MEMO_SHARD_CAP: usize = 512;
+
+impl Default for ColumnMemo {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(FastMap::default())),
+        }
+    }
+}
+
+impl ColumnMemo {
+    fn shard(&self, x: i32, z: i32) -> MutexGuard<'_, FastMap<(i32, i32), CubeColumn>> {
+        let h = (x as u32).wrapping_mul(0x9E37_79B1) ^ (z as u32).wrapping_mul(0x85EB_CA6B);
+        self.shards[(h >> 24) as usize % COLUMN_MEMO_SHARDS]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn get(&self, x: i32, z: i32) -> Option<CubeColumn> {
+        self.shard(x, z).get(&(x, z)).cloned()
+    }
+
+    fn put(&self, x: i32, z: i32, column: CubeColumn) {
+        let mut shard = self.shard(x, z);
+        if shard.len() >= COLUMN_MEMO_SHARD_CAP {
+            shard.clear();
+        }
+        shard.insert((x, z), column);
+    }
+
+    /// Forgets every column.
+    pub(super) fn clear(&self) {
+        for shard in &self.shards {
+            shard.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        }
+    }
 }
 
 impl EarthGenerator {
@@ -281,6 +334,7 @@ impl EarthGenerator {
             climate: None,
             water: super::water_gen::WaterState::default(),
             biome_memo: super::biome::BiomeMemo::default(),
+            column_memo: ColumnMemo::default(),
         })
     }
 
@@ -290,6 +344,7 @@ impl EarthGenerator {
     pub fn with_land_cover(mut self, source: Arc<LandCoverSource>) -> Self {
         if self.land_cover {
             self.land = Some(source);
+            self.column_memo.clear();
         }
         self
     }
@@ -300,6 +355,7 @@ impl EarthGenerator {
     pub fn with_climate(mut self, source: Arc<horizon_earth::ClimateSource>) -> Self {
         if self.climate_on {
             self.climate = Some(source);
+            self.column_memo.clear();
         }
         self
     }
@@ -1100,10 +1156,19 @@ impl EarthGenerator {
             out.fill(id);
             return Ok(Some(id));
         }
-        let mut surfaces = self.surfaces_of(a, r)?;
-        let kinds = self.kinds_core(a, [r.x0, r.z0], [16, 16], 1, 1, &mut surfaces)?;
+        let column = match self.column_memo.get(cube.x, cube.z) {
+            Some(column) => column,
+            None => {
+                let mut surfaces = self.surfaces_of(a, r)?;
+                let kinds = self.kinds_core(a, [r.x0, r.z0], [16, 16], 1, 1, &mut surfaces)?;
+                let column = Arc::new((surfaces, kinds));
+                self.column_memo.put(cube.x, cube.z, Arc::clone(&column));
+                column
+            }
+        };
+        let (surfaces, kinds) = &*column;
         for dy in 0..16 {
-            for (column, (&s, &kind)) in surfaces.iter().zip(&kinds).enumerate() {
+            for (column, (&s, &kind)) in surfaces.iter().zip(kinds).enumerate() {
                 out[dy << 8 | column] = self.block_for(y0 + dy as i32, s, kind);
             }
         }
