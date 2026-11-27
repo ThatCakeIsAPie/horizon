@@ -119,6 +119,9 @@ pub(super) fn class(
 /// The surfaces of the 16 by 16 columns of node `key` (the voxels' middles): level 0 and 1 at the base zoom (they
 /// are made of cubes), the others at the zoom of their step. Only heights, so land cover is not waited for.
 fn surfaces(earth: &EarthGenerator, key: CubeKey) -> Result<Vec<i32>, NotReady> {
+    if let Some(memo) = LAST_SURFACES.with(|m| m.borrow_mut().take_if(|(k, _)| *k == key)) {
+        return Ok(memo.1);
+    }
     let origin = key.origin();
     match key.level {
         0 | 1 => earth.surfaces_at(origin[0], origin[2], 1 << key.level, 1),
@@ -265,6 +268,14 @@ pub(super) fn node(
     }
 }
 
+thread_local! {
+    /// The final surfaces of the node [`from_surfaces`] last built on this thread: the same read
+    /// [`surfaces`] makes for its sky cover right after (with land cover, `surfaces_at` is `columns_at`'s
+    /// surfaces), so the columns are read once per node.
+    static LAST_SURFACES: std::cell::RefCell<Option<(CubeKey, Vec<i32>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Node `key` from its columns' surfaces at the zoom of its step (levels 2 and up; levels 0 and 1 too in the
 /// coarse pass, [`coarse_from_surfaces`]): its class first, uniform when the class says so.
 fn from_surfaces(
@@ -298,6 +309,10 @@ fn from_surfaces(
     }
     BUILT[1].fetch_add(1, Relaxed);
     let mut cols = earth.node_columns(u32::from(level), key.x, key.z)?;
+    // Level 1's sky cover reads its surfaces at the base zoom, not at its step's.
+    if level != 1 && earth.land_cover_active() {
+        LAST_SURFACES.with(|m| *m.borrow_mut() = Some((key, cols.surfaces.clone())));
+    }
     earth.decorate_columns(&mut cols, decor)?;
     let biomes: Vec<u16> = (0..256)
         .map(|i| {

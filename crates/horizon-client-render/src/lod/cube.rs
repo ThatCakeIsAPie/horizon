@@ -176,6 +176,19 @@ pub const NO_FLUID_TOP: u16 = u16::MAX;
 pub const FLUID_TOP_SCALE: u16 = 4096;
 
 impl CubeNode {
+    /// A hash of everything a node draws from: its voxels, sky cover and
+    /// fluid tops (not its key).
+    pub fn content_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        match &self.voxels {
+            Voxels::Uniform(v) => (0u8, v).hash(&mut h),
+            Voxels::Dense(d) => (1u8, &d[..]).hash(&mut h),
+        }
+        self.covered.hash(&mut h);
+        self.fluid_tops.as_deref().map(|t| &t[..]).hash(&mut h);
+        h.finish()
+    }
     pub fn uniform(key: CubeKey, voxel: Voxel) -> Self {
         Self {
             key,
@@ -1793,7 +1806,7 @@ pub mod profile {
         let e = std::array::from_fn::<u64, 3, _>(|i| earth[i].saturating_sub(before.earth[i]));
         let window = now.saturating_duration_since(before.at).as_millis();
         log::info!(
-            "Horizon far waste ({window} ms): jobs {}, built {} (uniform {}, empty {}, failed {}), delivered {}, rebuilt {}; plan +{} -{} (installs {}, reused {}, readded {}, dropped unbuilt {}); released {}, short-lived {} {:?}; late refreshed {} (skipped held {}, dropped {}, wasted {}, other {}); retries {}; refills {} ({} keys); replans {} (moved {}, classes {}, refine {}, timer {}); cache hits {} misses {} evicted {} forgotten {} cleared {}, {} nodes, {:.1} MB; earth coarse {}, whole refresh {}, whole direct {}",
+            "Horizon far waste ({window} ms): jobs {}, built {} (uniform {}, empty {}, failed {}), delivered {}, rebuilt {}; plan +{} -{} (installs {}, reused {}, readded {}, dropped unbuilt {}); released {}, short-lived {} {:?}; late refreshed {} (skipped held {}, dropped {}, wasted {}, other {}, same {}); retries {}; refills {} ({} keys); replans {} (moved {}, classes {}, refine {}, timer {}); cache hits {} misses {} evicted {} forgotten {} cleared {}, {} nodes, {:.1} MB; earth coarse {}, whole refresh {}, whole direct {}",
             w.jobs,
             w.built,
             w.built_uniform,
@@ -1815,6 +1828,7 @@ pub mod profile {
             w.late_dropped,
             w.late_wasted,
             w.late_other,
+            w.late_same,
             w.retries,
             w.refills,
             w.refill_keys,
@@ -2104,6 +2118,10 @@ impl DeliverBudget {
 struct Done {
     key: CubeKey,
     product: Option<Product>,
+    /// [`CubeNode::content_hash`] of the node made, when it was made from a
+    /// CPU node (not a GPU-generated slot): a late refresh that comes out the
+    /// same as the drawn node is not swapped in.
+    hash: Option<u64>,
 }
 
 /// What a node holds on the GPU path.
@@ -2134,6 +2152,8 @@ pub struct GpuNode {
     /// The distinct block states of a CPU node (empty for a generated one:
     /// the generator's states are known from the start).
     pub states: Vec<u32>,
+    /// [`CubeNode::content_hash`] of the CPU node it was made from.
+    pub hash: Option<u64>,
 }
 
 /// What `CubeLod::take_gpu_nodes` hands the renderer.
@@ -2795,6 +2815,7 @@ waste_counters!(
     late_dropped,
     late_wasted,
     late_other,
+    late_same,
     retries,
     refills,
     refill_keys,
@@ -3459,6 +3480,8 @@ pub struct CubeLod {
     late: Option<Arc<dyn LateContent>>,
     /// Drawn nodes queued to be made again for it.
     refreshing: FxHashSet<CubeKey>,
+    /// [`CubeNode::content_hash`] of each delivered node made from a CPU node.
+    drawn_hash: FxHashMap<CubeKey, u64>,
     /// Planned nodes not delivered.
     missing: usize,
     failed: FxHashMap<CubeKey, Instant>,
@@ -3664,6 +3687,7 @@ impl CubeLod {
             stale: FxHashSet::default(),
             late: None,
             refreshing: FxHashSet::default(),
+            drawn_hash: FxHashMap::default(),
             missing: 0,
             failed: FxHashMap::default(),
             retry_at: now,
@@ -4334,6 +4358,25 @@ impl CubeLod {
                 self.release(node);
             }
             return;
+        }
+        // Made again the same as drawn: nothing to swap (the same picture).
+        if again
+            && done.hash.is_some()
+            && self.drawn_hash.get(&key) == done.hash.as_ref()
+            && far_knob("HORIZON_FAR_LATE_SAME", 1) != 0
+        {
+            if let Some(Product::Gpu(node)) = &done.product {
+                self.release(node);
+            }
+            self.refreshed_at.remove(&key);
+            bump(&self.shared.waste.late_same, 1);
+            return;
+        }
+        if done.product.is_some() {
+            match done.hash {
+                Some(hash) => self.drawn_hash.insert(key, hash),
+                None => self.drawn_hash.remove(&key),
+            };
         }
         match done.product {
             Some(Product::Mesh(mesh)) => {
@@ -5200,6 +5243,7 @@ impl CubeLod {
         let w = &self.shared.waste;
         for key in &released {
             self.delivered.remove(key);
+            self.drawn_hash.remove(key);
             self.stale.remove(key);
             self.empty.remove(key);
             bump(&w.released, 1);
@@ -5362,6 +5406,7 @@ impl CubeLod {
             queue.later.clear();
         }
         self.refreshing.clear();
+        self.drawn_hash.clear();
         self.ever.clear();
         self.delivered_at.clear();
         self.refreshed_at.clear();
@@ -5736,6 +5781,7 @@ fn work(
         }
         for key in keys {
             let started = Instant::now();
+            let mut mesh_hash = None;
             let product = match gpu {
                 Some(backend) => gpu_node(
                     &shared,
@@ -5748,6 +5794,7 @@ fn work(
                 )
                 .map(Product::Gpu),
                 None => node(&shared, sampler.as_mut(), key, air, &kind).map(|node| {
+                    mesh_hash = Some(node.content_hash());
                     if let Some(voxel) = node.as_uniform() {
                         bump(&shared.waste.built_uniform, 1);
                         if voxel.state == air {
@@ -5792,7 +5839,11 @@ fn work(
             }
             let started = Instant::now();
             shared.queue.lock().unwrap().running.remove(&key);
-            if tx.send(Done { key, product }).is_err() {
+            let hash = match &product {
+                Some(Product::Gpu(node)) => node.hash,
+                _ => mesh_hash,
+            };
+            if tx.send(Done { key, product, hash }).is_err() {
                 return;
             }
             if profiling {
@@ -5857,6 +5908,7 @@ fn gpu_from_node(node: &CubeNode, air: BlockStateId, backend: &GpuBackend) -> Op
         cover,
         fluid_tops: node.fluid_tops().map(|tops| Box::new(*tops)),
         states,
+        hash: Some(node.content_hash()),
     })
 }
 
@@ -5898,6 +5950,7 @@ fn gpu_node(
             cover: None,
             fluid_tops: None,
             states: Vec::new(),
+            hash: None,
         }),
         Some(Resident::Node(node)) => {
             debug_assert_eq!(node.key, key);
@@ -7005,6 +7058,7 @@ mod tests {
         Done {
             key,
             product: Some(Product::Mesh(SectionMesh::default())),
+            hash: None,
         }
     }
 
