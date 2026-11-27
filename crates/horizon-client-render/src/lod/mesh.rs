@@ -1150,6 +1150,70 @@ fn voxel_faces<L: Look>(
     faces
 }
 
+/// A face of [`voxel_faces`] (one exposed voxel side and overlay, unmerged),
+/// for the GPU mesher's compare test (`gfx::cube_mesh`).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TestFace {
+    pub direction: Direction,
+    /// The face's plane, node-local blocks.
+    pub plane: f32,
+    /// `[u0, v0, u1, v1]`, node-local blocks (axes as `voxel_faces`).
+    pub rect: [f32; 4],
+    pub overlay: u8,
+    pub layer: u16,
+    pub light: u16,
+    pub color: u32,
+    pub translucent: bool,
+}
+
+/// A test material's paint: `(layer, color, translucent)`.
+#[cfg(test)]
+pub(crate) type TestPaint = (u16, u32, bool);
+
+/// [`voxel_faces`] of `node`, with materials from `style(state, biome,
+/// direction) -> (paints, fluid, opaque)` (each paint takes its span's light).
+#[cfg(test)]
+pub(crate) fn voxel_faces_for_test(
+    node: &CubeNode,
+    air: BlockStateId,
+    sea_surface: Option<i32>,
+    style: impl Fn(BlockStateId, u16, Direction) -> ([Option<TestPaint>; 2], u8, bool),
+    lets_sky_through: impl Fn(BlockStateId) -> bool,
+) -> Vec<TestFace> {
+    let material = |span: &Span, direction: Direction, _: [i32; 2]| {
+        let (paints, fluid, opaque) = style(span.state, span.biome, direction);
+        Material::<()> {
+            faces: paints.map(|p| {
+                p.map(|(layer, color, translucent)| Paint {
+                    layer,
+                    light: span.light,
+                    color,
+                    translucent,
+                    look: (),
+                })
+            }),
+            fluid,
+            opaque,
+        }
+    };
+    voxel_faces(node, air, sea_surface, material, lets_sky_through)
+        .into_iter()
+        .flat_map(|((key, ()), rects)| {
+            rects.into_iter().map(move |r| TestFace {
+                direction: key.direction,
+                plane: f32::from_bits(key.plane),
+                rect: [r.u0, r.v0, r.u1, r.v1],
+                overlay: key.overlay,
+                layer: key.layer,
+                light: key.light,
+                color: key.color,
+                translucent: key.translucent,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod refinement_tests {
     use super::*;

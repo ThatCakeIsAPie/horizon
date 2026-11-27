@@ -131,6 +131,11 @@ pub struct CubicLodSampler {
     /// An Earth world with far trees: its nodes are drawn coarse (without trees) first and made whole
     /// behind the rest (`refine`, docs/earth.md "Far view"); shared by every fork.
     refine: Option<Arc<refine::Refine>>,
+    /// An Earth world's node pool on the renderer's device ([`Self::with_device`]):
+    /// its nodes, all sampled on the CPU, are uploaded there for the GPU mesher
+    /// and draw path (`CubeLod::set_gpu_path`). `None` elsewhere (a Custom
+    /// world's backend is its far generator's) and without a usable device.
+    pool: Option<GpuBackend>,
 }
 
 /// The inputs of the far generator: parameters and the node columns.
@@ -342,6 +347,7 @@ impl CubicLodSampler {
             plains: level_plains,
             structures,
             refine,
+            pool: None,
         }
     }
 
@@ -350,6 +356,15 @@ impl CubicLodSampler {
     /// without reading them back). Without compute shaders there it stays
     /// the CPU reference.
     pub fn with_device(mut self, device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        // Earth has no far generator (`far_setup` needs CubicWorldGen's noises):
+        // its nodes stay the CPU's, and a node pool on this device lets the
+        // GPU mesher draw them (`GpuBackend::pool_only`). No descent, no
+        // surface tiles: both are a generator's.
+        if self.is_earth() {
+            let water = self.fluids.first().copied().unwrap_or(self.air);
+            self.pool = GpuBackend::pool_only(device, queue, Vec::new(), self.air, water);
+            return self;
+        }
         if let Some(f) = &self.far_setup {
             let sampler = GpuCubeSampler::new(device, queue, f.params.clone(), f.columns.clone());
             // The sparse descent proves subtrees uniform from CubicWorldGen's
@@ -856,10 +871,7 @@ impl Keeper {
     }
 
     fn send(&self, item: Queued) -> bool {
-        let sent = self
-            .tx
-            .as_ref()
-            .is_some_and(|tx| tx.try_send(item).is_ok());
+        let sent = self.tx.as_ref().is_some_and(|tx| tx.try_send(item).is_ok());
         if !sent {
             let n = self
                 .dropped
@@ -1061,11 +1073,7 @@ impl CubeSampler for CubicLodSampler {
             self.level.generation_cancelled(),
         ) {
             self.keep(&node, since);
-        } else if final_node(
-            self.in_band(key),
-            false,
-            self.level.generation_cancelled(),
-        ) {
+        } else if final_node(self.in_band(key), false, self.level.generation_cancelled()) {
             // Coarse: kept as coarse, drawn at once on a revisit.
             self.keep_coarse(&node, since);
         }
@@ -1172,6 +1180,9 @@ impl CubeSampler for CubicLodSampler {
     }
 
     fn gpu(&self) -> Option<GpuBackend> {
+        if let Some(pool) = &self.pool {
+            return Some(pool.clone());
+        }
         self.far.as_ref()?.gpu()
     }
 
@@ -1220,6 +1231,7 @@ impl CubeSampler for CubicLodSampler {
             plains: self.plains,
             structures: self.structures.clone(),
             refine: self.refine.clone(),
+            pool: self.pool.clone(),
         }))
     }
 

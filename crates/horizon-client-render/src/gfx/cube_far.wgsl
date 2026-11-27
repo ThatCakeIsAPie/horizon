@@ -57,6 +57,8 @@ fn cf_shade(dir: u32) -> f32 {
     let dim = (q.x >> 25u) & 1u;
     let state = q.y & 0x1ffffu;
     let biome = (q.y >> 17u) & 255u;
+    // A fluid's surface inside the quad's top voxel row, 1/256 voxel (0: none).
+    let top = ((q.x >> 26u) & 63u) | (((q.y >> 25u) & 3u) << 6u);
     let instance = cf_instances[node * 2u];
     let extent = cf_instances[node * 2u + 1u];
     let scale = extent.x;
@@ -77,8 +79,18 @@ fn cf_shade(dir: u32) -> f32 {
     let u0 = f32(a0) * scale;
     let u1 = f32(a0 + w) * scale;
     let v0 = f32(b0) * scale;
-    let v1 = f32(b0 + h) * scale;
-    let p = f32(plane) * scale;
+    var v1 = f32(b0 + h) * scale;
+    var p = f32(plane) * scale;
+    // A column's fluid top inside the voxel (cube_mesh.rs `Quad::top`): an Up face
+    // lies on it, a side face's top edge comes down to it (lod/mesh.rs `voxel_faces`).
+    if top != 0u {
+        let frac = f32(top) * (1.0 / 256.0);
+        if dir == 1u {
+            p = (f32(y) + frac) * scale;
+        } else if axis != 0u {
+            v1 = (f32(b0 + h - 1u) + frac) * scale;
+        }
+    }
     var c = corner;
     if dir == 0u || dir == 3u || dir == 5u {
         c = 3u - c;

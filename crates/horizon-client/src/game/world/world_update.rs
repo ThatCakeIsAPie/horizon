@@ -509,12 +509,30 @@ impl Game<'_> {
                 // and the setting allows (`CubeLod::set_gpu_path`). Decided before the
                 // update, so the first plan already has the descent's classes to wait for.
                 let facts = self.res.facts();
+                // An Earth world's backend is a node pool alone (its nodes all sampled on
+                // the CPU, `GpuBackend::pool_only`): it takes the GPU path only where every
+                // node fits the GPU mesher (`CubeLod::gpu_path_allowed`) and no shader pack
+                // draws the terrain (the pack draws the CPU's far meshes, not `cube_far`).
+                let pool_only = cube_lod.gpu_pool_only();
                 let gpu = self.settings.horizon.gpu_far
+                    && (!pool_only
+                        || (cube_lod.gpu_path_allowed() && !renderer.pack_draws_terrain()))
                     && cube_lod.gpu_backend().is_some_and(|backend| {
                         renderer.use_gpu_cube_lods(backend, facts.states.len(), facts.air.0)
                     });
                 if cube_lod.set_gpu_path(gpu) {
                     renderer.clear_cube_lods();
+                    if pool_only {
+                        log::info!(
+                            "Horizon: Earth far terrain on the {} far path{}",
+                            if gpu { "GPU" } else { "CPU" },
+                            if gpu {
+                                " (nodes sampled on the CPU, meshed and drawn on the GPU)"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
                 }
                 // The sparse descent rides the GPU path (the sampler has one
                 // only in a Custom world).

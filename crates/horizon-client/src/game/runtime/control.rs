@@ -1774,11 +1774,15 @@ impl Game<'_> {
                     "pending": s.pending,
                     "uniform_skipped": s.uniform_skipped,
                     "gpu_generated": s.gpu_generated,
+                    // CPU-sampled nodes uploaded for the GPU mesher (an Earth world's).
+                    "gpu_uploaded": s.gpu_uploaded,
                     "gpu_meshed": s.gpu_meshed,
                     "arena_bytes": s.arena_bytes,
                     "pool_bytes": s.pool_bytes,
                     "complete": s.complete,
                     "gpu_path": lod.on_gpu_path(),
+                    // The GPU backend is a node pool alone (no GPU generator: Earth).
+                    "gpu_pool_only": lod.gpu_pool_only(),
                     // Drawn nodes made again for structures found late.
                     "late_refreshed": s.late_refreshed,
                     "descent_runs": s.descent_runs,

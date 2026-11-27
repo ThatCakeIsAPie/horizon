@@ -1461,7 +1461,10 @@ pub fn plan_far(input: &PlanInput) -> Plan {
                     };
                     let ratio =
                         rule.factor(camera, node) * f64::from(node.size()) * merge / distance;
-                    if ratio > 1.0 && !may_split(node) && node.children().iter().all(|&c| bare(c, region)) {
+                    if ratio > 1.0
+                        && !may_split(node)
+                        && node.children().iter().all(|&c| bare(c, region))
+                    {
                         // Nothing of it would be planned once it splits (its eight are air, or drawn by
                         // tiles or near cubes): left out now. Held, it was drawn, split into nothing, left
                         // the drawn nodes and was held again: the plan went back and forth every replan.
@@ -1970,6 +1973,9 @@ pub struct CubeLodStats {
     pub uniform_skipped: usize,
     /// Nodes generated on the GPU, ever.
     pub gpu_generated: u64,
+    /// Nodes sampled on the CPU and uploaded into the GPU pool for the GPU
+    /// mesher, ever (an Earth world's far nodes on the GPU path).
+    pub gpu_uploaded: u64,
     /// Nodes meshed on the GPU, ever (the renderer's count).
     pub gpu_meshed: u64,
     /// Bytes of the quad arena and the node pool in use.
@@ -2183,9 +2189,11 @@ pub struct GpuNode {
     /// Where each column's fluid ends inside the node (`CubeNode::fluid_tops`:
     /// `z << 4 | x`, [`FLUID_TOP_SCALE`] units per node side over the node's
     /// bottom, [`NO_FLUID_TOP`] for none). Filled from a CPU node; `None` for
-    /// a generated slot. The GPU mesher does not read it yet (it knows the sea
-    /// surface only): a node that has them is meshed on the CPU, see
-    /// [`needs_cpu_mesh`].
+    /// a generated slot. The GPU mesher draws them as the CPU mesher does
+    /// (`gfx::cube_mesh::MeshJob::fluid_tops`; a [`GpuContent::Uniform`] node's
+    /// by `gfx::cube_mesh::uniform_quads`): a column with a top draws its
+    /// fluid's top on the node's top, and a top inside a fluid voxel is its
+    /// surface, to 1/256 of a voxel (the units' own precision).
     pub fluid_tops: Option<Box<FluidTops>>,
     /// The distinct block states of a CPU node (empty for a generated one:
     /// the generator's states are known from the start).
@@ -2879,6 +2887,7 @@ impl Shared {
             stop: AtomicBool::new(false),
             cache: Mutex::default(),
             gpu_path: AtomicBool::new(false),
+            gpu_unfit: AtomicBool::new(false),
             descent_on: AtomicBool::new(false),
             descent: Mutex::default(),
             descent_wake: Condvar::new(),
@@ -2915,6 +2924,10 @@ struct Shared {
     cache: Mutex<Cache>,
     /// The workers make [`GpuNode`]s (`CubeLod::set_gpu_path`).
     gpu_path: AtomicBool,
+    /// A worker of a backend without a generator met a CPU node the GPU
+    /// mesher cannot draw ([`needs_cpu_mesh`]): the world goes back to the CPU
+    /// mesher for good ([`CubeLod::gpu_path_allowed`]).
+    gpu_unfit: AtomicBool,
     /// Classes come from the GPU descent (`CubeLod::set_gpu_descent`), not
     /// from the classifier thread.
     descent_on: AtomicBool,
@@ -4062,13 +4075,37 @@ impl CubeLod {
     /// [`CubeLod::clear`]: clear the renderer's too (`clear_cube_lods`).
     /// Returns whether it changed.
     pub fn set_gpu_path(&mut self, on: bool) -> bool {
-        let on = on && self.backend.is_some();
+        let on = on && self.gpu_path_allowed();
         if self.shared.gpu_path.load(Ordering::Relaxed) == on {
             return false;
         }
         self.shared.gpu_path.store(on, Ordering::Relaxed);
         self.clear();
         true
+    }
+
+    /// Whether the GPU path can be taken: the sampler has a GPU backend, and
+    /// one without a generator (`GpuBackend::generates` false: every node
+    /// sampled on the CPU, an Earth world's) only where every node's states
+    /// and biomes fit the GPU mesher ([`cpu_nodes_fit_gpu`]); else the world
+    /// stays on the CPU mesher, never drawn wrong.
+    pub fn gpu_path_allowed(&self) -> bool {
+        match &self.backend {
+            None => false,
+            Some(backend) if backend.generates => true,
+            Some(_) => {
+                !self.shared.gpu_unfit.load(Ordering::Relaxed)
+                    && self.context.as_ref().is_some_and(|context| {
+                        cpu_nodes_fit_gpu(context.assets.registry.len(), context.biomes.list.len())
+                    })
+            }
+        }
+    }
+
+    /// Whether the GPU path's nodes are all sampled on the CPU and uploaded
+    /// (a backend without a generator, `GpuBackend::pool_only`).
+    pub fn gpu_pool_only(&self) -> bool {
+        self.backend.as_ref().is_some_and(|b| !b.generates)
     }
 
     /// Whether workers make [`GpuNode`]s.
@@ -4463,8 +4500,12 @@ impl CubeLod {
             Some(Product::Gpu(node)) => {
                 let empty = matches!(node.content,
                     GpuContent::Uniform(voxel) if voxel.state == self.air);
-                if matches!(node.content, GpuContent::Slot(_)) && node.states.is_empty() {
-                    self.stats.gpu_generated += 1;
+                if matches!(node.content, GpuContent::Slot(_)) {
+                    if node.states.is_empty() {
+                        self.stats.gpu_generated += 1;
+                    } else {
+                        self.stats.gpu_uploaded += 1;
+                    }
                 }
                 spent.nodes += 1;
                 *group = Some(key.parent());
@@ -5742,10 +5783,21 @@ fn work(
         let gpu = backend
             .as_ref()
             .filter(|_| shared.gpu_path.load(Ordering::Relaxed));
+        // A backend with no generator (an Earth world's, `GpuBackend::pool_only`):
+        // every node of every level is sampled on the CPU (1-4 ms each) and
+        // uploaded. A batch of them would hold 64 keys out of the other
+        // workers' reach for a quarter of a second and send none until the
+        // last is made: such a worker takes one key at a time, as on the CPU
+        // path, and only the GPU's meshing differs.
+        let cpu_nodes = gpu.is_some_and(|b| !b.generates);
         // On the GPU path a worker takes a batch of the first jobs and asks
         // the sampler for them at once (`resident_many`); on the CPU path one.
         let gpu_batch = far_knob("HORIZON_FAR_GPU_BATCH", GPU_BATCH as u64).max(1) as usize;
-        let take = if gpu.is_some() { gpu_batch } else { 1 };
+        let take = if gpu.is_some() && !cpu_nodes {
+            gpu_batch
+        } else {
+            1
+        };
         if priority == 0 {
             let loading = shared.near_loading.load(Ordering::Relaxed);
             // While the near terrain loads, and for `NEAR_HOLD` after (its
@@ -5776,8 +5828,13 @@ fn work(
             // The pool is full while the renderer meshes what is in it: wait
             // for room rather than fail the batch (a failed node waits RETRY).
             let mut waited = 0;
-            while backend.pool.free_slots()
-                < gpu_batch * far_knob("HORIZON_FAR_POOL_NEED", 1) as usize
+            // Room for the batch; for CPU nodes, for a few workers' nodes.
+            let room = if cpu_nodes {
+                far_knob("HORIZON_FAR_POOL_ROOM_CPU", CPU_POOL_ROOM as u64) as usize
+            } else {
+                gpu_batch
+            };
+            while backend.pool.free_slots() < room * far_knob("HORIZON_FAR_POOL_NEED", 1) as usize
                 && waited < far_knob("HORIZON_FAR_POOL_WAITS", u64::from(POOL_WAITS)) as u32
                 && !shared.stop.load(Ordering::Relaxed)
             {
@@ -5844,7 +5901,7 @@ fn work(
             }
         }
         let mut fetched: FxHashMap<CubeKey, Option<Resident>> = FxHashMap::default();
-        if gpu.is_some() && !shared.stop.load(Ordering::Relaxed) {
+        if gpu.is_some() && !cpu_nodes && !shared.stop.load(Ordering::Relaxed) {
             let uncached: Vec<CubeKey> = {
                 let mut cache = shared.cache.lock().unwrap();
                 keys.iter()
@@ -5864,6 +5921,24 @@ fn work(
             let started = Instant::now();
             let mut mesh_hash = None;
             let product = match gpu {
+                // Sampled as on the CPU path (cache, sampler, downsampled
+                // fine levels), then uploaded for the GPU mesher.
+                Some(backend) if cpu_nodes => node(&shared, sampler.as_mut(), key, air, &kind)
+                    .and_then(|node| {
+                        // Never drawn wrong: a node past the GPU mesher's ids
+                        // (the world rule, `cpu_nodes_fit_gpu`, should have
+                        // kept it off) sends the world back to the CPU.
+                        if needs_cpu_mesh(&node) {
+                            if !shared.gpu_unfit.swap(true, Ordering::Relaxed) {
+                                log::warn!(
+                                    "Horizon far: node {key:?} holds a block state or biome the GPU mesher cannot draw; far terrain back on the CPU mesher"
+                                );
+                            }
+                            return None;
+                        }
+                        gpu_from_node(&node, air, backend)
+                    })
+                    .map(Product::Gpu),
                 Some(backend) => gpu_node(
                     &shared,
                     sampler.as_mut(),
@@ -5911,7 +5986,7 @@ fn work(
                 }
             }
             if profiling {
-                if key.level < MIN_LEVEL {
+                if key.level < MIN_LEVEL || cpu_nodes {
                     profile::add(&profile::CPU_NODES, started);
                     profile::CPU_KEYS.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -5942,26 +6017,46 @@ const NEAR_HOLD: Duration = Duration::from_millis(1500);
 const GPU_BATCH: usize = 64;
 /// At most this many of them are of the levels sampled on the CPU.
 const CPU_PER_BATCH: usize = 2;
+/// Free pool slots a worker of a backend without a generator waits for before
+/// it samples a node (its node takes one; the other workers' take theirs).
+const CPU_POOL_ROOM: usize = 32;
+
+/// Whether the CPU nodes of a world with `states` block states and `biomes`
+/// biomes can all go through the GPU mesher: its quads hold a 17-bit block
+/// state id and an 8-bit biome id, and its material and biome colour tables
+/// stop there (`gfx::cube_mesh`). A world past either stays on the CPU mesher
+/// ([`CubeLod::gpu_path_allowed`]) rather than draw a wrong block or colour.
+pub fn cpu_nodes_fit_gpu(states: usize, biomes: usize) -> bool {
+    states <= crate::gfx::cube_mesh::MAX_STATE as usize + 1 && biomes <= 256
+}
 /// A worker finding the GPU pool without room for a batch waits this long, at
 /// most this many times, before asking anyway.
 const POOL_WAIT: Duration = Duration::from_millis(2);
 const POOL_WAITS: u32 = 250;
 
-/// Whether a CPU node cannot go through the GPU mesher: one with per-column
-/// fluid tops, which only the CPU mesher (`mesh::mesh_cube`) draws (the GPU's
-/// knows the sea surface alone). Today only an Earth world has such nodes and
-/// it has no GPU path; the workers do not route on this yet (the two
-/// renderers' swaps are separate, see `GpuNode::fluid_tops`).
+/// Whether a CPU node cannot go through the GPU mesher, and must be meshed
+/// on the CPU (`mesh::mesh_cube`): a voxel whose block state is past what a
+/// quad holds (`gfx::cube_mesh::MAX_STATE`, 17 bits) or whose biome id is
+/// past 255 (a quad's 8 bits, the slot's biome table). Fluid tops are no
+/// reason: the GPU mesher draws them (`GpuNode::fluid_tops`).
 pub fn needs_cpu_mesh(node: &CubeNode) -> bool {
-    node.fluid_tops().is_some()
+    let unfit = |v: Voxel| v.state.0 > crate::gfx::cube_mesh::MAX_STATE || v.biome > 255;
+    match node.as_uniform() {
+        Some(voxel) => unfit(voxel),
+        None => (0..VOLUME).any(|i| unfit(node.at(i))),
+    }
 }
 
-/// A CPU node as a [`GpuNode`]: uniform and uncovered ones need no slot, the
+/// A CPU node as a [`GpuNode`]: uniform and uncovered ones need no slot (a
+/// uniform fluid's tops are drawn from [`GpuNode::fluid_tops`] alone), the
 /// rest are uploaded into one. `None` when the pool is full.
 fn gpu_from_node(node: &CubeNode, air: BlockStateId, backend: &GpuBackend) -> Option<GpuNode> {
     let cover = node.covered_mask().map(|mask| Box::new(*mask));
     let mut states: Vec<u32> = Vec::new();
-    if node.as_uniform().is_none() {
+    if let Some(voxel) = node.as_uniform() {
+        // Its material is asked for even when it takes a slot (covered).
+        states.push(voxel.state.0);
+    } else {
         // A node holds a handful of states: a short list beats a hash set.
         let mut last = u32::MAX;
         for i in 0..VOLUME {
@@ -6083,6 +6178,25 @@ fn node(
 
 #[cfg(test)]
 mod tests {
+    /// A world whose CPU nodes take the GPU path (a backend without a
+    /// generator, Earth's) must have every block state id within the quads'
+    /// 17 bits and every biome id within their 8; past either it stays on the
+    /// CPU mesher.
+    #[test]
+    fn cpu_nodes_take_the_gpu_mesher_only_within_its_state_and_biome_ids() {
+        use super::cpu_nodes_fit_gpu;
+        use crate::gfx::cube_mesh::MAX_STATE;
+        let all_states = MAX_STATE as usize + 1;
+        // Today's registries and biome lists (vanilla: ~29k states, ~65 biomes).
+        assert!(cpu_nodes_fit_gpu(29_873, 65));
+        assert!(cpu_nodes_fit_gpu(all_states, 256));
+        assert!(cpu_nodes_fit_gpu(0, 0));
+        // One state or one biome more than a quad holds: CPU.
+        assert!(!cpu_nodes_fit_gpu(all_states + 1, 65));
+        assert!(!cpu_nodes_fit_gpu(29_873, 257));
+        assert!(!cpu_nodes_fit_gpu(usize::MAX, usize::MAX));
+    }
+
     /// Eight stored children with water tops (the sea's, on the top of the node
     /// at every level) make a parent with them: downsampling merges them, the
     /// way `keep_into` / `of_cached_children` / the fallback downsample build it.
@@ -6099,8 +6213,14 @@ mod tests {
             tops
         };
         let sea = |key: CubeKey, tops: Option<u16>| {
-            CubeNode::uniform(key, Voxel { state: water, biome: 1 })
-                .with_fluid_tops(tops.map(tops_of))
+            CubeNode::uniform(
+                key,
+                Voxel {
+                    state: water,
+                    biome: 1,
+                },
+            )
+            .with_fluid_tops(tops.map(tops_of))
         };
         // The sea: water on the top of the upper children (tops at their tops),
         // water going on through the lower ones (none).
@@ -6112,7 +6232,9 @@ mod tests {
         let refs = std::array::from_fn(|i| &nodes[i]);
         let merged = downsample(refs, air, kind);
         assert_eq!(merged.key, parent);
-        let tops = merged.fluid_tops().expect("the parent keeps the sea's tops");
+        let tops = merged
+            .fluid_tops()
+            .expect("the parent keeps the sea's tops");
         assert!(tops.iter().all(|&h| h == FLUID_TOP_SCALE));
         assert_eq!(merged.fluid_top(3, 4), Some(parent.size() as f32));
         // A lake halfway up the upper children: halfway up the upper half.
@@ -6131,25 +6253,48 @@ mod tests {
     }
 
     /// 6. The GPU path: a CPU node's tops ride in [`super::GpuNode::fluid_tops`]
-    /// (the same units), and a node with them is meshed on the CPU.
+    /// (the same units) and the GPU mesher draws them; only a state or biome
+    /// past what a quad holds keeps a node on the CPU.
     #[test]
-    fn a_node_with_water_tops_is_not_for_the_gpu_mesher() {
+    fn a_node_with_water_tops_is_for_the_gpu_mesher() {
         use super::{CubeKey, CubeNode, FLUID_TOP_SCALE, NO_FLUID_TOP, Voxel, needs_cpu_mesh};
         use horizon_world::registry::BlockStateId;
         let key = CubeKey::new(4, 0, -1, 0);
-        let voxel = |s| Voxel { state: BlockStateId(s), biome: 0 };
+        let voxel = |s| Voxel {
+            state: BlockStateId(s),
+            biome: 0,
+        };
         let dry = CubeNode::from_fn(key, |x, _, _| voxel(u32::from(x > 7)));
         assert!(!needs_cpu_mesh(&dry));
         let mut tops = Box::new([NO_FLUID_TOP; 256]);
         tops[16 * 5 + 3] = FLUID_TOP_SCALE;
-        let wet = dry.with_fluid_tops(Some(tops));
-        assert!(needs_cpu_mesh(&wet));
-        // An all-none set is no tops.
-        let none = wet.clone().with_fluid_tops(Some(Box::new([NO_FLUID_TOP; 256])));
-        assert!(!needs_cpu_mesh(&none));
+        let wet = dry.clone().with_fluid_tops(Some(tops));
+        assert!(!needs_cpu_mesh(&wet));
         // What `gpu_from_node` copies into the GpuNode.
         let copy = wet.fluid_tops().map(|t| Box::new(*t)).unwrap();
         assert_eq!(copy[16 * 5 + 3], FLUID_TOP_SCALE);
+        // A state past 17 bits or a biome past 255 does not fit a quad.
+        let max = crate::gfx::cube_mesh::MAX_STATE;
+        let big = |state, biome| {
+            CubeNode::from_fn(key, move |x, _, _| {
+                if x == 3 {
+                    Voxel {
+                        state: BlockStateId(state),
+                        biome,
+                    }
+                } else {
+                    voxel(0)
+                }
+            })
+        };
+        assert!(!needs_cpu_mesh(&big(max, 255)));
+        assert!(needs_cpu_mesh(&big(max + 1, 0)));
+        assert!(needs_cpu_mesh(&big(1, 256)));
+        let past = Voxel {
+            state: BlockStateId(max + 1),
+            biome: 0,
+        };
+        assert!(needs_cpu_mesh(&CubeNode::uniform(key, past)));
     }
 
     #[test]
@@ -7049,12 +7194,19 @@ mod tests {
             if next == drawn {
                 break;
             }
-            assert!(!seen.contains(&next), "the plan went back to an earlier one");
+            assert!(
+                !seen.contains(&next),
+                "the plan went back to an earlier one"
+            );
             seen.push(next.clone());
             drawn = next;
         }
         assert_eq!(plan(&drawn), drawn, "the plan settles");
-        assert!(!drawn.iter().any(|k| ancestor(*k, lone.level.max(k.level)) == lone || *k == lone));
+        assert!(
+            !drawn
+                .iter()
+                .any(|k| ancestor(*k, lone.level.max(k.level)) == lone || *k == lone)
+        );
     }
 
     #[test]

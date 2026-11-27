@@ -657,6 +657,14 @@ The standing rule for all far-view work, Cubic and Earth:
   cache, 192), `HORIZON_FAR_DISK_MB` (disk cache per world, 1024), `HORIZON_FAR_GPU_CULL=0` and `HORIZON_FAR_HIZ=0`
   (CPU culling, no occlusion; to compare), `HORIZON_FAR_WHOLE_WHEN_COVERED=1` (skip the coarse pass where something
   is drawn; measured slower, off).
+- **GPU mesher.** With `gpuFarTerrain` on (and compute shaders, and no shader pack drawing terrain), Earth's far
+  nodes, still sampled on the CPU, are uploaded into a node pool on the renderer's device
+  (`GpuBackend::pool_only`) and meshed and drawn by `gfx/cube_mesh` and `gfx/cube_far`, as a Custom world's.
+  Each column's fractional water top (`CubeNode::fluid_tops`) travels with the mesher job and rides in the quad
+  (`Quad::top`, 1/256 voxel), so water draws at its real height, as the CPU mesher draws it. A world whose block
+  states or biome ids do not fit the quad (17 and 8 bits) stays on the CPU mesher. The log says
+  `Earth far terrain on the GPU far path`; `horizon-ctl state` shows `cube_lod.gpu_pool_only` and `gpu_uploaded`.
+  `HORIZON_FAR_POOL_ROOM_CPU` (32): free pool slots a worker waits for before sampling a node.
 - **Grass sides.** The far mesher (`lod::mesh::far_style`, which the GPU material table shares) draws the side faces
   of a grass block with its top sprite, grass-tinted: on a far terraced slope a voxel's side stands for slope covered
   in grass, and the dirt side with its thin green strip made forested and grassy hills read brown. A snowy grass

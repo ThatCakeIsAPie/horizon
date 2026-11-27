@@ -805,6 +805,16 @@ impl Renderer {
             && self.device.limits().max_storage_buffers_per_shader_stage >= 6
     }
 
+    /// Whether the loaded shader pack draws the terrain itself (its gbuffers
+    /// programs): the GPU far terrain (`cube_far`) is not drawn then, only the
+    /// CPU's far meshes the pack's programs read.
+    pub fn pack_draws_terrain(&self) -> bool {
+        self.pack_post
+            .as_ref()
+            .and_then(|p| p.1.as_ref())
+            .is_some_and(|p| p.has_terrain())
+    }
+
     /// Makes the GPU far terrain ready for nodes of `backend`'s pool, which
     /// must be on this renderer's device. `states` the registry's block state
     /// count, `air` its air state. False if it cannot run (stay on the CPU).

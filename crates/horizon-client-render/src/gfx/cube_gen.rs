@@ -715,10 +715,12 @@ fn reference_states(p: &CubeGenParams, key: CubeKey, columns: &NodeColumns) -> V
                     let bottom = (f64::from(origin[1]) + f64::from(jj) * s) as f32;
                     if yc < water_top {
                         p.water
-                    } else if jj < 16 && water_at_sea(bottom, water_top, || {
-                        let ys = water_top - 0.5;
-                        density_at([wx, f64::from(ys), wz], ys)
-                    }) {
+                    } else if jj < 16
+                        && water_at_sea(bottom, water_top, || {
+                            let ys = water_top - 0.5;
+                            density_at([wx, f64::from(ys), wz], ys)
+                        })
+                    {
                         p.water
                     } else {
                         p.air
@@ -1423,6 +1425,83 @@ pub struct GpuBackend {
     pub params: Arc<CubeGenParams>,
     /// The GPU biome pass's inputs, once `GpuCubeSampler::with_biomes` set it.
     pub biome_params: Option<Arc<BiomeGenParams>>,
+    /// Whether a GPU generator fills the pool's slots. False for a pool alone
+    /// ([`GpuBackend::pool_only`]): every node is sampled on the CPU and
+    /// uploaded into a slot (`lod::cube::gpu_from_node`), and the far workers
+    /// take their keys one by one, as on the CPU path.
+    pub generates: bool,
+}
+
+/// `CubeGenParams::sea_level` of a backend whose sampler has no sea surface
+/// (`CubeSampler::sea_surface` is `None`, an Earth world's): far above any
+/// node, so `water_top` (`sea_level + 1`) never clips or caps water, and far
+/// enough from `i32::MAX` that offsets from it do not overflow.
+pub const NO_SEA_LEVEL: i32 = i32::MAX / 4;
+
+impl GpuBackend {
+    /// A node pool on `device`/`queue` with no generator: for a sampler whose
+    /// nodes are all made on the CPU (an Earth world's) to go through the GPU
+    /// mesher and draw path. `states` are block states always worth a
+    /// material record (each node lists its own besides; may be empty). The
+    /// pool has `HORIZON_FAR_POOL_SLOTS` slots ([`DEFAULT_POOL_SLOTS`]).
+    /// `params` hold no terrain, and a sea level of [`NO_SEA_LEVEL`]: no sea
+    /// surface. `None` when the device has too few storage buffers for the
+    /// GPU mesher or the pool is beyond its storage binding size.
+    pub fn pool_only(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        states: Vec<u32>,
+        air: u32,
+        water: u32,
+    ) -> Option<Self> {
+        let slots =
+            crate::lod::cube::far_knob("HORIZON_FAR_POOL_SLOTS", u64::from(DEFAULT_POOL_SLOTS))
+                .clamp(1, u64::from(u32::MAX)) as u32;
+        let limits = device.limits();
+        // Not even the GPU mesher's storage buffers (`Renderer::gpu_far_available`
+        // wants 6): no pool to hold for nothing.
+        if limits.max_storage_buffers_per_shader_stage < 6
+            || SLOT_BYTES * u64::from(slots) > limits.max_storage_buffer_binding_size
+        {
+            return None;
+        }
+        let pool = NodePool::new(&device, slots);
+        let flat = || NoiseDesc {
+            factor: 0.0,
+            offset: 0.0,
+            frequency: [0.0; 3],
+            octaves: Vec::new(),
+        };
+        let params = CubeGenParams {
+            noises: [flat(), flat(), flat(), flat()],
+            height_factor: 0.0,
+            height_offset: 0.0,
+            height_variation_factor: 0.0,
+            height_variation_offset: 0.0,
+            below_average_factor: 0.0,
+            sea_level: NO_SEA_LEVEL,
+            air,
+            stone: air,
+            deepslate: air,
+            water,
+            biomes: Vec::new(),
+            filler_depth: 0.0,
+            deepslate_from: 0.0,
+            deepslate_to: 0.0,
+        };
+        let mut states = states;
+        states.sort_unstable();
+        states.dedup();
+        Some(Self {
+            device,
+            queue,
+            pool: pool.handle(),
+            states,
+            params: Arc::new(params),
+            biome_params: None,
+            generates: false,
+        })
+    }
 }
 
 /// A [`CubeSampler`] generating levels [`MIN_LEVEL`] and up on the GPU. Every
@@ -1460,7 +1539,8 @@ impl GpuCubeSampler {
             device.clone(),
             queue.clone(),
             params.clone(),
-            crate::lod::cube::far_knob("HORIZON_FAR_POOL_SLOTS", u64::from(DEFAULT_POOL_SLOTS)) as u32,
+            crate::lod::cube::far_knob("HORIZON_FAR_POOL_SLOTS", u64::from(DEFAULT_POOL_SLOTS))
+                as u32,
         )
         .map(|generator| {
             let mut states = vec![params.air, params.stone, params.deepslate, params.water];
@@ -1476,6 +1556,7 @@ impl GpuCubeSampler {
                 states,
                 params: params.clone(),
                 biome_params: None,
+                generates: true,
             });
             let (tx, rx) = mpsc::channel::<Work>();
             std::thread::Builder::new()
@@ -1993,7 +2074,11 @@ mod tests {
         if let Some(filled) = fill_class(&p, key, &sea, class) {
             assert_eq!(states(&filled), states(&node));
         }
-        assert_eq!(node_class(&p, key, &sea), NodeClass::Mixed, "not uniform air");
+        assert_eq!(
+            node_class(&p, key, &sea),
+            NodeClass::Mixed,
+            "not uniform air"
+        );
         // All sea up to its top, the surface (a level-2 node at y 0..64): drawn
         // for its top; the one under it is not.
         assert_eq!(
@@ -2118,5 +2203,49 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
+    }
+
+    /// Earth's backend: a node pool on the device and nothing else. No
+    /// generator, no biome pass, and a sea level so high that `water_top`
+    /// (`sea_level + 1`, read by `cube_far`) never caps water, without
+    /// overflowing; its slots take CPU nodes and go back to the pool.
+    #[test]
+    fn a_pool_only_backend_has_slots_and_no_sea() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let Some(backend) = GpuBackend::pool_only(device, queue, vec![9, 0, 9], 0, 9) else {
+            eprintln!("too few storage buffers: skipped");
+            return;
+        };
+        assert!(!backend.generates);
+        assert!(backend.biome_params.is_none());
+        assert_eq!(backend.states, vec![0, 9]);
+        assert_eq!(backend.params.sea_level, NO_SEA_LEVEL);
+        assert_eq!((backend.params.air, backend.params.water), (0, 9));
+        let water_top = backend
+            .params
+            .sea_level
+            .checked_add(1)
+            .expect("no overflow");
+        // Far above any block (and any node's origin offset from it fits an i32).
+        assert!(water_top > 1 << 28);
+        assert!(water_top.checked_add(1 << 28).is_some());
+        assert!(water_top.checked_sub(i32::MAX / 4).is_some());
+        let capacity = backend.pool.capacity();
+        assert!(capacity >= 1);
+        assert_eq!(backend.pool.free_slots(), capacity as usize);
+        let node = CubeNode::from_fn(CubeKey::new(3, 1, 0, -2), |x, y, _| Voxel {
+            state: BlockStateId(if y < 4 { 9 } else { u32::from(x > 20) }),
+            biome: 7,
+        });
+        let slot = backend.pool.alloc().expect("a free slot");
+        backend
+            .pool
+            .write(&backend.queue, slot, &slot_words(&node, 0));
+        assert_eq!(backend.pool.free_slots(), capacity as usize - 1);
+        backend.pool.free(slot);
+        assert_eq!(backend.pool.free_slots(), capacity as usize);
     }
 }

@@ -6,12 +6,14 @@
 // and a thread that starts a maximal rectangle (a run along a, merged with
 // the identical runs of the rows after it) counts it (count_main) or writes
 // its quad (emit_main). The counts and the emit see the same keys, so the
-// numbers agree.
+// numbers agree. A key is two words: the face's, and its fluid top inside the
+// voxel (0 none), so faces with different tops never merge.
 
 const SLOT_WORDS: u32 = 4352u;
 const BIOMES: u32 = 4096u;
 const JOB_WORDS: u32 = 24u;
 const NONE: u32 = 0xffffffffu;
+const NO_TOP: u32 = 0xffffu;
 
 struct Params {
     air: u32,
@@ -23,16 +25,20 @@ struct Params {
 @group(0) @binding(1) var<storage, read> pool: array<u32>;
 @group(0) @binding(2) var<storage, read> materials: array<u32>;
 // Per job: slot, level, flags (bit 0: has cover, bit 1: the node's top is the sea's
-// surface), 0, six neighbour slots
-// (Down, Up, North, South, West, East; NONE), 2 spare, eight cover words
-// (bit z << 4 | x), 4 spare.
+// surface, bit 2: has fluid tops), the word of its fluid tops block (flag bit 2),
+// six neighbour slots (Down, Up, North, South, West, East; NONE), 2 spare, eight
+// cover words (bit z << 4 | x), 4 spare. Fluid tops blocks follow the jobs: 128
+// words, two u16 tops a word (column z << 4 | x, the even one low), 4096 units a
+// node side (256 a voxel) over the node's bottom, 0xffff none.
 @group(0) @binding(3) var<storage, read> jobs: array<u32>;
 @group(0) @binding(4) var<storage, read_write> counts: array<u32>;
 @group(0) @binding(5) var<storage, read> offsets: array<u32>;
 @group(0) @binding(6) var<storage, read_write> quads: array<vec2<u32>>;
 
-var<workgroup> keys: array<u32, 512>;
+var<workgroup> keys: array<vec2<u32>, 512>;
 var<workgroup> lit: array<u32, 256>;
+// The job's fluid top per column (z << 4 | x), NO_TOP for none or no tops.
+var<workgroup> tops: array<u32, 256>;
 var<workgroup> tally: array<atomic<u32>, 2>;
 
 fn header(state: u32) -> u32 {
@@ -101,17 +107,19 @@ fn step_of(dir: u32) -> vec3<i32> {
 }
 
 // The key of the face the voxel at p shows in direction dir, overlay o; 0: none.
-// bit 0 valid, bit 1 shaded, bits 2..18 state, bits 19..26 biome (tinted faces only),
-// bit 27 dim (its sky comes through foliage).
-fn cell_key(base: u32, slot: u32, dir: u32, o: u32, p: vec3<u32>) -> u32 {
+// x: bit 0 valid, bit 1 shaded, bits 2..18 state, bits 19..26 biome (tinted faces
+// only), bit 27 dim (its sky comes through foliage). y: the fluid's top inside the
+// voxel in 1/256 of a voxel (1..255), 0 none.
+fn cell_key(base: u32, slot: u32, dir: u32, o: u32, p: vec3<u32>) -> vec2<u32> {
     let own = state_at(slot, p.x, p.y, p.z);
     if own == params.air {
-        return 0u;
+        return vec2<u32>(0u);
     }
     let fw = face_word(own, dir, o);
     if (fw & 0x100000u) == 0u {
-        return 0u;
+        return vec2<u32>(0u);
     }
+    let col = (p.z << 4u) | p.x;
     let q = vec3<i32>(p) + step_of(dir);
     let inside = all(q >= vec3<i32>(0)) && all(q < vec3<i32>(16));
     var next = params.air;
@@ -121,12 +129,13 @@ fn cell_key(base: u32, slot: u32, dir: u32, o: u32, p: vec3<u32>) -> u32 {
         known = true;
     } else {
         // A fluid's faces on the node's edge lie inside the fluid the next node goes on
-        // with, except its top on a node whose top is the sea's surface (job flags bit 1):
-        // there the sea ends, and without it the sea showed its floor wherever its
-        // surface fell on a node's top (levels 0 to 2).
-        let sea_top = (jobs[base + 2u] & 2u) != 0u;
-        if fluid_of(own) != 0u && !(dir == 1u && sea_top) {
-            return 0u;
+        // with, except its top on a node whose top is the sea's surface (job flags bit 1)
+        // or in a column whose fluid ends in the node (a fluid top): there the fluid
+        // ends, and without it the sea showed its floor wherever its surface fell on a
+        // node's top (levels 0 to 2). As lod/mesh.rs `voxel_faces`' `ends`.
+        let ends = (jobs[base + 2u] & 2u) != 0u || tops[col] != NO_TOP;
+        if fluid_of(own) != 0u && !(dir == 1u && ends) {
+            return vec2<u32>(0u);
         }
         let neighbour = jobs[base + 4u + dir];
         if neighbour != NONE {
@@ -137,16 +146,15 @@ fn cell_key(base: u32, slot: u32, dir: u32, o: u32, p: vec3<u32>) -> u32 {
     }
     if known {
         if next == own {
-            return 0u;
+            return vec2<u32>(0u);
         }
         if next != params.air {
             let f = fluid_of(next);
             if is_opaque(next) || (f != 0u && f == fluid_of(own)) {
-                return 0u;
+                return vec2<u32>(0u);
             }
         }
     }
-    let col = (p.z << 4u) | p.x;
     // A face takes the light of the cell in front of it, as in Minecraft: a cliff's wall
     // is in the sun when the air beside it sees the sky, not only its top voxel. A top
     // on the node's top takes its own column's light there: open unless the column is
@@ -178,20 +186,32 @@ fn cell_key(base: u32, slot: u32, dir: u32, o: u32, p: vec3<u32>) -> u32 {
     if ((fw >> 16u) & 7u) != 0u {
         biome = min(pool[slot * SLOT_WORDS + BIOMES + col] & 255u, 255u);
     }
-    return 1u | (shaded << 1u) | (own << 2u) | (biome << 19u) | (dim << 27u);
+    // A fluid voxel holding its column's top strictly inside (y < top < y + 1 in
+    // voxels) stops there: its top on it, its sides' top edge lowered to it, its
+    // underside as it is (lod/mesh.rs `voxel_faces`).
+    var top = 0u;
+    let t = tops[col];
+    if t != NO_TOP && dir != 0u && (t & 255u) != 0u && (t >> 8u) == p.y
+        && fluid_of(own) != 0u {
+        top = t & 255u;
+    }
+    return vec2<u32>(1u | (shaded << 1u) | (own << 2u) | (biome << 19u) | (dim << 27u), top);
 }
 
-fn key_at(o: u32, a: u32, b: u32) -> u32 {
+fn key_at(o: u32, a: u32, b: u32) -> vec2<u32> {
     return keys[o * 256u + b * 16u + a];
+}
+fn same(k: vec2<u32>, l: vec2<u32>) -> bool {
+    return all(k == l);
 }
 fn run_start(o: u32, a: u32, b: u32) -> bool {
     let k = key_at(o, a, b);
-    return k != 0u && (a == 0u || key_at(o, a - 1u, b) != k);
+    return k.x != 0u && (a == 0u || !same(key_at(o, a - 1u, b), k));
 }
 fn run_len(o: u32, a: u32, b: u32) -> u32 {
     let k = key_at(o, a, b);
     var n = 1u;
-    while a + n < 16u && key_at(o, a + n, b) == k {
+    while a + n < 16u && same(key_at(o, a + n, b), k) {
         n += 1u;
     }
     return n;
@@ -220,6 +240,12 @@ fn mesh_group(group: u32, lid: u32, emit: bool) {
         sky = sky_below(sky, state_at(slot, lid & 15u, u32(y), lid >> 4u));
     }
     lit[lid] = mask;
+    // This thread's column's fluid top (lid is z << 4 | x).
+    var top = NO_TOP;
+    if (jobs[base + 2u] & 4u) != 0u {
+        top = (jobs[jobs[base + 3u] + (lid >> 1u)] >> (16u * (lid & 1u))) & 0xffffu;
+    }
+    tops[lid] = top;
     if lid < 2u {
         atomicStore(&tally[lid], 0u);
     }
@@ -234,17 +260,18 @@ fn mesh_group(group: u32, lid: u32, emit: bool) {
         }
         workgroupBarrier();
         for (var o = 0u; o < 2u; o++) {
-            let k = key_at(o, a, b);
+            let key = key_at(o, a, b);
+            let k = key.x;
             if k != 0u && run_start(o, a, b) {
                 let len = run_len(o, a, b);
                 var head = true;
-                if b > 0u && key_at(o, a, b - 1u) == k && run_start(o, a, b - 1u)
+                if b > 0u && same(key_at(o, a, b - 1u), key) && run_start(o, a, b - 1u)
                     && run_len(o, a, b - 1u) == len {
                     head = false;
                 }
                 if head {
                     var h = 1u;
-                    while b + h < 16u && key_at(o, a, b + h) == k && run_start(o, a, b + h)
+                    while b + h < 16u && same(key_at(o, a, b + h), key) && run_start(o, a, b + h)
                         && run_len(o, a, b + h) == len {
                         h += 1u;
                     }
@@ -254,8 +281,8 @@ fn mesh_group(group: u32, lid: u32, emit: bool) {
                     if emit && !skipped {
                         let w0 = p.x | (p.y << 4u) | (p.z << 8u) | ((len - 1u) << 12u)
                             | ((h - 1u) << 16u) | (dir << 20u) | (((k >> 1u) & 1u) << 23u)
-                            | (o << 24u) | (((k >> 27u) & 1u) << 25u);
-                        let w1 = state | (((k >> 19u) & 255u) << 17u);
+                            | (o << 24u) | (((k >> 27u) & 1u) << 25u) | ((key.y & 63u) << 26u);
+                        let w1 = state | (((k >> 19u) & 255u) << 17u) | ((key.y >> 6u) << 25u);
                         quads[offsets[job * 12u + dir * 2u + translucent] + n] = vec2<u32>(w0, w1);
                     }
                 }

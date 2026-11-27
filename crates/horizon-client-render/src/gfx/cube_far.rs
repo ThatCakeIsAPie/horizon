@@ -382,7 +382,9 @@ impl CubeFar {
             pool: backend.pool.clone(),
             table: MaterialTable::new(states),
             air,
-            water_top: backend.params.sea_level + 1,
+            // A world with no sea surface passes a huge sea level (Earth:
+            // `i32::MAX / 4`); `cube_cull.wgsl` clamps before subtracting.
+            water_top: backend.params.sea_level.saturating_add(1),
             node_buffer,
             biomes,
             solid_args,
@@ -594,19 +596,21 @@ impl CubeFar {
         self.overlaps.set(key, false);
     }
 
-    /// A uniform node needs no GPU work: air and fluid draw nothing, rock its
-    /// six faces, written by the CPU.
     /// Whether `key`'s top is the sea's surface (`MeshJob::sea_top`).
     fn sea_top(&self, key: CubeKey) -> bool {
         i64::from(key.origin()[1]) + i64::from(key.size()) == i64::from(self.water_top)
     }
 
-    fn install_uniform(&mut self, key: CubeKey, state: u32, biome: u16) {
+    /// A uniform node needs no GPU work: air draws nothing, a fluid its top
+    /// where it ends on the node's top (the sea's surface, or columns with
+    /// fluid `tops`), rock its six faces, written by the CPU.
+    fn install_uniform(&mut self, key: CubeKey, state: u32, biome: u16, tops: Option<&[u16; 256]>) {
         self.stats.uniform += 1;
         let (solid, translucent) = if state == self.air {
             (Vec::new(), Vec::new())
         } else {
-            uniform_quads(&self.table, state, biome.min(255) as u8, self.sea_top(key))
+            let sea_top = self.sea_top(key);
+            uniform_quads(&self.table, state, biome.min(255) as u8, sea_top, tops)
         };
         // One range per (dir, pass), solid quads first in dir order.
         let mut all: Vec<[u32; 2]> = Vec::new();
@@ -695,15 +699,19 @@ impl CubeFar {
                 };
                 match node.content {
                     // Uniform nodes need no mesher: they go in at once.
-                    GpuContent::Uniform(voxel) => {
-                        self.install_uniform(key, voxel.state.0, voxel.biome)
-                    }
+                    GpuContent::Uniform(voxel) => self.install_uniform(
+                        key,
+                        voxel.state.0,
+                        voxel.biome,
+                        node.fluid_tops.as_deref(),
+                    ),
                     GpuContent::Slot(slot) if idle && jobs.len() < MAX_JOBS => jobs.push(MeshJob {
                         key,
                         slot,
                         cover: node.cover.as_deref().map(cover_words),
                         neighbours: [NONE; 6],
                         sea_top: self.sea_top(key),
+                        fluid_tops: node.fluid_tops,
                     }),
                     GpuContent::Slot(_) => {
                         self.pending.insert(key, node);
