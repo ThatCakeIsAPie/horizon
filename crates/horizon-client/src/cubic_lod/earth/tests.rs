@@ -820,3 +820,32 @@ mod water_tops {
         }
     }
 }
+
+#[test]
+fn a_cover_proven_from_the_bounds_is_the_cover_its_columns_give_and_every_rock_node_has_one() {
+    let rig = rig();
+    let g = &rig.generator;
+    let (mut proven, mut rock) = (0, 0);
+    for level in 2..=6u32 {
+        let side = 16i32 << level;
+        // The sea, the coast, the slope, the spire's foot, flank and summit.
+        for x in [-3000 / side, -1, 0, 1000 / side, 2200 / side, 2500 / side] {
+            for z in [-1, 0] {
+                rig.load(level, x, z);
+                for y in -8_000 / side - 2..=9_000 / side + 2 {
+                    let key = CubeKey::new(level as u8, x, y, z);
+                    let is_rock = class(g, key, FarDecor::default()).unwrap() == NodeClass::Rock;
+                    rock += usize::from(is_rock);
+                    let Some(mask) = proven_cover(g, key) else {
+                        assert!(!is_rock, "{key:?} is rock but its cover is not proven");
+                        continue;
+                    };
+                    proven += 1;
+                    let read = cover_of(key, &surfaces(g, key).unwrap());
+                    assert_eq!(read.as_deref(), Some(&*mask), "{key:?}");
+                }
+            }
+        }
+    }
+    assert!(rock > 50 && proven >= rock, "{proven} {rock}");
+}

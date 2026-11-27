@@ -1295,6 +1295,22 @@ impl EarthGenerator {
         )
     }
 
+    /// A block height no column of the far node column (`level`, `x`, `z`) has its final surface under, at the
+    /// zoom of the node's step: the lowest elevation over its footprint less what the water rules may carve
+    /// ([`MAX_CARVE`]; one block for a sea bed without land cover). The bound [`EarthGenerator::classify_node`]
+    /// proves stone with, so a node's sky cover can be known without reading its columns.
+    pub fn ground_floor(&self, level: u32, x: i32, z: i32) -> Result<i32, NotReady> {
+        let r = self.node_rect(level, x, z);
+        let (lo, _) = self.ready(r, self.range_of(Access::Local, r))?;
+        let carve = if self.land.is_some() {
+            MAX_CARVE
+        } else {
+            SEA_BED_SLACK
+        };
+        let floor = i64::from(self.vertical_block(lo)) - carve;
+        Ok(floor.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+    }
+
     /// [`EarthGenerator::classify_node`] for a world whose far view draws trees and snow: air is proven only
     /// from [`MAX_TREE_UP`] blocks over the highest ground, so a node trees reach into is not pruned.
     pub fn classify_node_above(

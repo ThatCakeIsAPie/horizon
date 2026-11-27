@@ -142,6 +142,25 @@ pub(super) fn cover(
     Ok(cover_of(key, &surfaces(earth, key)?))
 }
 
+/// The sky cover of node `key` when the elevation bounds alone prove every column covered (the ground's lowest
+/// possible top, [`EarthGenerator::ground_floor`], reaches the first look over the node: a node deep in rock),
+/// without reading its columns; `None` when they do not prove it (read them: [`cover`]). Only levels 2 and up
+/// read their columns at the zoom of their footprint's bounds.
+fn proven_cover(earth: &EarthGenerator, key: CubeKey) -> Option<Box<CoverMask>> {
+    if key.level < 2 || key.level > COVER_LEVEL {
+        return None;
+    }
+    let floor = earth
+        .ground_floor(u32::from(key.level), key.x, key.z)
+        .ok()?;
+    let step = 1i32 << key.level;
+    let top = key.origin()[1].saturating_add(key.size());
+    let look = EarthGenerator::voxel_floor(top.saturating_add(COVER_LOOKS[0]), step);
+    // `far_surface` only rises with the surface: the floor's drawn top is the lowest any column has.
+    (EarthGenerator::far_surface(floor, step, SurfaceKind::Grass) >= look)
+        .then(|| Box::new([u64::MAX; 4]))
+}
+
 /// [`cover`] from the node's column surfaces.
 fn cover_of(key: CubeKey, surfaces: &[i32]) -> Option<Box<CoverMask>> {
     if key.level > COVER_LEVEL {
@@ -442,6 +461,13 @@ impl CubicLodSampler {
         };
         if key.level > COVER_LEVEL && !wet {
             return Some(node);
+        }
+        // A dry node deep in rock (most uniform rock nodes): its cover is proven whole from the bounds.
+        if !wet && let Some(mask) = proven_cover(earth, key) {
+            LAST_SURFACES.with(|m| {
+                m.borrow_mut().take_if(|(k, _)| *k == key);
+            });
+            return Some(node.with_covered(Some(mask)).with_fluid_tops(None));
         }
         let surfaces = self.or_request(surfaces(earth, key))?;
         let tops = if wet {
