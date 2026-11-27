@@ -72,6 +72,9 @@ pub struct FarStats {
     pub pool_bytes: u64,
     /// Whether a mesher batch is in flight.
     pub meshing: bool,
+    /// Nodes not drawn yet that wait for the mesher or are in its batch
+    /// (a drawn node made again is not counted: its old one shows).
+    pub waiting_new: usize,
 }
 
 struct Held {
@@ -155,6 +158,8 @@ pub struct CubeFar {
     overlaps: Overlaps,
     /// The batch in the mesher belongs to a forgotten plan (`clear`).
     discard: bool,
+    /// Keys of the batch in flight not drawn when it began.
+    meshing_new: usize,
     epoch: Instant,
     stats: FarStats,
 }
@@ -405,6 +410,7 @@ impl CubeFar {
             swap: Swap::default(),
             overlaps: Overlaps::default(),
             discard: false,
+            meshing_new: 0,
             epoch: Instant::now(),
             stats: FarStats::default(),
         })
@@ -688,11 +694,21 @@ impl CubeFar {
         }
         if self.mesher.idle() {
             self.discard = false;
+            self.meshing_new = 0;
         }
         if !self.pending.is_empty() {
             let idle = self.mesher.idle();
             let mut jobs = Vec::new();
             let mut keep = VecDeque::new();
+            // Nodes not drawn yet go first: a drawn node made again (late
+            // content) already shows, and waiting behind those left the
+            // far view's new nodes undrawn for seconds.
+            if idle {
+                let (new, old): (VecDeque<CubeKey>, VecDeque<CubeKey>) =
+                    std::mem::take(&mut self.order).into_iter().partition(|k| !self.nodes.contains_key(k));
+                self.order = new;
+                self.order.extend(old);
+            }
             while let Some(key) = self.order.pop_front() {
                 let Some(node) = self.pending.remove(&key) else {
                     continue;
@@ -721,6 +737,7 @@ impl CubeFar {
             }
             self.order = keep;
             if !jobs.is_empty() {
+                self.meshing_new = jobs.iter().filter(|j| !self.nodes.contains_key(&j.key)).count();
                 self.mesher.begin(jobs);
             }
         }
@@ -781,6 +798,8 @@ impl CubeFar {
             arena_capacity_bytes: u64::from(self.mesher.arena_capacity_quads()) * 8,
             pool_bytes: (u64::from(self.pool.capacity()) - free) * SLOT_BYTES,
             meshing: !self.mesher.idle(),
+            waiting_new: self.meshing_new
+                + self.pending.keys().filter(|k| !self.nodes.contains_key(k)).count(),
             ..self.stats
         }
     }

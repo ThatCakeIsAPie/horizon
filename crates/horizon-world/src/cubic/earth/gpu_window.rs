@@ -89,7 +89,11 @@ impl WindowGpuSlot {
 /// with identical columns. A hook doing the elevation alone is slower than the exact CPU read (0.016 ms of CPU
 /// against a 0.11-0.30 ms round trip; 6 workers 1.11-1.14 / 1.28-1.32), so the game installs one by default only
 /// when it does the classes ([`window_gpu_env_override`] `Some(true)` forces it anyway).
-pub const WINDOW_GPU_DEFAULT_ON: bool = true;
+///
+/// Off by default: in the game (autoresearch far scenario, desktop GTX 1070 Ti, 6 far workers) the round trips
+/// starved the workers: canyon far view complete 61 s with it against 17 s without, forest 45 s against 16 s.
+/// `HORIZON_EARTH_GPU_WINDOW=1` turns it on.
+pub const WINDOW_GPU_DEFAULT_ON: bool = false;
 
 /// What `HORIZON_EARTH_GPU_WINDOW` says, read once: `Some(true)` for `1`, `Some(false)` for `0`, else `None`.
 pub fn window_gpu_env_override() -> Option<bool> {

@@ -3589,6 +3589,8 @@ pub struct CubeLod {
     backend: Option<GpuBackend>,
     /// Nodes finished for the GPU mesher, not yet taken.
     gpu_out: Vec<GpuNode>,
+    /// Of `gpu_out`, the nodes not drawn yet (not made again for late content).
+    gpu_out_new: usize,
     /// Finished nodes pulled from the workers' channel and held back by the
     /// per-frame delivery budget ([`DeliverBudget`]), oldest first.
     backlog: VecDeque<Done>,
@@ -3784,6 +3786,7 @@ impl CubeLod {
             linger_queued: FxHashSet::default(),
             budget: NODE_BUDGET,
             gpu_out: Vec::new(),
+            gpu_out_new: 0,
             backlog: VecDeque::new(),
             context,
             known_states: FxHashSet::default(),
@@ -4027,16 +4030,22 @@ impl CubeLod {
     }
 
     /// Everything handed out has been meshed and shown: the renderer holds
-    /// nothing waiting (always, on the CPU path).
+    /// no node waiting that is not drawn yet (always, on the CPU path). A
+    /// drawn node made again shows its old one meanwhile.
     fn shown(&self) -> bool {
-        self.gpu_out.is_empty()
-            && (!self.gpu_path() || self.render.is_some_and(|r| r.pending == 0 && !r.meshing))
+        self.gpu_out_new == 0
+            && (!self.gpu_path() || self.render.is_some_and(|r| r.waiting_new == 0))
     }
 
-    fn is_complete(&self) -> bool {
+    /// Every planned node and tile handed out, meshed and shown or not.
+    fn handed_out(&self) -> bool {
         !(self.plan.is_empty() && self.tiles.plan.is_empty())
             && self.missing == 0
             && self.tiles.missing == 0
+    }
+
+    fn is_complete(&self) -> bool {
+        self.handed_out()
             && self.shown()
     }
 
@@ -4191,6 +4200,7 @@ impl CubeLod {
     /// are the caller's from here), for the nodes in the plan.
     pub fn take_gpu_nodes(&mut self) -> GpuBatch {
         let nodes = std::mem::take(&mut self.gpu_out);
+        self.gpu_out_new = 0;
         let mut wanted: Vec<u32> = Vec::new();
         if let Some(backend) = &self.backend {
             wanted.extend(&backend.states);
@@ -4510,6 +4520,7 @@ impl CubeLod {
                 spent.nodes += 1;
                 *group = Some(key.parent());
                 self.deliver(key, empty);
+                self.gpu_out_new += usize::from(!again);
                 self.gpu_out.push(node);
             }
             None => {
@@ -4524,7 +4535,11 @@ impl CubeLod {
         let Some(late) = self.late.clone() else {
             return;
         };
-        let complete = self.is_complete();
+        // Handed out is enough: on the GPU path the mesher is busy with
+        // the last refreshes most frames, and waiting for it to be idle
+        // (`shown`) let the late nodes through in bursts, the far workers
+        // idle in between (an Earth fill took 55 s instead of 19).
+        let complete = self.handed_out();
         late.view(camera, forward, max_distance, complete);
         self.tell_coarse_first(&late);
         if !complete {
@@ -5580,6 +5595,7 @@ impl CubeLod {
                 self.release(node);
             }
         }
+        self.gpu_out_new = 0;
         for node in std::mem::take(&mut self.gpu_out) {
             self.release(&node);
         }

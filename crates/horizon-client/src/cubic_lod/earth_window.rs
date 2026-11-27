@@ -1,6 +1,6 @@
 //! Earth's far-view padded windows (elevation and land cover classes, both exact) on the renderer's device
 //! (`gfx::earth_window`), behind the GPU far terrain setting and `HORIZON_EARTH_GPU_WINDOW`
-//! ([`horizon_world::cubic::earth::window_gpu_wanted`]). By default only when the device can do the classes too
+//! ([`horizon_world::cubic::earth::window_gpu_wanted`]). Off by default (slower in game); with `=1`, only when the device can do the classes too
 //! (`SHADER_F64 | SHADER_INT64`): the elevation alone is measured slower than the exact CPU read.
 
 use std::sync::Arc;
