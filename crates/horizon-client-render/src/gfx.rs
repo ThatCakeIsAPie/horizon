@@ -532,6 +532,7 @@ pub mod cube_descent;
 pub mod cube_far;
 pub mod cube_gen;
 pub mod cube_mesh;
+pub mod earth_class;
 mod cull;
 mod dx12_compiler;
 mod end_sky;

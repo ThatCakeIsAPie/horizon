@@ -999,6 +999,21 @@ impl LandCoverField {
         stride: i32,
         metres_per_sample: f64,
     ) -> Result<Vec<LandClass>, Fetch> {
+        self.class_grid_window(x0, z0, width, depth, stride, metres_per_sample)
+    }
+
+    /// [`LandCoverField::class_grid`] one [`LandCoverField::class_at`] per sample, as it was before the window
+    /// fast path: the reference the fast path is tested against, bit for bit.
+    #[doc(hidden)]
+    pub fn class_grid_reference(
+        &self,
+        x0: i32,
+        z0: i32,
+        width: usize,
+        depth: usize,
+        stride: i32,
+        metres_per_sample: f64,
+    ) -> Result<Vec<LandClass>, Fetch> {
         let mut out = Vec::with_capacity(width.saturating_mul(depth).min(1 << 20));
         for j in 0..depth {
             for i in 0..width {
@@ -1058,6 +1073,13 @@ impl LandCoverField {
         )
     }
 }
+
+// The window fast path of `class_grid` (and its timing helpers), with this module's private items.
+#[path = "landfield_window.rs"]
+mod window;
+
+#[path = "landfield_gpu.rs"]
+pub mod gpu;
 
 #[cfg(test)]
 mod tests {

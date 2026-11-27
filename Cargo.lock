@@ -2020,6 +2020,7 @@ dependencies = [
  "horizon-client-input",
  "horizon-command",
  "horizon-core",
+ "horizon-earth",
  "horizon-engine-slots",
  "horizon-guest-stack",
  "horizon-hdr",
