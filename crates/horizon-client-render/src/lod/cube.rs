@@ -1937,6 +1937,16 @@ const TURN: f64 = 0.087;
 /// looking for holes) run at most every [`SCAN_EVERY`].
 const SLOW_SCAN: usize = 8192;
 const SCAN_EVERY: Duration = Duration::from_millis(200);
+
+/// The least time between two passes of `releasable` over a short stale set:
+/// a stale node goes at most this much later than it could (below a frame at
+/// 60 fps). `HORIZON_FAR_RELEASE_MS` overrides it; 0 in unit tests.
+fn release_every() -> Duration {
+    if cfg!(test) {
+        return Duration::ZERO;
+    }
+    far_ms("HORIZON_FAR_RELEASE_MS", Duration::from_millis(25))
+}
 /// The most nodes [`CubeLod::removed`] lets go at a time. The GPU renderer
 /// fades each out and frees it with a buffer write of its own (about a
 /// microsecond each), so a whole plan let go at once after a teleport cost
@@ -3057,14 +3067,43 @@ struct PlanJob {
     /// The plan in place, for the hysteresis.
     previous: Arc<Vec<CubeKey>>,
     /// The nodes drawn (or failed: not to wait on), for the refining one
-    /// level at a time ([`PlanInput::refined`]).
-    drawn: Vec<CubeKey>,
+    /// level at a time ([`PlanInput::refined`]); listed on the planner
+    /// thread ([`Drawn::keys`]), not the game's.
+    drawn: Drawn,
     /// Refine one level at a time from the coverage layer down, so the far
     /// view sharpens step by step in front of the player (Lyle's design). On
     /// by default; `HORIZON_FAR_STEP=0` goes straight to the target instead.
     step: bool,
     /// Plan surface tiles at the coarse levels.
     surface: Option<SurfaceJob>,
+}
+
+/// What a stepping plan counts as drawn, as copies of [`CubeLod`]'s sets:
+/// the filter ([`Drawn::keys`]) runs on the planner thread.
+#[derive(Default)]
+struct Drawn {
+    delivered: FxHashSet<CubeKey>,
+    failed: Vec<CubeKey>,
+    stale: FxHashSet<CubeKey>,
+}
+
+impl Drawn {
+    /// The nodes handed out (or failed), except those inside a stale node
+    /// ([`CubeLod::drawn_for_steps`]).
+    fn keys(&self) -> Vec<CubeKey> {
+        let levels = self.stale.iter().fold(0u32, |m, k| m | 1 << k.level);
+        let inside_stale = |key: CubeKey| {
+            levels >> (key.level + 1) != 0
+                && (key.level + 1..=MAX_CUBE_LEVEL)
+                    .filter(|l| levels >> l & 1 == 1)
+                    .any(|l| self.stale.contains(&ancestor(key, l)))
+        };
+        (self.delivered.iter())
+            .chain(&self.failed)
+            .copied()
+            .filter(|&k| !inside_stale(k))
+            .collect()
+    }
 }
 
 /// A far item: a cube node or a surface tile.
@@ -3214,7 +3253,9 @@ fn make_plan(
     let cover = job
         .step
         .then(|| plan_job(job, &cover_rule, true, class, None));
-    let refined = cover.as_ref().map(|c| step_set(&job.drawn, &c.leaves));
+    let refined = cover
+        .as_ref()
+        .map(|c| step_set(&job.drawn.keys(), &c.leaves));
     let plan = plan_job(job, &job.rule, false, class, refined.as_ref());
     let (added, removed, next) = diff(&plan.leaves, last);
     let (tiles_added, tiles_removed, next_tiles) = diff(&plan.tiles, last_tiles);
@@ -4234,7 +4275,7 @@ impl CubeLod {
                     loaded,
                     snapshot,
                     previous: self.plan.clone(),
-                    drawn: self.drawn_for_steps(),
+                    drawn: self.drawn_input(),
                     step: far_knob("HORIZON_FAR_STEP", 1) != 0,
                     surface: self.tiles.on.then(|| SurfaceJob {
                         info: self.tiles.info.clone(),
@@ -4790,19 +4831,20 @@ impl CubeLod {
     /// not on screen yet: were it to split, its children would hold the
     /// stale one up again, a level at a time, and a coarse node stood over
     /// the near ground for many seconds after a flight.
+    #[cfg(test)]
     fn drawn_for_steps(&self) -> Vec<CubeKey> {
-        let levels = self.stale.iter().fold(0u32, |m, k| m | 1 << k.level);
-        let inside_stale = |key: CubeKey| {
-            levels >> (key.level + 1) != 0
-                && (key.level + 1..=MAX_CUBE_LEVEL)
-                    .filter(|l| levels >> l & 1 == 1)
-                    .any(|l| self.stale.contains(&ancestor(key, l)))
-        };
-        (self.delivered.iter())
-            .chain(self.failed.keys())
-            .copied()
-            .filter(|&k| !inside_stale(k))
-            .collect()
+        self.drawn_input().keys()
+    }
+
+    /// Copies of the sets [`Self::drawn_for_steps`] reads, for a plan job:
+    /// copying them is a fraction of filtering every drawn node, which the
+    /// planner thread does ([`Drawn::keys`]).
+    fn drawn_input(&self) -> Drawn {
+        Drawn {
+            delivered: self.delivered.clone(),
+            failed: self.failed.keys().copied().collect(),
+            stale: self.stale.clone(),
+        }
     }
 
     /// The look the queue's order is for now.
@@ -5049,10 +5091,14 @@ impl CubeLod {
         if !self.holes_dirty || (self.holes.is_empty() && self.tiles.holes.is_empty()) {
             return;
         }
-        if !force
-            && self.holes.len() > SLOW_SCAN
-            && now.saturating_duration_since(self.holes_at) < SCAN_EVERY
-        {
+        // As `releasable`: a delivery every frame would otherwise rescan every
+        // hole each frame; a covered hole leaves the list at most this later.
+        let every = if self.holes.len() > SLOW_SCAN {
+            SCAN_EVERY
+        } else {
+            release_every()
+        };
+        if !force && now.saturating_duration_since(self.holes_at) < every {
             return;
         }
         self.holes_dirty = false;
@@ -5300,10 +5346,15 @@ impl CubeLod {
         if (self.stale.is_empty() && self.tiles.stale.is_empty()) || !self.release_dirty {
             return Vec::new();
         }
-        // A pass costs about the stale nodes and the missing ones.
-        if self.missing + self.stale.len() > SLOW_SCAN
-            && now.saturating_duration_since(self.released_at) < SCAN_EVERY
-        {
+        // A pass costs about the stale nodes and the missing ones; even a short
+        // one runs at most every `release_every` (a delivery every frame would
+        // otherwise rescan every stale node each frame at hundreds of fps).
+        let every = if self.missing + self.stale.len() > SLOW_SCAN {
+            SCAN_EVERY
+        } else {
+            release_every()
+        };
+        if now.saturating_duration_since(self.released_at) < every {
             return Vec::new();
         }
         self.release_dirty = false;
@@ -5508,7 +5559,9 @@ fn track_lingering(
     let counts = snapshot.counts();
     let mut next = FxHashMap::default();
     for &key in delivered {
-        if empty.contains(&key) || !counts.holds(key) {
+        // The box test first: it is arithmetic, and most drawn nodes are far
+        // outside the loaded box.
+        if !counts.holds(key) || empty.contains(&key) {
             continue;
         }
         next.insert(key, lingering.get(&key).copied().unwrap_or(now));
@@ -7725,7 +7778,7 @@ mod tests {
             loaded: NONE,
             snapshot: LoadedSnapshot::default(),
             previous: Arc::default(),
-            drawn: Vec::new(),
+            drawn: Drawn::default(),
             step: false,
             surface: None,
         };
