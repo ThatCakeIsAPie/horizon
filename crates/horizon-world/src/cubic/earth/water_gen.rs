@@ -72,6 +72,7 @@ impl EarthGenerator {
     /// active (the water rules need the classes).
     pub fn with_water(mut self, atlas: &'static WaterAtlas) -> Self {
         self.water.atlas = Some(atlas);
+        self.column_memo.clear();
         self
     }
 

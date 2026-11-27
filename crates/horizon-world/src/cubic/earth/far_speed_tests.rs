@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use horizon_earth::testing::{MemoryClimate, SMALL_CLIMATE_GRID, TempDir};
 use horizon_earth::{ClimateFetcher, ClimateStore, ClimateVar};
+use horizon_core::position::SectionPos;
 
 use super::biome::Biome;
 use super::far::NodeColumns;
@@ -229,4 +230,51 @@ fn far_nodes_are_the_same_whether_the_memo_is_cold_or_warm() {
             }
         }
     }
+}
+
+/// A generator like `g` that has never made a cube (its column memo is cold).
+fn fresh_like(rig: &LandRig, g: &EarthGenerator) -> EarthGenerator {
+    EarthGenerator::new(&rig.settings, rig.store.clone(), rig.blocks)
+        .unwrap()
+        .with_land_cover(rig.source.clone())
+        .with_climate(g.climate_source().unwrap().clone())
+}
+
+/// The cubes of the chunk column `(cx, cz)` from well under its ground to over it, bottom up.
+fn column_cubes(rig: &LandRig, g: &EarthGenerator, cx: i32, cz: i32) -> Vec<SectionPos> {
+    let tops = ready(rig, g, |g| g.chunk_tops(cx, cz));
+    let (lo, hi) = (*tops.iter().min().unwrap(), *tops.iter().max().unwrap());
+    (lo.div_euclid(16) - 6..=hi.div_euclid(16) + 2)
+        .map(|y| SectionPos { x: cx, y, z: cz })
+        .collect()
+}
+
+#[test]
+fn cubes_are_the_same_whether_the_column_memo_is_cold_or_warm() {
+    let (rig, g, _dir) = world(9.0, 900);
+    let (mut mixed, mut total) = (0, 0);
+    for cz in -3..3 {
+        for cx in -3..3 {
+            let cubes = column_cubes(&rig, &g, cx, cz);
+            // Two passes over the same shared generator: the first fills the memo, the second reads it.
+            for pass in 0..2 {
+                for &cube in &cubes {
+                    let make = |g: &EarthGenerator| {
+                        let mut blocks = [0u32; 4096];
+                        g.generate(cube, &mut blocks).map(|got| (got, blocks))
+                    };
+                    let (got, warm) = ready(&rig, &g, make);
+                    let cold_g = fresh_like(&rig, &g);
+                    let (want, cold) = ready(&rig, &cold_g, make);
+                    assert_eq!(got, want, "pass {pass} cube {cube:?}");
+                    assert!(warm == cold, "pass {pass} cube {cube:?} differs");
+                    if pass == 0 {
+                        total += 1;
+                        mixed += usize::from(got.is_none());
+                    }
+                }
+            }
+        }
+    }
+    assert!(mixed > total / 8, "too few mixed cubes: {mixed} of {total}");
 }
