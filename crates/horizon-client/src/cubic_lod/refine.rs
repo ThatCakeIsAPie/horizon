@@ -30,6 +30,14 @@ const HANDED_FOR: Duration = Duration::from_secs(30);
 /// again: a loop that fills every batch with the same nodes and starves the others. After it, if the node is
 /// still drawn (it did not split), it is made whole as any other.
 const DEFER_FOR: Duration = Duration::from_millis(500);
+/// Coarse nodes kept ranked: enough for a few batches, so most takes are answered from the ranking.
+const RANKED: usize = 4 * BATCH;
+/// The ranking is rebuilt at most this often. Scoring every coarse node (trig each) on every take cost about
+/// 1 ms of the main thread per frame while walking; the order may lag the camera by up to this long, which
+/// nobody sees since a batch takes longer than that to make.
+const RERANK: Duration = Duration::from_millis(100);
+/// A camera this far (blocks, on any axis) from the one the ranking was made for (a teleport) ranks again at once.
+const RERANK_MOVED: f64 = 16.0;
 
 #[derive(Default)]
 struct State {
@@ -51,6 +59,44 @@ struct State {
     camera: [f64; 3],
     forward: [f64; 3],
     max_distance: f64,
+    /// The coarse nodes ranked best first at `ranked_at` (the best [`RANKED`] of them), as `(score, key)`,
+    /// lowest score first. May hold nodes no longer coarse; they are dropped when met.
+    ranked: Vec<(f64, CubeKey)>,
+    /// The score of the worst node kept when more were eligible than [`RANKED`] (a node scoring below it is
+    /// worth a place in `ranked`), or infinity when every coarse node fits.
+    ranked_floor: f64,
+    /// When `ranked` was made, and the camera and look it was made for.
+    ranked_at: Option<Instant>,
+    ranked_camera: [f64; 3],
+    ranked_forward: [f64; 3],
+}
+
+/// The far view's work order score of `key` for the camera the ranking was made for (lower is better).
+fn rank_score(s: &State, key: CubeKey) -> f64 {
+    let look = Look {
+        forward: s.ranked_forward,
+        ..Look::default()
+    };
+    -job_score(s.ranked_camera, look, key)
+}
+
+/// A node that became coarse between rankings: put it in `ranked` where it belongs, if it ranks better than
+/// the worst one kept. Without it a node made after the last ranking would wait for the next one.
+fn rank_insert(s: &mut State, key: CubeKey) {
+    if s.ranked_at.is_none() {
+        return;
+    }
+    let score = rank_score(s, key);
+    if score >= s.ranked_floor || s.ranked.iter().any(|(_, k)| *k == key) {
+        return;
+    }
+    let at = s.ranked.partition_point(|(o, _)| o.total_cmp(&score).is_lt());
+    s.ranked.insert(at, (score, key));
+    if s.ranked.len() > RANKED
+        && let Some((worst, _)) = s.ranked.pop()
+    {
+        s.ranked_floor = worst;
+    }
 }
 
 /// The coarse nodes and the order they are refined in, shared by every fork of the sampler.
@@ -116,6 +162,7 @@ impl Refine {
         match (whole, made) {
             (false, true) => {
                 s.coarse.insert(key);
+                rank_insert(&mut s, key);
                 profile::R_COARSE.fetch_add(1, Relaxed);
             }
             (true, true) => {
@@ -133,6 +180,7 @@ impl Refine {
             (true, false) => {
                 if s.handed.remove(&key).is_some() {
                     s.coarse.insert(key);
+                    rank_insert(&mut s, key);
                 }
             }
             (false, false) => {}
@@ -155,14 +203,15 @@ impl Refine {
             {
                 s.coarse.insert(key);
                 s.deferred.insert(key, now);
+                rank_insert(s, key);
             }
         }
     }
 
-    /// The next coarse nodes to refine: by the far view's work order (the crosshair first, then the near).
-    fn next(s: &mut State, now: Instant) -> Vec<CubeKey> {
-        s.handed
-            .retain(|_, at| now.duration_since(*at) < HANDED_FOR);
+    /// Rank the coarse nodes again for the current camera: forget the ones left far behind, score the rest
+    /// and keep the best [`RANKED`]. Deferred nodes are ranked too (the pick skips them while deferred), so
+    /// they are in place when their time is up.
+    fn rerank(s: &mut State, now: Instant) {
         let (camera, forward) = (s.camera, s.forward);
         // Coarse nodes left far behind (a teleport) are out of the plan: forgotten, made coarse
         // again if they come back.
@@ -174,33 +223,84 @@ impl Refine {
                 d[0].abs().max(d[2].abs()) <= reach + size
             });
         }
-        let room = BATCH.saturating_sub(s.handed.len());
-        // Nodes given back a moment ago are skipped (see `DEFER_FOR`).
-        s.deferred
-            .retain(|_, at| now.duration_since(*at) < DEFER_FOR);
-        if room == 0 || s.coarse.is_empty() {
-            return Vec::new();
-        }
+        s.ranked_at = Some(now);
+        s.ranked_camera = camera;
+        s.ranked_forward = forward;
         // The far view's work order (`job_score`: the crosshair first, half as much the near), highest first.
-        let look = Look {
-            forward,
-            ..Look::default()
-        };
-        let score = |key: &CubeKey| -job_score(camera, look, *key);
         let mut keys: Vec<(f64, CubeKey)> = s
             .coarse
             .iter()
-            .filter(|k| !s.deferred.contains_key(k))
-            .map(|k| (score(k), *k))
+            .map(|k| (rank_score(s, *k), *k))
             .collect();
-        if keys.is_empty() {
+        s.ranked_floor = f64::INFINITY;
+        if keys.len() > RANKED {
+            keys.select_nth_unstable_by(RANKED - 1, |a, b| a.0.total_cmp(&b.0));
+            keys.truncate(RANKED);
+            s.ranked_floor = keys
+                .iter()
+                .map(|(score, _)| *score)
+                .max_by(f64::total_cmp)
+                .unwrap_or(f64::INFINITY);
+        }
+        keys.sort_by(|a, b| a.0.total_cmp(&b.0));
+        s.ranked = keys;
+    }
+
+    /// Take up to `room` nodes off the ranking, best first: the ones still coarse and not deferred. Deferred
+    /// nodes stay (their time may run out), nodes no longer coarse are dropped.
+    fn pick(s: &mut State, room: usize) -> Vec<CubeKey> {
+        let mut taken = Vec::with_capacity(room);
+        let mut kept = Vec::with_capacity(s.ranked.len());
+        for (score, key) in std::mem::take(&mut s.ranked) {
+            if !s.coarse.contains(&key) {
+                continue;
+            }
+            if taken.len() < room && !s.deferred.contains_key(&key) {
+                taken.push(key);
+            } else {
+                kept.push((score, key));
+            }
+        }
+        s.ranked = kept;
+        taken
+    }
+
+    /// The next coarse nodes to refine: by the far view's work order (the crosshair first, then the near).
+    /// Answered from a ranking kept for up to [`RERANK`], not from scoring every coarse node on every call.
+    fn next(s: &mut State, now: Instant) -> Vec<CubeKey> {
+        s.handed
+            .retain(|_, at| now.duration_since(*at) < HANDED_FOR);
+        // Nodes given back a moment ago are skipped (see `DEFER_FOR`).
+        s.deferred
+            .retain(|_, at| now.duration_since(*at) < DEFER_FOR);
+        let moved = s
+            .camera
+            .iter()
+            .zip(&s.ranked_camera)
+            .any(|(a, b)| (a - b).abs() > RERANK_MOVED);
+        // A jump (a teleport) forgets the coarse nodes left far behind at once, even with no room.
+        let jumped = moved && s.ranked_at.is_some();
+        if jumped {
+            Self::rerank(s, now);
+        }
+        let room = BATCH.saturating_sub(s.handed.len());
+        if room == 0 || s.coarse.is_empty() {
             return Vec::new();
         }
-        let room = room.min(keys.len());
-        keys.select_nth_unstable_by(room - 1, |a, b| a.0.total_cmp(&b.0));
-        keys.truncate(room);
-        keys.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let keys: Vec<CubeKey> = keys.into_iter().map(|(_, k)| k).collect();
+        let stale = jumped
+            || match s.ranked_at {
+                None => true,
+                Some(at) => now.saturating_duration_since(at) >= RERANK,
+            };
+        if stale && !jumped {
+            Self::rerank(s, now);
+        }
+        let mut keys = Self::pick(s, room);
+        // Fewer than asked, and the ranking left nodes out: they may be next, so rank once more.
+        if keys.len() < room && !stale && s.ranked_floor.is_finite() {
+            Self::rerank(s, now);
+            keys = Self::pick(s, room);
+        }
         for key in &keys {
             s.coarse.remove(key);
             s.handed.insert(*key, now);
@@ -313,6 +413,22 @@ mod tests {
         s.max_distance = 4096.0;
         assert!(Refine::next(&mut s, later).is_empty());
         assert!(s.coarse.is_empty());
+    }
+
+    #[test]
+    fn a_node_made_after_the_ranking_is_taken_without_waiting_for_the_next_one() {
+        let refine = Refine::default();
+        // More nodes than the ranking keeps, so a stale ranking would not hold the new one.
+        for x in 1..=300 {
+            refine.made(CubeKey::new(2, x, 0, 0), false, true);
+        }
+        refine.view([0.0, 32.0, 32.0], [1.0, 0.0, 0.0], 1e5, true);
+        let first = refine.take_refreshes();
+        assert_eq!(first.len(), BATCH);
+        // A node round the camera appears, and one slot opens.
+        refine.made(CubeKey::new(2, 0, 0, 0), false, true);
+        refine.made(CubeKey::new(2, first[0].0[0] >> 6, 0, 0), true, true);
+        assert_eq!(refine.take_refreshes(), vec![([0, 0, 0], [63, 63, 63])]);
     }
 
     #[test]
