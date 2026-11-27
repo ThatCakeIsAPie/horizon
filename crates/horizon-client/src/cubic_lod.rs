@@ -364,9 +364,17 @@ impl CubicLodSampler {
         // its nodes stay the CPU's, and a node pool on this device lets the
         // GPU mesher draw them (`GpuBackend::pool_only`). No descent, no
         // surface tiles: both are a generator's.
+        //
+        // Opt-in (`HORIZON_EARTH_GPU_MESH=1`): measured on the desktop (GTX
+        // 1070 Ti) it made the far view complete sooner (reopen 2.5 s against
+        // 5-6, forest 15.7 against 17), but frames slower (walk 2.96 ms against
+        // 2.10, GPU 2.86 against 1.98) and far trees showed farther out than
+        // the CPU mesher draws them.
         if self.is_earth() {
-            let water = self.fluids.first().copied().unwrap_or(self.air);
-            self.pool = GpuBackend::pool_only(device, queue, Vec::new(), self.air, water);
+            if crate::lod::cube::far_knob("HORIZON_EARTH_GPU_MESH", 0) != 0 {
+                let water = self.fluids.first().copied().unwrap_or(self.air);
+                self.pool = GpuBackend::pool_only(device, queue, Vec::new(), self.air, water);
+            }
             return self;
         }
         if let Some(f) = &self.far_setup {
