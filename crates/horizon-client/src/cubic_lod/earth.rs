@@ -144,15 +144,25 @@ pub(super) fn cover(
 
 /// The sky cover of node `key` when the elevation bounds alone prove every column covered (the ground's lowest
 /// possible top, [`EarthGenerator::ground_floor`], reaches the first look over the node: a node deep in rock),
-/// without reading its columns; `None` when they do not prove it (read them: [`cover`]). Only levels 2 and up
-/// read their columns at the zoom of their footprint's bounds.
+/// without reading its columns; `None` when they do not prove it (read them: [`cover`]). The bounds are taken at
+/// the zoom the node's columns are read at ([`surfaces`]): levels 0 and 1 read theirs at a block's, so a level 1
+/// node's floor is the lowest of its four level 0 columns'.
 fn proven_cover(earth: &EarthGenerator, key: CubeKey) -> Option<Box<CoverMask>> {
-    if key.level < 2 || key.level > COVER_LEVEL {
+    if key.level > COVER_LEVEL {
         return None;
     }
-    let floor = earth
-        .ground_floor(u32::from(key.level), key.x, key.z)
-        .ok()?;
+    let floor = if key.level == 1 {
+        let (x, z) = (key.x.checked_mul(2)?, key.z.checked_mul(2)?);
+        let mut floor = i32::MAX;
+        for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            floor = floor.min(earth.ground_floor(0, x + dx, z + dz).ok()?);
+        }
+        floor
+    } else {
+        earth
+            .ground_floor(u32::from(key.level), key.x, key.z)
+            .ok()?
+    };
     let step = 1i32 << key.level;
     let top = key.origin()[1].saturating_add(key.size());
     let look = EarthGenerator::voxel_floor(top.saturating_add(COVER_LOOKS[0]), step);

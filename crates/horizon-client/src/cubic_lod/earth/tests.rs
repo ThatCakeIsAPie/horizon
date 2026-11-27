@@ -826,18 +826,25 @@ fn a_cover_proven_from_the_bounds_is_the_cover_its_columns_give_and_every_rock_n
     let rig = rig();
     let g = &rig.generator;
     let (mut proven, mut rock) = (0, 0);
-    for level in 2..=6u32 {
+    for level in 0..=6u32 {
         let side = 16i32 << level;
         // The sea, the coast, the slope, the spire's foot, flank and summit.
         for x in [-3000 / side, -1, 0, 1000 / side, 2200 / side, 2500 / side] {
             for z in [-1, 0] {
                 rig.load(level, x, z);
+                if level == 1 {
+                    // Levels 0 and 1 read their columns at a block's zoom.
+                    for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        rig.load(0, x * 2 + dx, z * 2 + dz);
+                    }
+                }
                 for y in -8_000 / side - 2..=9_000 / side + 2 {
                     let key = CubeKey::new(level as u8, x, y, z);
                     let is_rock = class(g, key, FarDecor::default()).unwrap() == NodeClass::Rock;
-                    rock += usize::from(is_rock);
+                    rock += usize::from(is_rock && level >= 2);
                     let Some(mask) = proven_cover(g, key) else {
-                        assert!(!is_rock, "{key:?} is rock but its cover is not proven");
+                        // Level 1's rock is classed at its own zoom, its cover proven at a block's.
+                        assert!(!is_rock || level == 1, "{key:?} is rock but its cover is not proven");
                         continue;
                     };
                     proven += 1;
