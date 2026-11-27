@@ -43,15 +43,21 @@ pub mod tile;
 mod warp;
 pub mod water;
 pub mod waterfile;
+pub mod window;
 
 pub use climate::{CLIMATE_RULES, Climate, ClimateVar};
 pub use climatefield::{ClimateFetch, ClimateField, ClimateGrid, ClimateLookup, ClimateStore};
 pub use climatesource::{ClimateFetcher, ClimateSource};
 pub use height::ElevationField;
 pub use landcover::{LAND_COVER_RULES, LandClass, WorldCoverFile};
+pub use landfield::gpu::{
+    AxisOctave, AxisSample as ClassAxisSample, ClassWindowPlan, NO_TILE, OUTSIDE_PLAN, OctavePlan, PlanFile, PlanTile,
+    octave_noise,
+};
 pub use landfield::{Fetch, GeoBox, LandCoverField, LandCoverStore, Lookup, Wanted};
 pub use landsource::{LandCoverFetcher, LandCoverSource};
 pub use projection::{LatLon, LocalTangent, Projection, VerticalMap};
 pub use source::{FetchError, LoadError, SEA_FLOOR_M, TileFetcher, TileStore};
 pub use tile::{Tile, TileError, TileId};
+pub use window::{AxisIndex, AxisSample, WindowPlan, WindowPlanError};
 pub use water::{Lake, RiverReach, WATER_RULES, WaterAtlas, WaterAtlasError};

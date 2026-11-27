@@ -509,6 +509,8 @@ impl Game<'_> {
                 // and the setting allows (`CubeLod::set_gpu_path`). Decided before the
                 // update, so the first plan already has the descent's classes to wait for.
                 let facts = self.res.facts();
+                // Earth's far elevation windows follow the same setting (and HORIZON_EARTH_GPU_WINDOW).
+                horizon_client::cubic_lod::earth_window::set_setting(self.settings.horizon.gpu_far);
                 // An Earth world's backend is a node pool alone (its nodes all sampled on
                 // the CPU, `GpuBackend::pool_only`): it takes the GPU path only where every
                 // node fits the GPU mesher (`CubeLod::gpu_path_allowed`) and no shader pack

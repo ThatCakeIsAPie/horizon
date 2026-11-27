@@ -156,6 +156,8 @@ fn main() {
                 n_ok += 1;
                 st_sum.surfaces += st.surfaces;
                 st_sum.window_dem += st.window_dem;
+                st_sum.window_plan += st.window_plan;
+                st_sum.window_dem_reference += st.window_dem_reference;
                 st_sum.window_class += st.window_class;
                 st_sum.rivers += st.rivers;
                 st_sum.lakes += st.lakes;
@@ -174,4 +176,12 @@ fn main() {
         per(st_sum.surfaces), per(st_sum.window_dem), per(st_sum.window_class), per(st_sum.rivers),
         per(st_sum.water_rules), per(st_sum.kinds), st_sum.window_samples
     );
+    println!(
+        "window DEM ms/node: old reference {:.3}  separable plan {:.3} (of which building the plan {:.3})  speedup {:.2}x",
+        per(st_sum.window_dem_reference), per(st_sum.window_dem), per(st_sum.window_plan),
+        per(st_sum.window_dem_reference) / per(st_sum.window_dem).max(1e-9)
+    );
+    let all_ms: f64 = total.values().map(|(d, _)| d.as_secs_f64() * 1000.0).sum();
+    let all_n: usize = total.values().map(|(_, n)| *n).sum();
+    println!("columns_at overall {:.3} ms/node ({all_n} nodes, levels 2..8)", all_ms / all_n.max(1) as f64);
 }

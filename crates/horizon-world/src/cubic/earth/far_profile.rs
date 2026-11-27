@@ -18,8 +18,14 @@ use super::water::{
 pub struct Stages {
     /// The node's own elevation surfaces.
     pub surfaces: Duration,
-    /// The padded window's elevation surfaces.
+    /// The padded window's elevation surfaces through the separable plan (plan, heights and block heights), the
+    /// way `columns_at` reads them.
     pub window_dem: Duration,
+    /// Just building that plan (axes and tile lookups).
+    pub window_plan: Duration,
+    /// The same window through the old point-by-point read
+    /// ([`horizon_earth::ElevationField::surface_ys_strided_reference`]).
+    pub window_dem_reference: Duration,
     /// The padded window's land cover classes (warp and vote).
     pub window_class: Duration,
     /// The river index search of every window sample.
@@ -58,10 +64,20 @@ impl EarthGenerator {
         let (w, h) = (16 + 2 * WINDOW_PAD, 16 + 2 * WINDOW_PAD);
         st.window_samples = w * h;
         let t = Instant::now();
+        let reference = self
+            .field()
+            .surface_ys_strided_reference(px, pz, w, h, stride, zoom)?;
+        st.window_dem_reference = t.elapsed();
+        let t = Instant::now();
+        let _plan = self.field().window_plan(px, pz, w, h, stride, zoom).ok()?;
+        st.window_plan = t.elapsed();
+        drop(_plan);
+        let t = Instant::now();
         let dem = self
             .field()
             .surface_ys_strided(px, pz, w, h, stride, zoom)?;
         st.window_dem = t.elapsed();
+        debug_assert_eq!(dem, reference);
         let t = Instant::now();
         let class = self
             .classes_core(Access::Local, &land, [px, pz], [w, h], stride, zoom_step)

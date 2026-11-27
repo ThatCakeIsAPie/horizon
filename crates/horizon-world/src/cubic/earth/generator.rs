@@ -255,6 +255,8 @@ pub struct EarthGenerator {
     pub(super) biome_memo: super::biome::BiomeMemo,
     /// The surfaces and kinds of the cube columns already made, so the cubes stacked in a column share them.
     pub(super) column_memo: ColumnMemo,
+    /// The hook that may compute padded windows elsewhere, and its switch ([`super::gpu_window`]).
+    pub(super) window_gpu: super::gpu_window::WindowGpuSlot,
 }
 
 /// The final surfaces and the kinds of one cube column's 16 by 16 blocks (`z << 4 | x`).
@@ -335,6 +337,7 @@ impl EarthGenerator {
             water: super::water_gen::WaterState::default(),
             biome_memo: super::biome::BiomeMemo::default(),
             column_memo: ColumnMemo::default(),
+            window_gpu: super::gpu_window::WindowGpuSlot::default(),
         })
     }
 

@@ -21,6 +21,8 @@ horizon-client-core = { path = "../horizon-client-core" }
 horizon-client-input = { path = "../horizon-client-input" }
 horizon-command = { path = "../horizon-command" }
 horizon-core = { path = "../horizon-core" }
+# The Earth window sampler (gfx/earth_window.rs, gfx/earth_class*.rs) takes horizon-earth's window plans and tiles.
+horizon-earth = { path = "../horizon-earth" }
 horizon-hdr = { path = "../horizon-hdr" }
 horizon-items = { path = "../horizon-items" }
 # Create World's Data Packs: a 26.2 pack's world generation upgraded on its way into the world.
@@ -105,6 +107,10 @@ path = "tests/standard_pack_gpu_entities.rs"
 [[example]]
 name = "standard_pack_gpu_entities"
 path = "examples/standard_pack_gpu_entities.rs"
+
+[[example]]
+name = "earth_window_bench"
+path = "examples/earth_window_bench.rs"
 
 [dev-dependencies]
 tempfile = "3"

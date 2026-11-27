@@ -83,6 +83,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 mod earth;
+pub mod earth_window;
 mod refine;
 
 /// Node columns of vanilla far terrain kept per sampler.
@@ -356,6 +357,9 @@ impl CubicLodSampler {
     /// without reading them back). Without compute shaders there it stays
     /// the CPU reference.
     pub fn with_device(mut self, device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        if let Some(earth) = self.wg.generator.earth_generator() {
+            earth_window::install(earth, &device, &queue);
+        }
         // Earth has no far generator (`far_setup` needs CubicWorldGen's noises):
         // its nodes stay the CPU's, and a node pool on this device lets the
         // GPU mesher draw them (`GpuBackend::pool_only`). No descent, no

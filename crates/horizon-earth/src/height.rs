@@ -116,10 +116,7 @@ impl ElevationField {
         depth: usize,
         zoom: u8,
     ) -> Option<Vec<f32>> {
-        self.grid_with(x0, z0, width, depth, 1.0, zoom, &mut |id| {
-            Ok::<_, std::convert::Infallible>(self.store.cached(id))
-        })
-        .unwrap_or(None)
+        self.window_heights(x0, z0, width, depth, 1, zoom)
     }
 
     /// [`ElevationField::heights_m`] that fetches the tiles it lacks, blocking.
@@ -176,15 +173,67 @@ impl ElevationField {
         stride: i32,
         zoom: u8,
     ) -> Option<Vec<i32>> {
-        let heights = self
-            .grid_with(x0, z0, width, depth, f64::from(stride), zoom, &mut |id| {
-                Ok::<_, std::convert::Infallible>(self.store.cached(id))
-            })
-            .unwrap_or(None)?;
+        let heights = self.window_heights(x0, z0, width, depth, stride, zoom)?;
         Some(heights.into_iter().map(|h| self.block_y_of(h)).collect())
     }
 
-    fn block_y_of(&self, height_m: f32) -> i32 {
+    /// [`ElevationField::surface_ys_strided`] the old way, one point at a time through [`ElevationField::sample`]
+    /// with the tiles resolved per window. Kept as the reference the separable window plan
+    /// ([`ElevationField::window_plan`]) must equal bit for bit, and for the profiler's "old" timing.
+    #[doc(hidden)]
+    pub fn surface_ys_strided_reference(
+        &self,
+        x0: i32,
+        z0: i32,
+        width: usize,
+        depth: usize,
+        stride: i32,
+        zoom: u8,
+    ) -> Option<Vec<i32>> {
+        let heights = self.heights_strided_reference(x0, z0, width, depth, stride, zoom)?;
+        Some(heights.into_iter().map(|h| self.block_y_of(h)).collect())
+    }
+
+    /// The heights in metres of [`ElevationField::surface_ys_strided_reference`].
+    #[doc(hidden)]
+    pub fn heights_strided_reference(
+        &self,
+        x0: i32,
+        z0: i32,
+        width: usize,
+        depth: usize,
+        stride: i32,
+        zoom: u8,
+    ) -> Option<Vec<f32>> {
+        self.grid_with(x0, z0, width, depth, f64::from(stride), zoom, &mut |id| {
+            Ok::<_, std::convert::Infallible>(self.store.cached(id))
+        })
+        .unwrap_or(None)
+    }
+
+    /// The heights in metres of the local window through the separable plan; `None` as the point-by-point read
+    /// says it (a tile not local, a point not finite).
+    fn window_heights(
+        &self,
+        x0: i32,
+        z0: i32,
+        width: usize,
+        depth: usize,
+        stride: i32,
+        zoom: u8,
+    ) -> Option<Vec<f32>> {
+        match self.window_plan(x0, z0, width, depth, stride, zoom) {
+            Ok(plan) => Some(plan.heights_m()),
+            // A window with more tiles along an axis than the plan can number: the point-by-point read.
+            Err(crate::window::WindowPlanError::TooManyTiles) => {
+                self.heights_strided_reference(x0, z0, width, depth, stride, zoom)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// The block height of an elevation in metres from this field's vertical scale, as the surfaces use it.
+    pub fn block_y_of(&self, height_m: f32) -> i32 {
         self.vertical.block_y(f64::from(height_m))
     }
 
@@ -584,6 +633,146 @@ mod tests {
         assert_eq!(
             rig.field.surface_ys_strided(x0, z0, 5, 4, 1, 8),
             rig.field.surface_ys(x0, z0, 5, 4, 8)
+        );
+    }
+
+    /// The separable plan against the point-by-point reference: every window must give the same heights bit for bit
+    /// and the same block ys, and the same `None` while a tile is missing.
+    #[test]
+    fn the_window_plan_equals_the_per_point_reference_bit_for_bit() {
+        use crate::window::WindowPlanError;
+        // Origins: a tile corner, either side of the antimeridian, high latitudes, a mid latitude, fine blocks.
+        let rigs: [(f64, f64, f64); 7] = [
+            (0.0, 0.0, 100.0),
+            (10.0, 179.99, 50.0),
+            (-33.0, -179.995, 30.0),
+            (84.9, 10.0, 100.0),
+            (-84.0, 120.0, 20.0),
+            (60.0, -170.0, 5.0),
+            (45.0, 7.0, 1.0),
+        ];
+        let strides = [1, 2, 3, 7, 16, 64, 256];
+        let mut seed = 0x5eed_u64;
+        let (mut compared, mut skipped, mut missing_checked) = (0, 0, 0);
+        let mut zooms_seen = [false; 16];
+        let mut crossed_seam = 0;
+        for (rig_no, &(lat0, lon0, scale)) in rigs.iter().enumerate() {
+            let rig = build(lat0, lon0, scale, rough);
+            // One rig also has a lower zoom ceiling than the zooms asked for.
+            let field = if rig_no == 3 {
+                rig.field.clone().with_max_zoom(9)
+            } else {
+                rig.field.clone()
+            };
+            for n in 0..90 {
+                let stride = strides[(unit(&mut seed) * strides.len() as f64) as usize];
+                let width = 1 + (unit(&mut seed) * 40.0) as usize;
+                let depth = 1 + (unit(&mut seed) * 40.0) as usize;
+                let reach = i32::try_from(width.max(depth) as i64 * i64::from(stride)).unwrap();
+                // Mostly around the origin (so seams and the antimeridian are crossed), sometimes far away.
+                let spread = if n % 9 == 0 {
+                    400_000.0
+                } else {
+                    f64::from(reach) * 1.5
+                };
+                let x0 = ((unit(&mut seed) - 0.5) * 2.0 * spread) as i32;
+                let z0 = ((unit(&mut seed) - 0.5) * 2.0 * spread) as i32;
+                let fine = field.zoom_for(scale * f64::from(stride));
+                let zoom = match n % 3 {
+                    0 => (unit(&mut seed) * 16.0) as u8,
+                    _ => (i32::from(fine) + (unit(&mut seed) * 4.0) as i32 - 2).clamp(0, 15) as u8,
+                };
+                let plan = field.window_plan(x0, z0, width, depth, stride, zoom);
+                let reference =
+                    field.surface_ys_strided_reference(x0, z0, width, depth, stride, zoom);
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(WindowPlanError::Missing(ids)) => {
+                        // The reference agrees that something is missing; then load it, if it is not too much.
+                        assert_eq!(reference, None, "rig {rig_no} window {n}");
+                        assert_eq!(
+                            field.surface_ys_strided(x0, z0, width, depth, stride, zoom),
+                            None
+                        );
+                        missing_checked += 1;
+                        if ids.len() > 9 {
+                            skipped += 1;
+                            continue;
+                        }
+                        for id in ids {
+                            field.store().load(id).unwrap();
+                        }
+                        field
+                            .window_plan(x0, z0, width, depth, stride, zoom)
+                            .unwrap_or_else(|e| panic!("rig {rig_no} window {n}: {e:?}"))
+                    }
+                    Err(e) => panic!("rig {rig_no} window {n}: {e:?}"),
+                };
+                assert_eq!((plan.width, plan.depth), (width, depth));
+                assert_eq!(plan.tiles.len(), plan.tile_xs.len() * plan.tile_ys.len());
+                assert_eq!(plan.zoom, zoom.min(field.max_zoom()));
+                zooms_seen[usize::from(plan.zoom)] = true;
+                crossed_seam += usize::from(plan.tiles.len() > 1);
+                let reference_h = field
+                    .heights_strided_reference(x0, z0, width, depth, stride, zoom)
+                    .unwrap();
+                let got_h = plan.heights_m();
+                assert_eq!(got_h.len(), reference_h.len());
+                for (k, (a, b)) in got_h.iter().zip(&reference_h).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "rig {rig_no} window {n} (x0 {x0} z0 {z0} {width}x{depth} stride {stride} zoom {zoom}) sample {k}: {a} vs {b}"
+                    );
+                }
+                let ys = field
+                    .surface_ys_strided(x0, z0, width, depth, stride, zoom)
+                    .unwrap();
+                let reference = field
+                    .surface_ys_strided_reference(x0, z0, width, depth, stride, zoom)
+                    .unwrap();
+                assert_eq!(ys, reference, "rig {rig_no} window {n}");
+                if stride == 1 {
+                    assert_eq!(
+                        field.surface_ys(x0, z0, width, depth, zoom).unwrap(),
+                        reference
+                    );
+                }
+                compared += 1;
+            }
+        }
+        eprintln!(
+            "window plan test: {compared} windows equal, {skipped} skipped (too many tiles), {missing_checked} checked while missing, {crossed_seam} across tiles, zooms {:?}",
+            zooms_seen
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| **s)
+                .map(|(z, _)| z)
+                .collect::<Vec<_>>()
+        );
+        assert!(compared >= 300, "only {compared} windows compared");
+        assert!(
+            crossed_seam >= 100,
+            "only {crossed_seam} windows across tiles"
+        );
+        assert!(
+            zooms_seen.iter().filter(|s| **s).count() >= 12,
+            "zooms {zooms_seen:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_window_plan_is_empty() {
+        let rig = build(0.0, 0.0, 100.0, smooth);
+        let plan = rig.field.window_plan(0, 0, 0, 5, 3, 8).unwrap();
+        assert!(plan.heights_m().is_empty() && plan.tiles.is_empty());
+        assert_eq!(
+            rig.field.surface_ys_strided(0, 0, 4, 0, 3, 8),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            rig.field.surface_ys_strided_reference(0, 0, 4, 0, 3, 8),
+            Some(Vec::new())
         );
     }
 
