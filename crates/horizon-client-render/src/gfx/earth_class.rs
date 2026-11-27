@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 #[path = "earth_class_gpu.rs"]
 mod gpu;
-pub use gpu::{ClassifyTimings, Division, EarthClassGpu, kernel_source};
+pub use gpu::{ClassEncoded, ClassifyTimings, Division, EarthClassGpu, kernel_source};
 
 /// Shader source: the exact helpers, then the probe kernels.
 const HELPERS_WGSL: &str = include_str!("earth_class.wgsl");

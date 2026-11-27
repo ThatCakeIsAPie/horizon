@@ -444,6 +444,90 @@ impl EarthClassGpu {
         out: &mut [Option<Vec<u8>>],
         timings: &mut ClassifyTimings,
     ) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("earth class"),
+            });
+        let encoded = self.encode_group(plans, group, &mut encoder, timings);
+        let t = Instant::now();
+        let submission = self.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.staging_slice(&encoded)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+        let ok = self
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(Duration::from_secs(60)),
+            })
+            .is_ok()
+            && matches!(rx.recv_timeout(Duration::from_secs(60)), Ok(Ok(())));
+        self.read_group(plans, encoded, ok, out);
+        timings.gpu += t.elapsed();
+        timings.dispatches += 1;
+    }
+
+    /// Encodes one batch of windows into the caller's `encoder` (for a caller that submits it together with its
+    /// own work and maps [`EarthClassGpu::staging_slice`] itself): the windows whose tiles fit in the pool
+    /// together, in order; the others are left out (their answer from [`EarthClassGpu::finish_encoded`] is
+    /// `None`). `None` when no window can go.
+    pub fn encode(
+        &mut self,
+        plans: &[&ClassWindowPlan],
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Option<ClassEncoded> {
+        let mut group: Vec<usize> = Vec::new();
+        let mut keys_in: HashMap<TileKey, ()> = HashMap::new();
+        for (w, plan) in plans.iter().enumerate() {
+            if !self.supported(plan) || group.len() >= MAX_WINDOWS_PER_DISPATCH {
+                continue;
+            }
+            let keys = Self::held_keys(plan);
+            let new = keys.iter().filter(|k| !keys_in.contains_key(k)).count();
+            if keys_in.len() + new > self.slots {
+                continue;
+            }
+            for k in keys {
+                keys_in.insert(k, ());
+            }
+            group.push(w);
+        }
+        if group.is_empty() {
+            return None;
+        }
+        let mut timings = ClassifyTimings::default();
+        Some(self.encode_group(plans, &group, encoder, &mut timings))
+    }
+
+    /// The readback buffer of an encoded batch, to map once the caller's submission is done.
+    pub fn staging_slice(&self, encoded: &ClassEncoded) -> wgpu::BufferSlice<'_> {
+        self.staging.buffer.slice(..encoded.bytes.max(4))
+    }
+
+    /// The codes of an encoded batch after its staging buffer was mapped (`ok`) or failed to (`!ok`): one entry
+    /// per plan given to [`EarthClassGpu::encode`], `None` for a window left out or on failure. Unmaps.
+    pub fn finish_encoded(
+        &mut self,
+        plans: &[&ClassWindowPlan],
+        encoded: ClassEncoded,
+        ok: bool,
+    ) -> Vec<Option<Vec<u8>>> {
+        let mut out = vec![None; plans.len()];
+        self.read_group(plans, encoded, ok, &mut out);
+        out
+    }
+
+    /// Uploads the tiles of `group`, writes its job records and encodes the dispatch and the copy to staging.
+    fn encode_group(
+        &mut self,
+        plans: &[&ClassWindowPlan],
+        group: &[usize],
+        encoder: &mut wgpu::CommandEncoder,
+        timings: &mut ClassifyTimings,
+    ) -> ClassEncoded {
         self.clock += 1;
         let stamp = self.clock;
         // Tiles first (their slots go into the jobs).
@@ -477,7 +561,6 @@ impl EarthClassGpu {
         }
         timings.pack += t.elapsed();
 
-        let t = Instant::now();
         let device = self.device.clone();
         self.windows.fit(&device, (windows.len() * 8) as u64);
         self.jobs.fit(&device, (jobs.len() * 8) as u64);
@@ -514,11 +597,6 @@ impl EarthClassGpu {
             ],
         });
         let bytes = (total * 4) as u64;
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("earth class"),
-            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("earth class"),
@@ -529,34 +607,38 @@ impl EarthClassGpu {
             pass.dispatch_workgroups((max_samples as u32).div_ceil(64), group.len() as u32, 1);
         }
         encoder.copy_buffer_to_buffer(&self.out.buffer, 0, &self.staging.buffer, 0, bytes);
-        let submission = self.queue.submit([encoder.finish()]);
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.staging
-            .buffer
-            .slice(..bytes)
-            .map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-        let ok = self
-            .device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(Duration::from_secs(60)),
-            })
-            .is_ok()
-            && matches!(rx.recv_timeout(Duration::from_secs(60)), Ok(Ok(())));
+        ClassEncoded {
+            group: group.to_vec(),
+            total,
+            bytes,
+        }
+    }
+
+    /// Reads a mapped batch into `out` (or, on failure, drops the pool whose state is unknown), and unmaps.
+    fn read_group(
+        &mut self,
+        plans: &[&ClassWindowPlan],
+        encoded: ClassEncoded,
+        ok: bool,
+        out: &mut [Option<Vec<u8>>],
+    ) {
+        let ClassEncoded {
+            group,
+            total,
+            bytes,
+        } = encoded;
         if ok {
             let codes: Vec<u32> = {
-                let view = self.staging.buffer.slice(..bytes).get_mapped_range();
+                let view = self.staging.buffer.slice(..bytes.max(4)).get_mapped_range();
                 match view {
                     Ok(view) => bytemuck::cast_slice::<u8, u32>(&view).to_vec(),
                     Err(_) => Vec::new(),
                 }
             };
             self.staging.buffer.unmap();
-            if codes.len() == total {
+            if codes.len() >= total {
                 let mut at = 0;
-                for &w in group {
+                for &w in &group {
                     let n = plans[w].width * plans[w].depth;
                     out[w] = Some(codes[at..at + n].iter().map(|&c| c as u8).collect());
                     at += n;
@@ -566,9 +648,17 @@ impl EarthClassGpu {
             // Leave the windows `None` (the CPU answers them); drop the pool, its state is unknown.
             self.clear_pool();
         }
-        timings.gpu += t.elapsed();
-        timings.dispatches += 1;
     }
+}
+
+/// A batch [`EarthClassGpu::encode`] put into a caller's command encoder.
+pub struct ClassEncoded {
+    /// Indexes of the plans in the batch, in output order.
+    group: Vec<usize>,
+    /// Samples in the batch.
+    total: usize,
+    /// Bytes of codes to read back.
+    bytes: u64,
 }
 
 /// Appends a plan's job record (see the layout in `earth_class_kernel.wgsl`); `slots[k]` is the pool slot of

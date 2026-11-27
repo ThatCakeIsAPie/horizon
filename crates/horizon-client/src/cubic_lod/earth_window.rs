@@ -1,12 +1,14 @@
-//! Earth's far-view elevation windows on the renderer's device (`gfx::earth_window`), behind the GPU far terrain
-//! setting and `HORIZON_EARTH_GPU_WINDOW` ([`horizon_world::cubic::earth::window_gpu_wanted`]; off by default,
-//! as measured slower than the exact CPU read).
+//! Earth's far-view padded windows (elevation and land cover classes, both exact) on the renderer's device
+//! (`gfx::earth_window`), behind the GPU far terrain setting and `HORIZON_EARTH_GPU_WINDOW`
+//! ([`horizon_world::cubic::earth::window_gpu_wanted`]). By default only when the device can do the classes too
+//! (`SHADER_F64 | SHADER_INT64`): the elevation alone is measured slower than the exact CPU read.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use horizon_world::cubic::earth::{
-    EarthGenerator, WindowGpu, WindowJob, WindowTicket, window_gpu_possible, window_gpu_wanted,
+    EarthGenerator, WindowGpu, WindowJob, WindowTicket, window_gpu_env_override, window_gpu_possible,
+    window_gpu_wanted,
 };
 
 use crate::gfx::earth_window::EarthWindowGpu;
@@ -40,9 +42,17 @@ pub(super) fn install(earth: &EarthGenerator, device: &wgpu::Device, queue: &wgp
         log::info!("Horizon: Earth window sampler not on the GPU (no compute)");
         return;
     };
+    if !gpu.does_classes() && window_gpu_env_override() != Some(true) {
+        log::info!(
+            "Horizon: Earth windows stay on the CPU (the device cannot do the land cover classes exactly; \
+             the elevation alone is slower on the GPU)"
+        );
+        return;
+    }
     log::info!(
-        "Horizon: Earth window elevation on the GPU ({})",
-        if gpu.uses_f64() { "f64, exact" } else { "f32" }
+        "Horizon: Earth window elevation on the GPU ({}; land cover classes {})",
+        if gpu.uses_f64() { "f64, exact" } else { "f32" },
+        if gpu.does_classes() { "too, exact" } else { "on the CPU" }
     );
     earth.set_window_gpu(Some(Arc::new(Gated(gpu))));
     earth.set_window_gpu_enabled(true);

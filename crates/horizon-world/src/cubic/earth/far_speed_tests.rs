@@ -320,9 +320,11 @@ impl WindowTicket for MockTicket {
             MockMode::FailWait => None,
             MockMode::WrongLength => Some(WindowResult {
                 heights_m: self.heights[1..].to_vec(),
+                class_codes: None,
             }),
             _ => Some(WindowResult {
                 heights_m: self.heights,
+                class_codes: None,
             }),
         }
     }

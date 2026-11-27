@@ -21,8 +21,10 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use horizon_earth::{Tile, TileId, WindowPlan};
+use horizon_earth::{ClassWindowPlan, Tile, TileId, WindowPlan};
 use horizon_world::cubic::earth::{WindowGpu, WindowJob, WindowResult, WindowTicket};
+
+use super::earth_class::{Division, EarthClassGpu};
 
 const SHADER: &str = include_str!("earth_window.wgsl");
 
@@ -39,6 +41,9 @@ const MAX_JOBS: usize = 128;
 const MAX_SAMPLES: usize = 1 << 21;
 /// Storage buffers the shader binds.
 const STORAGE_BUFFERS: u32 = 5;
+/// The land cover tile pool's size (64 slots of a 1024 x 1024 WorldCover tile, 2 MiB each; within the 128 MiB
+/// storage binding of a GTX 1070 Ti).
+const CLASS_POOL_BYTES: u64 = 128 << 20;
 /// The readback and the wait for the GPU give up after this.
 const GPU_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -57,6 +62,8 @@ pub struct EarthWindowStats {
     pub evictions: u64,
     /// Time from starting a batch (after collecting the jobs) to having its heights, nanoseconds.
     pub gpu_ns: u64,
+    /// Windows whose land cover classes the GPU answered.
+    pub class_windows: u64,
 }
 
 #[derive(Default)]
@@ -67,6 +74,7 @@ struct Counters {
     uploads: AtomicU64,
     evictions: AtomicU64,
     gpu_ns: AtomicU64,
+    class_windows: AtomicU64,
 }
 
 /// How an [`EarthWindowGpu`] is set up.
@@ -77,6 +85,9 @@ pub struct EarthWindowOptions {
     /// After the first job of a batch, wait this long for more before dispatching (zero: take what is already
     /// queued only; jobs arriving while a batch is on the GPU make the next batch anyway).
     pub linger: Duration,
+    /// Also compute the land cover classes of jobs that carry a class plan (needs `SHADER_F64 | SHADER_INT64`;
+    /// exact, see `gfx/earth_class`).
+    pub classes: bool,
 }
 
 impl Default for EarthWindowOptions {
@@ -84,6 +95,7 @@ impl Default for EarthWindowOptions {
         Self {
             allow_f64: true,
             linger: Duration::ZERO,
+            classes: true,
         }
     }
 }
@@ -111,6 +123,7 @@ pub struct EarthWindowGpu {
     alive: Arc<AtomicBool>,
     counters: Arc<Counters>,
     f64: bool,
+    classes: bool,
     slots: u32,
 }
 
@@ -156,6 +169,11 @@ impl EarthWindowGpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let class = options
+            .classes
+            .then(|| EarthClassGpu::with_pool(&device, &queue, CLASS_POOL_BYTES, Division::Native))
+            .flatten();
+        let classes = class.is_some();
         let alive = Arc::new(AtomicBool::new(true));
         let counters = Arc::new(Counters::default());
         let (tx, rx) = mpsc::channel();
@@ -164,6 +182,7 @@ impl EarthWindowGpu {
             queue,
             pipeline,
             f64,
+            class,
             pool,
             globals,
             growable: None,
@@ -188,6 +207,7 @@ impl EarthWindowGpu {
             alive,
             counters,
             f64,
+            classes,
             slots,
         }))
     }
@@ -195,6 +215,11 @@ impl EarthWindowGpu {
     /// Whether the shader mixes in `f64` (the CPU's arithmetic) rather than `f32`.
     pub fn uses_f64(&self) -> bool {
         self.f64
+    }
+
+    /// Whether jobs' land cover classes are computed too (else they come back `None`).
+    pub fn does_classes(&self) -> bool {
+        self.classes
     }
 
     /// Tile slots in the pool.
@@ -217,6 +242,7 @@ impl EarthWindowGpu {
             uploads: c.uploads.load(Ordering::Relaxed),
             evictions: c.evictions.load(Ordering::Relaxed),
             gpu_ns: c.gpu_ns.load(Ordering::Relaxed),
+            class_windows: c.class_windows.load(Ordering::Relaxed),
         }
     }
 }
@@ -309,6 +335,8 @@ struct Batcher {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     f64: bool,
+    /// The land cover kernel, when the device can run it exactly.
+    class: Option<EarthClassGpu>,
     pool: wgpu::Buffer,
     globals: wgpu::Buffer,
     growable: Option<Growable>,
@@ -400,15 +428,22 @@ impl Batcher {
             return;
         }
         match self.dispatch(&jobs, samples) {
-            Some(all) => {
+            Some((all, mut codes)) => {
                 let mut at = 0;
-                for (msg, _) in &jobs {
+                let mut class_windows = 0;
+                for (j, (msg, _)) in jobs.iter().enumerate() {
                     let n = msg.job.plan.width * msg.job.plan.depth;
+                    let class_codes = codes.get_mut(j).and_then(Option::take);
+                    class_windows += u64::from(class_codes.is_some());
                     let _ = msg.reply.send(Some(WindowResult {
                         heights_m: all[at..at + n].to_vec(),
+                        class_codes,
                     }));
                     at += n;
                 }
+                self.counters
+                    .class_windows
+                    .fetch_add(class_windows, Ordering::Relaxed);
                 let c = &self.counters;
                 c.batches.fetch_add(1, Ordering::Relaxed);
                 c.jobs.fetch_add(jobs.len() as u64, Ordering::Relaxed);
@@ -542,8 +577,14 @@ impl Batcher {
         });
     }
 
-    /// Writes the jobs, dispatches once and reads every height back (`samples` of them, job after job).
-    fn dispatch(&mut self, jobs: &[(Msg, Vec<u32>)], samples: usize) -> Option<Vec<f32>> {
+    /// Writes the jobs, dispatches once and reads every height back (`samples` of them, job after job), with the
+    /// land cover codes of the jobs that asked for them (in the same submission and wait; `None` per job when the
+    /// classes were not done).
+    fn dispatch(
+        &mut self,
+        jobs: &[(Msg, Vec<u32>)],
+        samples: usize,
+    ) -> Option<(Vec<f32>, Vec<Option<Vec<u8>>>)> {
         let mut hdrs: Vec<u32> = Vec::with_capacity(jobs.len() * 8);
         let mut data: Vec<u32> = Vec::new();
         let mut ts32: Vec<f32> = Vec::new();
@@ -619,6 +660,18 @@ impl Batcher {
         }
         let bytes = samples as u64 * 4;
         encoder.copy_buffer_to_buffer(&g.out, 0, &g.readback, 0, bytes);
+        // The land cover of the jobs that carry a class plan, in the same submission.
+        let class_jobs: Vec<usize> = (0..jobs.len())
+            .filter(|&j| jobs[j].0.job.class.is_some())
+            .collect();
+        let class_plans: Vec<&ClassWindowPlan> = class_jobs
+            .iter()
+            .filter_map(|&j| jobs[j].0.job.class.as_deref())
+            .collect();
+        let class_encoded = match self.class.as_mut() {
+            Some(class) if !class_plans.is_empty() => class.encode(&class_plans, &mut encoder),
+            _ => None,
+        };
         let submission = self.queue.submit([encoder.finish()]);
         let (tx, rx) = mpsc::channel();
         g.readback
@@ -626,11 +679,33 @@ impl Batcher {
             .map_async(wgpu::MapMode::Read, move |r| {
                 let _ = tx.send(r);
             });
+        let class_rx = match (&class_encoded, self.class.as_ref()) {
+            (Some(encoded), Some(class)) => {
+                let (tx, rx) = mpsc::channel();
+                class
+                    .staging_slice(encoded)
+                    .map_async(wgpu::MapMode::Read, move |r| {
+                        let _ = tx.send(r);
+                    });
+                Some(rx)
+            }
+            _ => None,
+        };
         let polled = self.device.poll(wgpu::PollType::Wait {
             submission_index: Some(submission),
             timeout: Some(GPU_TIMEOUT),
         });
-        if polled.is_err() || !matches!(rx.recv_timeout(GPU_TIMEOUT), Ok(Ok(()))) {
+        let heights_ok = polled.is_ok() && matches!(rx.recv_timeout(GPU_TIMEOUT), Ok(Ok(())));
+        let class_ok = polled.is_ok()
+            && class_rx.is_some_and(|rx| matches!(rx.recv_timeout(GPU_TIMEOUT), Ok(Ok(()))));
+        let mut codes: Vec<Option<Vec<u8>>> = vec![None; jobs.len()];
+        if let (Some(encoded), Some(class)) = (class_encoded, self.class.as_mut()) {
+            let answered = class.finish_encoded(&class_plans, encoded, class_ok);
+            for (&j, answer) in class_jobs.iter().zip(answered) {
+                codes[j] = answer;
+            }
+        }
+        if !heights_ok {
             return None;
         }
         let heights = {
@@ -638,6 +713,6 @@ impl Batcher {
             bytemuck::cast_slice::<u8, f32>(&view).to_vec()
         };
         g.readback.unmap();
-        Some(heights)
+        Some((heights, codes))
     }
 }

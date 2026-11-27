@@ -51,7 +51,7 @@ pub use climatesource::{ClimateFetcher, ClimateSource};
 pub use height::ElevationField;
 pub use landcover::{LAND_COVER_RULES, LandClass, WorldCoverFile};
 pub use landfield::gpu::{
-    AxisOctave, AxisSample, ClassWindowPlan, NO_TILE, OUTSIDE_PLAN, OctavePlan, PlanFile, PlanTile,
+    AxisOctave, AxisSample as ClassAxisSample, ClassWindowPlan, NO_TILE, OUTSIDE_PLAN, OctavePlan, PlanFile, PlanTile,
     octave_noise,
 };
 pub use landfield::{Fetch, GeoBox, LandCoverField, LandCoverStore, Lookup, Wanted};

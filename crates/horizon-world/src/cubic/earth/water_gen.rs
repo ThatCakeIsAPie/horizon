@@ -36,7 +36,9 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use horizon_earth::fastmap::FastMap;
-use horizon_earth::{Lake, LandClass, LandCoverSource, WaterAtlas, WindowPlan, WindowPlanError};
+use horizon_earth::{
+    ClassWindowPlan, Lake, LandClass, LandCoverSource, WaterAtlas, WindowPlan, WindowPlanError,
+};
 
 use super::generator::{Access, EarthGenerator, Gap, Rect};
 use super::gpu_window::{WindowJob, WindowTicket};
@@ -97,7 +99,12 @@ impl WaterColumns {
 /// The window's elevation, either already read or being computed by the hook.
 enum WindowDem {
     Ready(Result<Vec<i32>, Gap>),
-    Pending(Arc<WindowPlan>, Box<dyn WindowTicket>),
+    /// On the hook, with the class plan when the classes went with it.
+    Pending(
+        Arc<WindowPlan>,
+        Option<Arc<ClassWindowPlan>>,
+        Box<dyn WindowTicket>,
+    ),
 }
 
 impl EarthGenerator {
@@ -290,6 +297,7 @@ impl EarthGenerator {
         size: [usize; 2],
         stride: i32,
         zoom: u8,
+        class: impl FnOnce() -> Option<Arc<ClassWindowPlan>>,
     ) -> WindowDem {
         if a == Access::Fetch {
             return WindowDem::Ready(self.window_surfaces(a, origin, size, stride, zoom));
@@ -299,12 +307,16 @@ impl EarthGenerator {
         match self.field.window_plan(x0, z0, width, depth, stride, zoom) {
             Ok(plan) => {
                 let plan = Arc::new(plan);
-                let ticket = self
-                    .window_gpu
-                    .active()
-                    .and_then(|gpu| gpu.submit(WindowJob { plan: Arc::clone(&plan) }));
-                match ticket {
-                    Some(ticket) => WindowDem::Pending(plan, ticket),
+                let pending = self.window_gpu.active().and_then(|gpu| {
+                    let class = class();
+                    let job = WindowJob {
+                        plan: Arc::clone(&plan),
+                        class: class.clone(),
+                    };
+                    gpu.submit(job).map(|ticket| (class, ticket))
+                });
+                match pending {
+                    Some((class, ticket)) => WindowDem::Pending(plan, class, ticket),
                     None => WindowDem::Ready(Ok(self.plan_surfaces(&plan.heights_m()))),
                 }
             }
@@ -317,18 +329,29 @@ impl EarthGenerator {
         }
     }
 
-    /// The window's elevation surfaces: waits for the hook's answer, and reads the window on the CPU from the same
-    /// plan when the hook has none (or one of the wrong size).
-    fn finish_window_dem(&self, dem: WindowDem) -> Result<Vec<i32>, Gap> {
+    /// Whether the window's classes went to the hook with its elevation.
+    fn classes_on_hook(dem: &WindowDem) -> bool {
+        matches!(dem, WindowDem::Pending(_, Some(_), _))
+    }
+
+    /// The window's elevation surfaces, and its land cover classes when they went to the hook and it answered
+    /// them all: waits for the hook's answer, and reads the window on the CPU from the same plan when the hook has
+    /// none (or one of the wrong size).
+    fn finish_window_dem(&self, dem: WindowDem) -> Result<(Vec<i32>, Option<Vec<LandClass>>), Gap> {
         match dem {
-            WindowDem::Ready(dem) => dem,
-            WindowDem::Pending(plan, ticket) => {
+            WindowDem::Ready(dem) => dem.map(|d| (d, None)),
+            WindowDem::Pending(plan, class, ticket) => {
                 let expected = plan.cols.len() * plan.rows.len();
                 match ticket.wait() {
                     Some(result) if result.heights_m.len() == expected => {
-                        Ok(self.plan_surfaces(&result.heights_m))
+                        let classes = class.zip(result.class_codes).and_then(|(c, codes)| {
+                            (codes.len() == c.width * c.depth && codes.len() == expected)
+                                .then(|| codes.into_iter().map(LandClass::from_code).collect::<Option<Vec<_>>>())
+                                .flatten()
+                        });
+                        Ok((self.plan_surfaces(&result.heights_m), classes))
                     }
-                    _ => Ok(self.plan_surfaces(&plan.heights_m())),
+                    _ => Ok((self.plan_surfaces(&plan.heights_m()), None)),
                 }
             }
         }
@@ -358,15 +381,25 @@ impl EarthGenerator {
         let (px, pz) = (x0.saturating_sub(pad), z0.saturating_sub(pad));
         let (w, h) = (width + 2 * WINDOW_PAD, depth + 2 * WINDOW_PAD);
         let zoom = self.zoom_for_step(zoom_step);
+        // The classes go to the hook with the elevation when their plan can be made (every tile it may read is
+        // held); otherwise, or without a hook, they are read here, on the CPU.
+        let class_plan = || {
+            let metres = f64::from(zoom_step.max(1)) * self.field.projection().metres_per_block();
+            land.field()
+                .class_window_plan(px, pz, w, h, stride, metres)
+                .ok()
+                .map(Arc::new)
+        };
         // Both are asked for before either failure is reported, so one pass names everything the window lacks.
-        let dem = self.start_window_dem(a, [px, pz], [w, h], stride, zoom);
-        let class = self.classes_core(a, land, [px, pz], [w, h], stride, zoom_step);
+        let dem = self.start_window_dem(a, [px, pz], [w, h], stride, zoom, class_plan);
+        let class = (!Self::classes_on_hook(&dem))
+            .then(|| self.classes_core(a, land, [px, pz], [w, h], stride, zoom_step));
         // A failed elevation read is reported before a failed class read, as it always was.
         let dem = match dem {
             WindowDem::Ready(Err(gap)) => return Err(gap),
             dem => dem,
         };
-        let class = class?;
+        let class = class.transpose()?;
         let span = |n: usize| (n.saturating_sub(1) as i64 * i64::from(stride)) as i32;
         let r = Rect {
             x0: px,
@@ -398,7 +431,13 @@ impl EarthGenerator {
                 })
                 .collect()
         };
-        let dem = self.finish_window_dem(dem)?;
+        let (dem, hook_class) = self.finish_window_dem(dem)?;
+        // The hook's classes, else the CPU's (also when the hook had the classes but did not answer them all).
+        let class = match (class, hook_class) {
+            (Some(class), _) => class,
+            (None, Some(class)) => class,
+            (None, None) => self.classes_core(a, land, [px, pz], [w, h], stride, zoom_step)?,
+        };
         let vertical = *self.field.vertical();
         let lakes: Vec<Arc<Lake>> = match self.water.atlas {
             Some(atlas) if class.contains(&LandClass::Water) => {

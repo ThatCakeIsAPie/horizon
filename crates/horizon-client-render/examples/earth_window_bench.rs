@@ -9,7 +9,9 @@
 //! CPU code, the separable CPU plan and the GPU, then the whole `columns_at` with the hook off and on, with one
 //! thread and with six at once; each as the worker thread's CPU time, the time it was blocked waiting for the
 //! GPU, and the wall time. `compare` checks the GPU's heights against the plan's CPU heights over random nodes
-//! (levels 2..8) and the final columns (surfaces, kinds, classes) of `columns_at` with the hook on against off.
+//! (levels 2..8), the GPU's land cover classes against `class_grid`, and the final columns (surfaces, kinds,
+//! classes) of `columns_at` with the hook (elevation and classes) on against off. `--no-class` keeps the classes on
+//! the CPU.
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -279,6 +281,28 @@ impl WindowGpu for Timed {
     }
 }
 
+/// The land cover classes' plan of the node's padded window, as `water_columns` makes it.
+fn class_plan(g: &EarthGenerator, n: &Node) -> Option<Arc<horizon_earth::ClassWindowPlan>> {
+    let (x0, z0, side, stride) = n.window();
+    let metres = f64::from(n.step().max(1)) * g.field().projection().metres_per_block();
+    g.land_source()?
+        .field()
+        .class_window_plan(x0, z0, side, side, stride, metres)
+        .ok()
+        .map(Arc::new)
+}
+
+/// The CPU's land cover codes of the node's padded window (`class_grid`, as `classes_core` reads it).
+fn class_codes_cpu(g: &EarthGenerator, n: &Node) -> Option<Vec<u8>> {
+    let (x0, z0, side, stride) = n.window();
+    let metres = f64::from(n.step().max(1)) * g.field().projection().metres_per_block();
+    g.land_source()?
+        .field()
+        .class_grid(x0, z0, side, side, stride, metres)
+        .ok()
+        .map(|v| v.into_iter().map(|c| c.code()).collect())
+}
+
 // ------------------------------------------------------------------ bench
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -399,7 +423,13 @@ fn print_row(label: &str, threads: usize, r: &Run) {
     );
 }
 
-fn bench(gens: &[Arc<EarthGenerator>], hook: &Arc<Timed>, nodes: &[Node], reps: usize) {
+fn bench(
+    gens: &[Arc<EarthGenerator>],
+    hook: &Arc<Timed>,
+    dem_hook: &Arc<Timed>,
+    nodes: &[Node],
+    reps: usize,
+) {
     let spots = gens.len();
     // Interleave the spots so every thread sees all of them.
     let mut items: Vec<Node> = Vec::new();
@@ -442,7 +472,23 @@ fn bench(gens: &[Arc<EarthGenerator>], hook: &Arc<Timed>, nodes: &[Node], reps: 
                 .window_plan(x0, z0, side, side, stride, zoom)
                 .unwrap(),
         );
-        let t = hook.submit(WindowJob { plan }).expect("gpu job");
+        let t = hook.submit(WindowJob { plan, class: None }).expect("gpu job");
+        std::hint::black_box(t.wait().expect("gpu result"));
+    };
+    let class_cpu = |n: &Node| {
+        std::hint::black_box(class_codes_cpu(&gens[n.spot], n).expect("cpu classes"));
+    };
+    let class_gpu = |n: &Node| {
+        let (x0, z0, side, stride) = n.window();
+        let g = &gens[n.spot];
+        let zoom = g.zoom_for_step(n.step());
+        let plan = Arc::new(
+            g.field()
+                .window_plan(x0, z0, side, side, stride, zoom)
+                .unwrap(),
+        );
+        let class = class_plan(g, n);
+        let t = hook.submit(WindowJob { plan, class }).expect("gpu job");
         std::hint::black_box(t.wait().expect("gpu result"));
     };
     let cols = |n: &Node| {
@@ -458,30 +504,53 @@ fn bench(gens: &[Arc<EarthGenerator>], hook: &Arc<Timed>, nodes: &[Node], reps: 
         print_row("separable CPU (plan + heights_m)", threads, &r);
         let r = measure(&items, spots, threads, reps, &gpu);
         print_row("GPU (plan + submit + wait)", threads, &r);
+        println!("--- window land class (+ DEM on the GPU), {threads} thread(s)");
+        let r = measure(&items, spots, threads, reps, &class_cpu);
+        print_row("CPU class_grid (class only)", threads, &r);
+        let r = measure(&items, spots, threads, reps, &class_gpu);
+        print_row("GPU DEM+class (plans+submit+wait)", threads, &r);
         println!("--- whole columns_at, {threads} thread(s)");
-        for g in gens {
-            g.set_window_gpu_enabled(false);
-        }
-        let r = measure(&items, spots, threads, reps, &cols);
-        print_row("columns_at hook off", threads, &r);
-        for g in gens {
-            g.set_window_gpu_enabled(true);
-        }
-        let r = measure(&items, spots, threads, reps, &cols);
-        print_row("columns_at hook on", threads, &r);
-        for g in gens {
-            g.set_window_gpu_enabled(false);
+        // Interleaved rounds of off / DEM-only hook / DEM+class hook, so machine load hits all alike.
+        for round in 0..2 {
+            for g in gens {
+                g.set_window_gpu_enabled(false);
+            }
+            let r = measure(&items, spots, threads, reps, &cols);
+            print_row(&format!("columns_at hook off (r{round})"), threads, &r);
+            for g in gens {
+                g.set_window_gpu(Some(dem_hook.clone() as Arc<dyn WindowGpu>));
+                g.set_window_gpu_enabled(true);
+            }
+            let r = measure(&items, spots, threads, reps, &cols);
+            print_row(&format!("columns_at hook DEM only (r{round})"), threads, &r);
+            for g in gens {
+                g.set_window_gpu(Some(hook.clone() as Arc<dyn WindowGpu>));
+            }
+            let r = measure(&items, spots, threads, reps, &cols);
+            print_row(&format!("columns_at hook DEM+class (r{round})"), threads, &r);
+            for g in gens {
+                g.set_window_gpu_enabled(false);
+            }
         }
     }
     let after = hook.0.stats();
     let batches = after.batches - before.batches;
     let jobs = after.jobs - before.jobs;
     println!(
-        "gpu batcher: {batches} batches, {jobs} jobs ({:.2} jobs/batch), {:.3} ms/batch inside the batcher, {} uploads, {} evictions",
+        "gpu batcher (DEM+class hook): {batches} batches, {jobs} jobs ({:.2} jobs/batch), {} class windows, {:.3} ms/batch inside the batcher, {} uploads, {} evictions",
         jobs as f64 / batches.max(1) as f64,
+        after.class_windows - before.class_windows,
         (after.gpu_ns - before.gpu_ns) as f64 / 1e6 / batches.max(1) as f64,
         after.uploads,
         after.evictions
+    );
+    let d = dem_hook.0.stats();
+    println!(
+        "gpu batcher (DEM-only hook): {} batches, {} jobs ({:.2} jobs/batch), {:.3} ms/batch",
+        d.batches,
+        d.jobs,
+        d.jobs as f64 / d.batches.max(1) as f64,
+        d.gpu_ns as f64 / 1e6 / d.batches.max(1) as f64
     );
 }
 
@@ -503,6 +572,10 @@ struct Cmp {
     kinds_diff: u64,
     classes_diff: u64,
     skipped: u64,
+    class_windows: u64,
+    class_samples: u64,
+    class_diff: u64,
+    class_none: u64,
 }
 
 impl Cmp {
@@ -521,6 +594,10 @@ impl Cmp {
         self.kinds_diff += o.kinds_diff;
         self.classes_diff += o.classes_diff;
         self.skipped += o.skipped;
+        self.class_windows += o.class_windows;
+        self.class_samples += o.class_samples;
+        self.class_diff += o.class_diff;
+        self.class_none += o.class_none;
     }
 }
 
@@ -564,6 +641,14 @@ fn compare(gens: &[Arc<EarthGenerator>], hook: &Arc<Timed>, nodes: &[Node]) {
         100.0 * c.block_y_diff as f64 / c.samples.max(1) as f64,
     );
     println!(
+        "window classes: {} windows, {} samples; GPU class None {}; class mismatches {} ({:.6} %)",
+        c.class_windows,
+        c.class_samples,
+        c.class_none,
+        c.class_diff,
+        100.0 * c.class_diff as f64 / c.class_samples.max(1) as f64,
+    );
+    println!(
         "columns_at hook on vs off: {} nodes, {} columns; nodes differing {}; columns differing {} (surfaces {}, kinds {}, classes {})",
         c.nodes,
         c.columns,
@@ -591,9 +676,12 @@ fn compare_node(gens: &[Arc<EarthGenerator>], hook: &Timed, n: &Node, c: &mut Cm
         return;
     };
     let cpu = plan.heights_m();
+    let class = class_plan(g, n);
+    let cpu_class = class.as_ref().and_then(|_| class_codes_cpu(g, n));
     let Some(gpu) = hook
         .submit(WindowJob {
             plan: Arc::new(plan),
+            class,
         })
         .and_then(|t| t.wait())
     else {
@@ -601,6 +689,21 @@ fn compare_node(gens: &[Arc<EarthGenerator>], hook: &Timed, n: &Node, c: &mut Cm
         return;
     };
     c.windows += 1;
+    if let Some(cpu_class) = cpu_class {
+        match &gpu.class_codes {
+            Some(codes) => {
+                c.class_windows += 1;
+                c.class_samples += cpu_class.len() as u64;
+                c.class_diff += codes
+                    .iter()
+                    .zip(&cpu_class)
+                    .filter(|(a, b)| a != b)
+                    .count() as u64
+                    + (codes.len() as u64).abs_diff(cpu_class.len() as u64);
+            }
+            None => c.class_none += 1,
+        }
+    }
     assert_eq!(gpu.heights_m.len(), cpu.len());
     for (a, b) in gpu.heights_m.iter().zip(&cpu) {
         c.samples += 1;
@@ -673,7 +776,7 @@ fn main() {
     }))
     .expect("an adapter");
     let info = adapter.get_info();
-    let features = adapter.features() & wgpu::Features::SHADER_F64;
+    let features = adapter.features() & (wgpu::Features::SHADER_F64 | wgpu::Features::SHADER_INT64);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("earth_window_bench"),
         required_features: features,
@@ -689,15 +792,36 @@ fn main() {
         device.features().contains(wgpu::Features::SHADER_F64),
         device.limits().max_storage_buffer_binding_size >> 20,
     );
-    let gpu = EarthWindowGpu::with_options(device, queue, EarthWindowOptions { allow_f64, linger })
-        .expect("EarthWindowGpu (no compute support?)");
+    let classes = !args.iter().any(|a| a == "--no-class");
+    let dem_gpu = EarthWindowGpu::with_options(
+        device.clone(),
+        queue.clone(),
+        EarthWindowOptions {
+            allow_f64,
+            linger,
+            classes: false,
+        },
+    )
+    .expect("EarthWindowGpu (no compute support?)");
+    let gpu = EarthWindowGpu::with_options(
+        device,
+        queue,
+        EarthWindowOptions {
+            allow_f64,
+            linger,
+            classes,
+        },
+    )
+    .expect("EarthWindowGpu (no compute support?)");
     println!(
-        "EarthWindowGpu: uses_f64 = {}, pool {} tile slots, linger {:?}",
+        "EarthWindowGpu: uses_f64 = {}, classes = {}, pool {} tile slots, linger {:?}",
         gpu.uses_f64(),
+        gpu.does_classes(),
         gpu.pool_slots(),
         linger
     );
     let hook = Arc::new(Timed(gpu));
+    let dem_hook = Arc::new(Timed(dem_gpu));
 
     let mut gens: Vec<Arc<EarthGenerator>> = Vec::new();
     let mut nodes: Vec<Node> = Vec::new();
@@ -732,16 +856,17 @@ fn main() {
             "== bench ({} nodes, warm-up + {reps} passes, median pass)",
             bench_nodes.len()
         );
-        bench(&gens, &hook, &bench_nodes, reps);
+        bench(&gens, &hook, &dem_hook, &bench_nodes, reps);
     }
     if mode == "compare" || mode == "all" {
         println!("== compare ({} nodes)", nodes.len());
         compare(&gens, &hook, &nodes);
         let s = hook.0.stats();
         println!(
-            "gpu: {} batches, {} jobs, {} uploads, {} evictions; alive {}",
+            "gpu: {} batches, {} jobs, {} class windows, {} uploads, {} evictions; alive {}",
             s.batches,
             s.jobs,
+            s.class_windows,
             s.uploads,
             s.evictions,
             hook.0.is_alive()

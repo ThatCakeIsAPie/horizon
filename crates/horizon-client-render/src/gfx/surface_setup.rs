@@ -215,8 +215,10 @@ pub(super) async fn open_adapter(
                 | wgpu::Features::CLEAR_TEXTURE
                 | wgpu::Features::TEXTURE_ATOMIC
                 | wgpu::Features::FLOAT32_FILTERABLE
-                // gfx/earth_window.rs mixes Earth's far-view elevation in f64 like the CPU when it can.
-                | wgpu::Features::SHADER_F64));
+                // gfx/earth_window.rs mixes Earth's far-view elevation in f64 like the CPU when it can,
+                // and gfx/earth_class runs the land class bit for bit with f64 and u64.
+                | wgpu::Features::SHADER_F64
+                | wgpu::Features::SHADER_INT64));
     let driver = format!("{} {}", info.driver, info.driver_info);
     startup_step(format_args!(
         "requesting the device (driver {}) with features [{features}] and the adapter's \
