@@ -34,6 +34,44 @@ pub fn wrap_longitude(lon: f64) -> f64 {
     (lon + 180.0).rem_euclid(360.0) - 180.0
 }
 
+/// The latitude of the poles, in degrees.
+pub const POLE_LATITUDE: f64 = 90.0;
+
+/// Folds a latitude that is past a pole back onto the globe, and says whether the fold put the point on the far side
+/// (its longitude is then 180 degrees further round). A latitude of 100 comes back as 80 on the opposite meridian,
+/// 190 as -10 on it, 360 as 0 on the original one, so the map is continuous through both poles however far the
+/// input goes. A latitude within `[-90, 90]` (or not a finite number) is returned as it is, exactly.
+pub(crate) fn fold_latitude(lat: f64) -> (f64, bool) {
+    if !(lat.abs() > POLE_LATITUDE && lat.is_finite()) {
+        return (lat, false);
+    }
+    let q = lat + POLE_LATITUDE;
+    let n = (q / 180.0).floor();
+    let r = (q - n * 180.0).clamp(0.0, 180.0);
+    if n.rem_euclid(2.0) == 1.0 {
+        (
+            (POLE_LATITUDE - r).clamp(-POLE_LATITUDE, POLE_LATITUDE),
+            true,
+        )
+    } else {
+        (
+            (r - POLE_LATITUDE).clamp(-POLE_LATITUDE, POLE_LATITUDE),
+            false,
+        )
+    }
+}
+
+/// Folds a latitude and longitude, in degrees, onto the globe: a latitude past +-90 comes back down on the other side
+/// of the pole with the longitude 180 degrees further round, so the mapping is continuous through the poles, and
+/// the longitude then wraps into `[-180, 180)`. Any finite input is valid, however many times it laps the globe.
+pub fn fold_globe(lat: f64, lon: f64) -> LatLon {
+    let (lat, far_side) = fold_latitude(lat);
+    LatLon {
+        lat,
+        lon: wrap_longitude(if far_side { lon + 180.0 } else { lon }),
+    }
+}
+
 /// The width, in pixels, of the whole world at `zoom` (it is as tall as it is wide).
 pub fn world_pixels(zoom: u8) -> f64 {
     f64::from(TILE_SIZE) * (1u64 << zoom) as f64
@@ -156,9 +194,21 @@ impl Projection {
         LocalTangent::new(lat0, lon0, metres_per_block).map(Self::Tangent)
     }
 
-    /// The world point `(x, z)` (fractional blocks) to latitude and longitude. The longitude wraps into
-    /// `[-180, 180)`; the latitude is not clamped, so it may pass the poles far from the origin.
+    /// The world point `(x, z)` (fractional blocks) to latitude and longitude on the globe: the latitude is folded
+    /// over the poles ([`fold_globe`]: past +-90 it comes back down on the other side, continuous through the
+    /// pole, with the longitude 180 degrees further round) and the longitude wraps into `[-180, 180)`, so far from
+    /// the origin the point still lands on the globe, however many laps round it is. The latitude is in
+    /// `[-90, 90]`, so it can pass the Mercator limit (85.05) near the poles.
     pub fn to_lat_lon(&self, x: f64, z: f64) -> LatLon {
+        let at = self.to_lat_lon_unwrapped(x, z);
+        fold_globe(at.lat, at.lon)
+    }
+
+    /// The point as the datasets with a southern and northern edge see it: the latitude **not folded** (it may pass
+    /// +-90, where those datasets have no data) and the longitude wrapped into `[-180, 180)`. This is what
+    /// [`Projection::to_lat_lon`] was before the fold; the land cover and climate readers keep it, because their
+    /// separable window plans cannot express the half-lap longitude the fold adds.
+    pub fn to_lat_lon_flat(&self, x: f64, z: f64) -> LatLon {
         let at = self.to_lat_lon_unwrapped(x, z);
         LatLon {
             lat: at.lat,
@@ -166,8 +216,9 @@ impl Projection {
         }
     }
 
-    /// Like [`Projection::to_lat_lon`] but the longitude keeps counting past ±180°, so two points can be
-    /// compared to see how far apart they are in longitude.
+    /// The raw mapping, **not folded**: the latitude may pass +-90 (and keeps counting) and the longitude keeps
+    /// counting past +-180 degrees, so two points can be compared to see how far apart they are, and a box of
+    /// blocks becomes a box of degrees. Use [`Projection::to_lat_lon`] for a place on the globe.
     pub fn to_lat_lon_unwrapped(&self, x: f64, z: f64) -> LatLon {
         match self {
             Self::Tangent(t) => {
@@ -181,7 +232,9 @@ impl Projection {
         }
     }
 
-    /// The inverse of [`Projection::to_lat_lon`], taking the short way round the globe for longitude.
+    /// The inverse of [`Projection::to_lat_lon`] near the origin, taking the short way round the globe for
+    /// longitude. Once the map folds over the poles and laps, a point of the globe has many world positions; this
+    /// gives the one nearest the origin's meridian and latitude.
     pub fn from_lat_lon(&self, lat: f64, lon: f64) -> (f64, f64) {
         match self {
             Self::Tangent(t) => {
@@ -371,6 +424,118 @@ mod tests {
         assert!((-180.0..-170.0).contains(&ll.lon), "lon {}", ll.lon);
         let (x, _) = p.from_lat_lon(ll.lat, ll.lon);
         assert!((x - 2000.0).abs() < 1e-6);
+    }
+
+    /// The unit vector of a point on the globe.
+    fn unit_vector(p: LatLon) -> [f64; 3] {
+        let (la, lo) = (p.lat.to_radians(), p.lon.to_radians());
+        [la.cos() * lo.cos(), la.cos() * lo.sin(), la.sin()]
+    }
+
+    fn chord(a: LatLon, b: LatLon) -> f64 {
+        let (u, v) = (unit_vector(a), unit_vector(b));
+        ((u[0] - v[0]).powi(2) + (u[1] - v[1]).powi(2) + (u[2] - v[2]).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn folding_over_a_pole_comes_down_the_other_side() {
+        let at = fold_globe;
+        // Inside the globe nothing changes (the longitude only wraps).
+        assert_eq!(
+            at(45.0, 10.0),
+            LatLon {
+                lat: 45.0,
+                lon: 10.0
+            }
+        );
+        assert_eq!(at(90.0, 10.0).lat, 90.0);
+        assert_eq!(at(-90.0, 10.0).lat, -90.0);
+        assert_eq!(at(0.0, 190.0).lon, -170.0);
+        // Past the north pole: down the opposite meridian.
+        let p = at(100.0, 30.0);
+        assert!(
+            (p.lat - 80.0).abs() < 1e-12 && (p.lon + 150.0).abs() < 1e-12,
+            "{p:?}"
+        );
+        // Past the south pole.
+        let p = at(-100.0, 30.0);
+        assert!(
+            (p.lat + 80.0).abs() < 1e-12 && (p.lon + 150.0).abs() < 1e-12,
+            "{p:?}"
+        );
+        // Half a lap over both poles is the antipode's latitude, a full lap is the same place.
+        let p = at(180.0, 30.0);
+        assert!(
+            p.lat.abs() < 1e-12 && (p.lon + 150.0).abs() < 1e-12,
+            "{p:?}"
+        );
+        let p = at(360.0, 30.0);
+        assert!(p.lat.abs() < 1e-12 && (p.lon - 30.0).abs() < 1e-12, "{p:?}");
+        let p = at(270.0, 30.0);
+        assert!((p.lat + 90.0).abs() < 1e-12, "{p:?}");
+        // Always on the globe, however far.
+        for lat in [1e3, -1e3, 123_456.7, -9.9e6, 2.4e7] {
+            let p = at(lat, 1e6 + 0.25);
+            assert!(
+                (-90.0..=90.0).contains(&p.lat) && (-180.0..180.0).contains(&p.lon),
+                "{lat}: {p:?}"
+            );
+        }
+        assert!(at(f64::NAN, 0.0).lat.is_nan());
+    }
+
+    #[test]
+    fn the_folded_globe_is_continuous_through_both_poles_and_many_laps() {
+        // Walk the latitude in small steps over the poles and several laps: consecutive points stay close on the
+        // sphere (no jump at a pole, at the fold, or at the antimeridian).
+        let step = 0.05;
+        for lon in [0.0, 30.0, 179.99, -179.99] {
+            let mut prev = fold_globe(-1000.0, lon);
+            let mut lat = -1000.0 + step;
+            let mut worst = 0.0f64;
+            while lat < 1000.0 {
+                let now = fold_globe(lat, lon);
+                worst = worst.max(chord(prev, now));
+                prev = now;
+                lat += step;
+            }
+            assert!(
+                worst < step.to_radians() * 1.01,
+                "lon {lon}: jump of chord {worst}"
+            );
+        }
+        // The same through the projection: walking north (negative z) over the pole and on round the globe.
+        let p = Projection::local(60.0, 20.0, 1000.0).unwrap();
+        let mut prev = p.to_lat_lon(0.0, 0.0);
+        let mut worst = 0.0f64;
+        let mut past_pole = false;
+        for i in 1..=200_000 {
+            let now = p.to_lat_lon(5.0, -f64::from(i) * 2.0);
+            assert!((-90.0..=90.0).contains(&now.lat) && (-180.0..180.0).contains(&now.lon));
+            past_pole |= p.to_lat_lon_unwrapped(5.0, -f64::from(i) * 2.0).lat > 90.0;
+            worst = worst.max(chord(prev, now));
+            prev = now;
+        }
+        assert!(past_pole);
+        // 2 blocks of 1 km on a sphere of 6378 km is 0.0003 radians, and the pole only swings the longitude.
+        assert!(worst < 0.001, "worst chord {worst}");
+    }
+
+    #[test]
+    fn the_unwrapped_mapping_is_the_raw_one_and_the_wrapped_one_is_folded() {
+        let p = Projection::local(60.0, 20.0, 1000.0).unwrap();
+        // 4,000 km north of 60 degrees is past the pole.
+        let raw = p.to_lat_lon_unwrapped(0.0, -4_000.0);
+        assert!(raw.lat > 90.0 && (raw.lon - 20.0).abs() < 1e-9, "{raw:?}");
+        let folded = p.to_lat_lon(0.0, -4_000.0);
+        assert_eq!(folded, fold_globe(raw.lat, raw.lon));
+        assert!(
+            folded.lat <= 90.0 && (folded.lon + 160.0).abs() < 1e-9,
+            "{folded:?}"
+        );
+        // Inside the globe the two agree.
+        let near = p.to_lat_lon(100.0, 100.0);
+        assert_eq!(near.lat, p.to_lat_lon_unwrapped(100.0, 100.0).lat);
     }
 
     #[test]

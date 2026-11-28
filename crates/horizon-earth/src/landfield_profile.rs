@@ -198,7 +198,7 @@ impl LandCoverField {
                     acc = fold(acc, black_box(wx).to_bits() ^ black_box(wz).to_bits().rotate_left(1));
                     continue;
                 }
-                let at = self.projection.to_lat_lon(wx, wz);
+                let at = self.projection.to_lat_lon_flat(wx, wz);
                 if stage == 2 {
                     acc = fold(acc, black_box(at.lat).to_bits() ^ black_box(at.lon).to_bits().rotate_left(1));
                     continue;

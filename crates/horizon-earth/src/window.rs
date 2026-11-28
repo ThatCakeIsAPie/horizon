@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use crate::height::ElevationField;
-use crate::projection::{pixel_x, pixel_y, world_pixels};
+use crate::projection::{MAX_LATITUDE, pixel_x, pixel_y, world_pixels};
 use crate::tile::{TILE_SIZE, Tile, TileId};
 
 /// A pixel position along one axis: which of the plan's distinct tiles along that axis holds it, and the pixel
@@ -42,7 +42,10 @@ pub enum WindowPlanError {
     NotFinite,
     /// These tiles (distinct, in the plan's tile order) are not in the store; nothing was fetched.
     Missing(Vec<TileId>),
-    /// More distinct tiles along one axis than a [`AxisIndex`] can number; read the samples one by one instead.
+    /// More distinct tiles along one axis than a [`AxisIndex`] can number, or a window that reaches the polar cap
+    /// (a row past the Mercator limit, where the field folds over the pole and blends to the pole's height, which
+    /// the separable axes cannot express): read the samples one by one instead
+    /// ([`ElevationField::surface_ys_strided`] does).
     TooManyTiles,
 }
 
@@ -180,24 +183,31 @@ impl ElevationField {
             cols.push((
                 t,
                 floor.rem_euclid(size),
-                floor.wrapping_add(1).rem_euclid(size),
+                floor.saturating_add(1).rem_euclid(size),
             ));
         }
         let mut rows = Vec::with_capacity(depth);
+        let mut polar = false;
         for j in 0..depth {
             let z = f64::from(z0) + (j as f64) * stride + 0.5;
             let lat = projection.to_lat_lon_unwrapped(0.0, z).lat;
+            // Past the Mercator limit the field folds over the pole and blends to the pole's height, which also
+            // moves the longitude by half a lap: not separable into column and row axes.
+            polar |= lat.abs() > MAX_LATITUDE;
             let py = pixel_y(lat, zoom);
             finite &= py.is_finite();
             let (t, floor) = split(py);
             rows.push((
                 t,
                 floor.clamp(0, size - 1),
-                floor.wrapping_add(1).clamp(0, size - 1),
+                floor.saturating_add(1).clamp(0, size - 1),
             ));
         }
         if !finite {
             return Err(WindowPlanError::NotFinite);
+        }
+        if polar {
+            return Err(WindowPlanError::TooManyTiles);
         }
 
         let mut too_many = false;

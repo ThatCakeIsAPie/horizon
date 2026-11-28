@@ -6,18 +6,40 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::projection::{Projection, VerticalMap, latlon_to_pixel, world_pixels};
+use crate::projection::{
+    LatLon, MAX_LATITUDE, POLE_LATITUDE, Projection, VerticalMap, fold_latitude, pixel_x, pixel_y,
+    world_pixels,
+};
 use crate::source::{LoadError, TileStore};
 use crate::tile::{MAX_ZOOM, TILE_SIZE, Tile, TileId};
 
 /// Metres per pixel at zoom 0 on the equator: Web Mercator's circumference over 256 pixels.
 pub const EQUATOR_METRES_PER_PIXEL: f64 = 156_543.033_92;
 
-/// Pixel rectangle of a block rectangle, split where it crosses the antimeridian: each x interval and the y
-/// interval are inclusive pixel indices over the whole world.
-struct Span {
+/// The tile every polar cap read needs: the whole world at zoom 0, whose edge rows' means are the poles' heights.
+pub const POLE_TILE: TileId = TileId { z: 0, x: 0, y: 0 };
+
+/// How far the polar cap blend has gone at a latitude (folded onto `[-90, 90]`): 0 up to the Mercator limit (the
+/// terrain is the data's edge row there), 1 at the pole (the terrain is the pole's mean height), linear in latitude
+/// between.
+pub fn polar_cap_weight(lat: f64) -> f64 {
+    ((lat.abs() - MAX_LATITUDE) / (POLE_LATITUDE - MAX_LATITUDE)).clamp(0.0, 1.0)
+}
+
+/// The pixels of a block rectangle that one latitude band of it reads: each x interval and the y interval are
+/// inclusive pixel indices over the whole world.
+struct Part {
     xs: Vec<(i64, i64)>,
     y: (i64, i64),
+}
+
+/// Pixel rectangle of a block rectangle, in as many parts as its latitude folds over poles (at most three; the
+/// whole world when it is a lap or more tall), each split where it crosses the antimeridian, and which poles'
+/// caps it touches.
+struct Span {
+    parts: Vec<Part>,
+    north: bool,
+    south: bool,
 }
 
 /// The terrain's height at any world block, read from a [`TileStore`] through a [`Projection`].
@@ -264,7 +286,10 @@ impl ElevationField {
     }
 
     /// The tiles [`ElevationField::range`] reads for this rectangle, in order, for prefetching. Every tile
-    /// [`ElevationField::height_m`] needs inside the rectangle is among them.
+    /// [`ElevationField::height_m`] needs inside the rectangle is among them: a rectangle that spans the
+    /// antimeridian lists both sides, one wider than a lap of longitude or taller than a lap of latitude lists each
+    /// tile of the zoom once (never more than the world has), and one that reaches a polar cap (past the Mercator
+    /// limit, or folded over a pole) also lists [`POLE_TILE`], whose edge rows give the pole's height.
     pub fn tiles_for(&self, x0: i32, z0: i32, x1: i32, z1: i32, zoom: u8) -> Vec<TileId> {
         let zoom = zoom.min(self.max_zoom);
         let Some(span) = self.span(x0, z0, x1, z1, zoom) else {
@@ -272,26 +297,36 @@ impl ElevationField {
         };
         let side = i64::from(TILE_SIZE);
         let mut ids = Vec::new();
-        for &(xa, xb) in &span.xs {
-            for ty in span.y.0 / side..=span.y.1 / side {
-                for tx in xa / side..=xb / side {
-                    ids.push(TileId {
-                        z: zoom,
-                        x: tx as u32,
-                        y: ty as u32,
-                    });
+        for part in &span.parts {
+            for &(xa, xb) in &part.xs {
+                for ty in part.y.0 / side..=part.y.1 / side {
+                    for tx in xa / side..=xb / side {
+                        ids.push(TileId {
+                            z: zoom,
+                            x: tx as u32,
+                            y: ty as u32,
+                        });
+                    }
                 }
             }
+        }
+        if span.north || span.south {
+            ids.push(POLE_TILE);
         }
         ids.sort_unstable();
         ids.dedup();
         ids
     }
 
-    /// Fractional world pixels of the point, with x not wrapped.
-    fn pixel_of(&self, x: f64, z: f64, zoom: u8) -> (f64, f64) {
+    /// The point's latitude folded over the poles and its longitude unwrapped (counting past 180 degrees, moved
+    /// half a lap when the fold put it on the far side of a pole), exactly what the pixel maths below reads.
+    fn folded_at(&self, x: f64, z: f64) -> LatLon {
         let at = self.projection.to_lat_lon_unwrapped(x, z);
-        latlon_to_pixel(at.lat, at.lon, zoom)
+        let (lat, far_side) = fold_latitude(at.lat);
+        LatLon {
+            lat,
+            lon: if far_side { at.lon + 180.0 } else { at.lon },
+        }
     }
 
     fn sample<E>(
@@ -302,7 +337,8 @@ impl ElevationField {
         get: &mut dyn FnMut(TileId) -> Result<Option<Arc<Tile>>, E>,
     ) -> Result<Option<f32>, E> {
         let zoom = zoom.min(self.max_zoom);
-        let (px, py) = self.pixel_of(x, z, zoom);
+        let at = self.folded_at(x, z);
+        let (px, py) = (pixel_x(at.lon, zoom), pixel_y(at.lat, zoom));
         if !(px.is_finite() && py.is_finite()) {
             return Ok(None);
         }
@@ -311,38 +347,41 @@ impl ElevationField {
         let (fx, fy) = (px - 0.5, py - 0.5);
         let (x_floor, y_floor) = (fx.floor(), fy.floor());
         let (tx, ty) = (fx - x_floor, fy - y_floor);
+        let (x_floor, y_floor) = (x_floor as i64, y_floor as i64);
         let xs = [
-            (x_floor as i64).rem_euclid(size),
-            (x_floor as i64 + 1).rem_euclid(size),
+            x_floor.rem_euclid(size),
+            x_floor.saturating_add(1).rem_euclid(size),
         ];
         let ys = [
-            (y_floor as i64).clamp(0, size - 1),
-            (y_floor as i64 + 1).clamp(0, size - 1),
+            y_floor.clamp(0, size - 1),
+            y_floor.saturating_add(1).clamp(0, size - 1),
         ];
 
-        let mut held: Vec<(TileId, Arc<Tile>)> = Vec::with_capacity(4);
-        let mut at = |gx: i64, gy: i64| -> Result<Option<f64>, E> {
+        let mut held: Vec<(TileId, Arc<Tile>)> = Vec::with_capacity(5);
+        let mut tile_of = |id: TileId| -> Result<Option<Arc<Tile>>, E> {
+            if let Some((_, tile)) = held.iter().find(|(held_id, _)| *held_id == id) {
+                return Ok(Some(Arc::clone(tile)));
+            }
+            let Some(tile) = get(id)? else {
+                return Ok(None);
+            };
+            held.push((id, Arc::clone(&tile)));
+            Ok(Some(tile))
+        };
+        let mut corner = |gx: i64, gy: i64| -> Result<Option<f64>, E> {
             let side = i64::from(TILE_SIZE);
             let id = TileId {
                 z: zoom,
                 x: (gx / side) as u32,
                 y: (gy / side) as u32,
             };
-            let tile = match held.iter().find(|(held_id, _)| *held_id == id) {
-                Some((_, tile)) => Arc::clone(tile),
-                None => match get(id)? {
-                    Some(tile) => {
-                        held.push((id, Arc::clone(&tile)));
-                        tile
-                    }
-                    None => return Ok(None),
-                },
+            let Some(tile) = tile_of(id)? else {
+                return Ok(None);
             };
             Ok(Some(f64::from(
                 tile.height((gx % side) as usize, (gy % side) as usize),
             )))
         };
-        let mut corner = |gx, gy| at(gx, gy);
         let (Some(h00), Some(h10), Some(h01), Some(h11)) = (
             corner(xs[0], ys[0])?,
             corner(xs[1], ys[0])?,
@@ -353,7 +392,22 @@ impl ElevationField {
         };
         let top = h00 + (h10 - h00) * tx;
         let bottom = h01 + (h11 - h01) * tx;
-        Ok(Some((top + (bottom - top) * ty) as f32))
+        let edge = top + (bottom - top) * ty;
+        if at.lat.abs() <= MAX_LATITUDE {
+            return Ok(Some(edge as f32));
+        }
+        // The polar cap: the data's edge row at this longitude (the rows clamp at the limit) blends to the pole's
+        // mean height, linearly in latitude, so the surface is continuous at the pole and at the fold.
+        let Some(pole_tile) = tile_of(POLE_TILE)? else {
+            return Ok(None);
+        };
+        let pole = f64::from(if at.lat > 0.0 {
+            pole_tile.north_edge_mean()
+        } else {
+            pole_tile.south_edge_mean()
+        });
+        let blended = edge + (pole - edge) * polar_cap_weight(at.lat);
+        Ok(Some(blended.clamp(edge.min(pole), edge.max(pole)) as f32))
     }
 
     fn grid_with<E>(
@@ -407,67 +461,142 @@ impl ElevationField {
         };
         let side = i64::from(TILE_SIZE);
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for &(xa, xb) in &span.xs {
-            for ty in span.y.0 / side..=span.y.1 / side {
-                for tx in xa / side..=xb / side {
-                    let id = TileId {
-                        z: zoom,
-                        x: tx as u32,
-                        y: ty as u32,
-                    };
-                    let Some(tile) = get(id)? else {
-                        return Ok(None);
-                    };
-                    // The part of the span inside this tile, in the tile's own pixels.
-                    let local = |from: i64, to: i64, origin: i64| {
-                        (
-                            (from.max(origin) - origin) as usize,
-                            (to.min(origin + side - 1) - origin) as usize,
-                        )
-                    };
-                    let (px0, px1) = local(xa, xb, tx * side);
-                    let (py0, py1) = local(span.y.0, span.y.1, ty * side);
-                    if let Some((a, b)) = tile.range(px0, py0, px1, py1) {
-                        lo = lo.min(a);
-                        hi = hi.max(b);
+        for part in &span.parts {
+            for &(xa, xb) in &part.xs {
+                for ty in part.y.0 / side..=part.y.1 / side {
+                    for tx in xa / side..=xb / side {
+                        let id = TileId {
+                            z: zoom,
+                            x: tx as u32,
+                            y: ty as u32,
+                        };
+                        let Some(tile) = get(id)? else {
+                            return Ok(None);
+                        };
+                        // The part of the span inside this tile, in the tile's own pixels.
+                        let local = |from: i64, to: i64, origin: i64| {
+                            (
+                                (from.max(origin) - origin) as usize,
+                                (to.min(origin + side - 1) - origin) as usize,
+                            )
+                        };
+                        let (px0, px1) = local(xa, xb, tx * side);
+                        let (py0, py1) = local(part.y.0, part.y.1, ty * side);
+                        if let Some((a, b)) = tile.range(px0, py0, px1, py1) {
+                            lo = lo.min(a);
+                            hi = hi.max(b);
+                        }
                     }
+                }
+            }
+        }
+        if span.north || span.south {
+            // The cap blends the edge rows (read above) to the pole's mean height.
+            let Some(pole_tile) = get(POLE_TILE)? else {
+                return Ok(None);
+            };
+            for (touched, mean) in [
+                (span.north, pole_tile.north_edge_mean()),
+                (span.south, pole_tile.south_edge_mean()),
+            ] {
+                if touched {
+                    lo = lo.min(mean);
+                    hi = hi.max(mean);
                 }
             }
         }
         Ok((lo <= hi).then_some((lo, hi)))
     }
 
-    /// The pixels a block rectangle's samples can blend, plus one pixel all round.
+    /// The pixels a block rectangle's samples can blend, plus one pixel all round, in the parts its latitude folds
+    /// into: the rectangle's raw latitude band is cut at the poles (latitudes 90 + 180 k), each piece is the
+    /// folded band of latitudes (and the longitudes moved half a lap where the fold puts it on the far side), and a
+    /// band a lap or more tall is the whole world.
     fn span(&self, x0: i32, z0: i32, x1: i32, z1: i32, zoom: u8) -> Option<Span> {
         let (xa, xb) = (f64::from(x0.min(x1)), f64::from(x0.max(x1)) + 1.0);
         let (za, zb) = (f64::from(z0.min(z1)), f64::from(z0.max(z1)) + 1.0);
-        // The mapping keeps each axis to its own pixel axis, so two opposite corners bound the rectangle.
-        let (pxa, pya) = self.pixel_of(xa, za, zoom);
-        let (pxb, pyb) = self.pixel_of(xb, zb, zoom);
-        if !(pxa.is_finite() && pxb.is_finite() && pya.is_finite() && pyb.is_finite()) {
+        // The mapping keeps each axis to its own geographic axis: longitude from x alone, latitude from z alone
+        // (falling with z), so two opposite corners bound the rectangle.
+        let lon_a = self.projection.to_lat_lon_unwrapped(xa, za).lon;
+        let lon_b = self.projection.to_lat_lon_unwrapped(xb, za).lon;
+        let lat_a = self.projection.to_lat_lon_unwrapped(xa, za).lat;
+        let lat_b = self.projection.to_lat_lon_unwrapped(xa, zb).lat;
+        if !(lon_a.is_finite() && lon_b.is_finite() && lat_a.is_finite() && lat_b.is_finite()) {
             return None;
         }
+        let (lon_lo, lon_hi) = (lon_a.min(lon_b), lon_a.max(lon_b));
+        let (lat_lo, lat_hi) = (lat_a.min(lat_b), lat_a.max(lat_b));
         let size = world_pixels(zoom) as i64;
         // A sample at pixel position `p` blends pixels `floor(p - 0.5)` and the next; one more pixel of margin.
-        let first = |p: f64| (p - 0.5).floor() as i64 - 1;
-        let last = |p: f64| (p - 0.5).floor() as i64 + 2;
-        let (west, east) = (first(pxa.min(pxb)), last(pxa.max(pxb)));
-        let xs = if east - west + 1 >= size {
-            vec![(0, size - 1)]
-        } else {
-            let start = west.rem_euclid(size);
-            let end = start + (east - west);
-            if end < size {
-                vec![(start, end)]
+        let first = |p: f64| ((p - 0.5).floor() as i64).saturating_sub(1);
+        let last = |p: f64| ((p - 0.5).floor() as i64).saturating_add(2);
+        let x_intervals = |shift: f64| {
+            let (pa, pb) = (pixel_x(lon_lo + shift, zoom), pixel_x(lon_hi + shift, zoom));
+            let (west, east) = (first(pa.min(pb)), last(pa.max(pb)));
+            if east.saturating_sub(west).saturating_add(1) >= size {
+                vec![(0, size - 1)]
             } else {
-                vec![(start, size - 1), (0, end - size)]
+                let start = west.rem_euclid(size);
+                let end = start + (east - west);
+                if end < size {
+                    vec![(start, end)]
+                } else {
+                    vec![(start, size - 1), (0, end - size)]
+                }
             }
         };
-        let y = (
-            first(pya.min(pyb)).clamp(0, size - 1),
-            last(pya.max(pyb)).clamp(0, size - 1),
-        );
-        Some(Span { xs, y })
+        if lat_hi - lat_lo >= 2.0 * 180.0 {
+            return Some(Span {
+                parts: vec![Part {
+                    xs: vec![(0, size - 1)],
+                    y: (0, size - 1),
+                }],
+                north: true,
+                south: true,
+            });
+        }
+        // Cut the latitude band at the poles: latitudes 90 + 180 k inside it (at most two, as it is under a lap).
+        let mut cuts = vec![lat_lo];
+        let mut pole = 90.0 + 180.0 * (((lat_lo - 90.0) / 180.0).floor() + 1.0);
+        while pole < lat_hi {
+            cuts.push(pole);
+            pole += 180.0;
+        }
+        cuts.push(lat_hi);
+        let mut span = Span {
+            parts: Vec::new(),
+            north: false,
+            south: false,
+        };
+        for cut in cuts.windows(2) {
+            let (low, high) = (cut[0], cut[1]);
+            // Which band between the poles this piece is in: 0 is the globe itself, odd bands are folded.
+            let band = (((low + high) / 2.0 + 90.0) / 180.0).floor();
+            let folded = band != 0.0;
+            let far_side = band.rem_euclid(2.0) == 1.0;
+            let fold = |lat: f64| {
+                if !folded {
+                    return lat;
+                }
+                let r = (lat + 90.0 - band * 180.0).clamp(0.0, 180.0);
+                if far_side { 90.0 - r } else { r - 90.0 }
+            };
+            let (la, lb) = (fold(low), fold(high));
+            let (pya, pyb) = (pixel_y(la, zoom), pixel_y(lb, zoom));
+            if !(pya.is_finite() && pyb.is_finite()) {
+                return None;
+            }
+            span.north |= la > MAX_LATITUDE || lb > MAX_LATITUDE;
+            span.south |= la < -MAX_LATITUDE || lb < -MAX_LATITUDE;
+            span.parts.push(Part {
+                xs: x_intervals(if far_side { 180.0 } else { 0.0 }),
+                y: (
+                    first(pya.min(pyb)).clamp(0, size - 1),
+                    last(pya.max(pyb)).clamp(0, size - 1),
+                ),
+            });
+        }
+        Some(span)
     }
 }
 
@@ -653,7 +782,7 @@ mod tests {
         ];
         let strides = [1, 2, 3, 7, 16, 64, 256];
         let mut seed = 0x5eed_u64;
-        let (mut compared, mut skipped, mut missing_checked) = (0, 0, 0);
+        let (mut compared, mut skipped, mut missing_checked, mut polar_windows) = (0, 0, 0, 0);
         let mut zooms_seen = [false; 16];
         let mut crossed_seam = 0;
         for (rig_no, &(lat0, lon0, scale)) in rigs.iter().enumerate() {
@@ -687,6 +816,20 @@ mod tests {
                     field.surface_ys_strided_reference(x0, z0, width, depth, stride, zoom);
                 let plan = match plan {
                     Ok(plan) => plan,
+                    Err(WindowPlanError::TooManyTiles) => {
+                        // A window that reaches the polar cap has no separable plan: the per-point read answers it.
+                        let reaches_cap = (0..depth).any(|j| {
+                            let z = f64::from(z0) + j as f64 * f64::from(stride) + 0.5;
+                            let lat = field.projection().to_lat_lon_unwrapped(0.0, z).lat;
+                            lat.abs() > crate::projection::MAX_LATITUDE
+                        });
+                        assert!(
+                            reaches_cap,
+                            "rig {rig_no} window {n}: no plan away from the poles"
+                        );
+                        polar_windows += 1;
+                        continue;
+                    }
                     Err(WindowPlanError::Missing(ids)) => {
                         // The reference agrees that something is missing; then load it, if it is not too much.
                         assert_eq!(reference, None, "rig {rig_no} window {n}");
@@ -742,7 +885,7 @@ mod tests {
             }
         }
         eprintln!(
-            "window plan test: {compared} windows equal, {skipped} skipped (too many tiles), {missing_checked} checked while missing, {crossed_seam} across tiles, zooms {:?}",
+            "window plan test: {compared} windows equal, {polar_windows} polar (no plan), {skipped} skipped (too many tiles), {missing_checked} checked while missing, {crossed_seam} across tiles, zooms {:?}",
             zooms_seen
                 .iter()
                 .enumerate()
@@ -967,6 +1110,347 @@ mod tests {
         }
         assert!(seam.field.range(-4, -4, 4, 4, 8).is_some());
         assert_eq!(seam.fetcher.fetch_count(), 4);
+    }
+
+    /// A pole's flatness test terrain: smooth in longitude and latitude, so any jump is the field's own.
+    fn polar_rig(lat0: f64, lon0: f64, scale: f64) -> Rig {
+        build(lat0, lon0, scale, smooth)
+    }
+
+    /// Loads every tile a rectangle needs, so the non-blocking reads can answer.
+    fn load_for(field: &ElevationField, x0: i32, z0: i32, x1: i32, z1: i32, zoom: u8) {
+        for id in field.tiles_for(x0, z0, x1, z1, zoom) {
+            field.store().load_or_sea(id).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_surface_is_finite_and_continuous_over_a_pole() {
+        // 1 km blocks from 80 degrees north: the pole is 1,112 blocks north, and the walk goes on to 4,000.
+        let rig = polar_rig(80.0, 170.0, 1000.0);
+        let zoom = 4;
+        let (mut prev, mut worst, mut in_cap, mut folded): (Option<f64>, f64, usize, usize) =
+            (None, 0.0, 0, 0);
+        for i in 0..=4000 {
+            let z = -f64::from(i);
+            let h = rig
+                .field
+                .height_m_blocking(3.0, z, zoom)
+                .unwrap()
+                .expect("a height");
+            assert!(h.is_finite(), "z {z}: {h}");
+            if let Some(p) = prev {
+                worst = worst.max((f64::from(h) - p).abs());
+            }
+            prev = Some(f64::from(h));
+            let raw = rig.field.projection().to_lat_lon_unwrapped(3.0, z).lat;
+            in_cap += usize::from(raw.abs() > crate::projection::MAX_LATITUDE);
+            folded += usize::from(raw > 90.0);
+        }
+        assert!(
+            in_cap > 500 && folded > 500,
+            "cap {in_cap}, folded {folded}"
+        );
+        // The cap swings at most about 700 m over 550 blocks; no wall, no jump at the pole.
+        assert!(worst < 2.0, "largest step between blocks {worst} m");
+        // At the pole the surface is the pole's mean height, whatever the longitude.
+        let north = rig.field.store().load(POLE_TILE).unwrap().north_edge_mean();
+        let pole_z = -(10.0f64.to_radians() * crate::projection::EARTH_RADIUS_M / 1000.0);
+        for lon_blocks in [-300.0, 0.0, 250.0] {
+            let h = rig
+                .field
+                .height_m_blocking(lon_blocks, pole_z, zoom)
+                .unwrap()
+                .unwrap();
+            assert!((h - north).abs() < 1.0, "{h} at the pole, mean {north}");
+        }
+        // And the same over the south pole.
+        let south_rig = polar_rig(-80.0, -100.0, 1000.0);
+        let south = south_rig
+            .field
+            .store()
+            .load(POLE_TILE)
+            .unwrap()
+            .south_edge_mean();
+        let h = south_rig
+            .field
+            .height_m_blocking(40.0, -pole_z, zoom)
+            .unwrap()
+            .unwrap();
+        assert!(
+            (h - south).abs() < 1.0,
+            "{h} at the south pole, mean {south}"
+        );
+        let mut prev: Option<f64> = None;
+        let mut worst = 0.0f64;
+        for i in 0..=4000 {
+            let h = south_rig
+                .field
+                .height_m_blocking(3.0, f64::from(i), zoom)
+                .unwrap()
+                .unwrap();
+            assert!(h.is_finite());
+            if let Some(p) = prev {
+                worst = worst.max((f64::from(h) - p).abs());
+            }
+            prev = Some(f64::from(h));
+        }
+        assert!(worst < 2.0, "largest step over the south pole {worst} m");
+    }
+
+    #[test]
+    fn the_surface_is_continuous_across_the_antimeridian_inside_the_polar_cap() {
+        // 1 km blocks from 85 degrees north; 20 blocks north of that is inside the cap, where a block is 0.1 degrees
+        // of longitude, so a walk east goes round the pole's circle in a few thousand blocks.
+        let rig = polar_rig(85.0, 179.0, 1000.0);
+        let zoom = 4;
+        let (mut prev, mut worst, mut crossed): (Option<f64>, f64, bool) = (None, 0.0, false);
+        for i in -1500..=2500 {
+            let x = f64::from(i);
+            let h = rig
+                .field
+                .height_m_blocking(x, -20.0, zoom)
+                .unwrap()
+                .unwrap();
+            assert!(h.is_finite());
+            if let Some(p) = prev {
+                worst = worst.max((f64::from(h) - p).abs());
+            }
+            prev = Some(f64::from(h));
+            let lon = rig.field.projection().to_lat_lon_unwrapped(x, -20.0).lon;
+            crossed |= lon > 180.0;
+        }
+        assert!(crossed);
+        assert!(worst < 1.0, "largest step between blocks {worst} m");
+    }
+
+    #[test]
+    fn every_read_path_agrees_near_a_pole_and_across_the_antimeridian() {
+        use crate::window::WindowPlanError;
+        // (origin lat, origin lon, metres per block, x0, z0, stride, zoom, samples per side)
+        let cases: [(f64, f64, f64, i32, i32, i32, u8, usize); 7] = [
+            // Folded past the north pole, a little past the Mercator limit, across the antimeridian.
+            (84.0, 179.9, 500.0, -5, -2400, 1, 5, 16),
+            // Straddling the pole itself.
+            (84.0, 179.9, 500.0, -8, -1334 - 8, 1, 5, 16),
+            // Strided over the pole and the antimeridian: a far node of the octree.
+            (84.0, 179.9, 500.0, -300, -1500, 37, 5, 16),
+            // The south pole.
+            (-84.0, -179.95, 500.0, -100, 1326, 1, 5, 16),
+            // Inside the cap, not folded.
+            (84.9, 10.0, 2000.0, -50, -30, 3, 6, 12),
+            // Whole laps of both axes: 20 km blocks, 4,000 km between samples.
+            (60.0, 100.0, 20_000.0, -3000, -1000, 200, 3, 16),
+            // No pole at all: the fast path must still be taken and agree.
+            (10.0, 179.99, 50.0, -500, -40, 25, 9, 16),
+        ];
+        for (case, &(lat0, lon0, scale, x0, z0, stride, zoom, n)) in cases.iter().enumerate() {
+            let rig = polar_rig(lat0, lon0, scale);
+            let field = &rig.field;
+            let (last_x, last_z) = (x0 + stride * (n as i32 - 1), z0 + stride * (n as i32 - 1));
+            // Nothing is local yet: no answer, whichever way it is asked.
+            assert_eq!(field.surface_ys_strided(x0, z0, n, n, stride, zoom), None);
+            assert_eq!(field.range(x0, z0, last_x, last_z, zoom), None);
+            let ids = field.tiles_for(x0, z0, last_x, last_z, zoom);
+            let side = 1usize << zoom;
+            assert!(
+                ids.iter().filter(|id| id.z == zoom).count() <= side * side,
+                "case {case}: {} tiles",
+                ids.len()
+            );
+            let polar = (0..n).any(|j| {
+                let z = f64::from(z0) + (j as f64) * f64::from(stride) + 0.5;
+                field.projection().to_lat_lon_unwrapped(0.0, z).lat.abs()
+                    > crate::projection::MAX_LATITUDE
+            });
+            assert_eq!(
+                ids.contains(&POLE_TILE),
+                polar,
+                "case {case}: the pole tile is listed exactly when the cap is read"
+            );
+            for id in ids {
+                field.store().load(id).unwrap();
+            }
+            // The separable plan exists away from the poles, and is declined at them.
+            match field.window_plan(x0, z0, n, n, stride, zoom) {
+                Ok(_) => assert!(!polar, "case {case}: plan across a pole"),
+                Err(WindowPlanError::TooManyTiles) => assert!(polar, "case {case}"),
+                Err(e) => panic!("case {case}: {e:?}"),
+            }
+            let strided = field
+                .surface_ys_strided(x0, z0, n, n, stride, zoom)
+                .unwrap_or_else(|| panic!("case {case}: strided read has no answer"));
+            let heights = field
+                .heights_strided_reference(x0, z0, n, n, stride, zoom)
+                .unwrap();
+            let (lo, hi) = field.range(x0, z0, last_x, last_z, zoom).unwrap();
+            assert!(lo <= hi);
+            for j in 0..n {
+                for i in 0..n {
+                    let (x, z) = (x0 + i as i32 * stride, z0 + j as i32 * stride);
+                    let point = field
+                        .height_m(f64::from(x) + 0.5, f64::from(z) + 0.5, zoom)
+                        .unwrap();
+                    assert!(point.is_finite(), "case {case}: {x},{z}");
+                    assert_eq!(
+                        point.to_bits(),
+                        heights[j * n + i].to_bits(),
+                        "case {case}: {x},{z}"
+                    );
+                    assert_eq!(Some(strided[j * n + i]), field.surface_y(x, z, zoom));
+                    assert_eq!(strided[j * n + i], field.block_y_of(point));
+                    assert!(
+                        lo <= point && point <= hi,
+                        "case {case}: {point} outside {lo}..{hi}"
+                    );
+                }
+            }
+            if stride == 1 {
+                let batch = field.heights_m(x0, z0, n, n, zoom).unwrap();
+                assert_eq!(
+                    batch.iter().map(|h| h.to_bits()).collect::<Vec<_>>(),
+                    heights.iter().map(|h| h.to_bits()).collect::<Vec<_>>(),
+                    "case {case}"
+                );
+                assert_eq!(field.surface_ys(x0, z0, n, n, zoom).unwrap(), strided);
+            }
+        }
+    }
+
+    #[test]
+    fn a_rectangle_wider_than_a_lap_lists_each_tile_once_and_reads_finite_heights() {
+        let rig = polar_rig(60.0, 20.0, 1000.0);
+        let field = &rig.field;
+        // A lap of longitude at 60 degrees is 20,037 blocks of 1 km: this rectangle is seven laps wide.
+        let lap = 2.0 * std::f64::consts::PI * crate::projection::EARTH_RADIUS_M * 0.5 / 1000.0;
+        assert!((lap - 20_037.5).abs() < 1.0);
+        for zoom in [0u8, 1, 2, 3] {
+            let ids = field.tiles_for(-70_000, -3_000, 70_000, 3_000, zoom);
+            let side = 1usize << zoom;
+            let of_zoom: Vec<_> = ids.iter().filter(|id| id.z == zoom).collect();
+            assert!(
+                of_zoom.len() <= side * side,
+                "zoom {zoom}: {} tiles",
+                of_zoom.len()
+            );
+            assert!(ids.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
+            // Every column of the world is read, once.
+            let mut columns: Vec<u32> = of_zoom.iter().map(|id| id.x).collect();
+            columns.sort_unstable();
+            columns.dedup();
+            assert_eq!(columns.len(), side, "zoom {zoom}");
+            // 54 degrees of latitude from 33 to 87 reach the north cap.
+            assert!(ids.contains(&POLE_TILE), "zoom {zoom}");
+        }
+        // Taller than a lap of latitude: the whole world once.
+        let all = field.tiles_for(-100, -80_000, 100, 80_000, 2);
+        assert_eq!(all.iter().filter(|id| id.z == 2).count(), 16);
+        // Heights across the laps are finite, bounded by the range, and periodic in longitude.
+        let (lo, hi) = field
+            .range_blocking(-70_000, -3_000, 70_000, 3_000, 3)
+            .unwrap()
+            .unwrap();
+        assert!(lo.is_finite() && hi.is_finite() && lo <= hi);
+        for i in 0..40 {
+            let x = -70_000.0 + f64::from(i) * 3_511.0;
+            let z = -2_500.0 + f64::from(i) * 120.0;
+            let h = field.height_m_blocking(x, z, 3).unwrap().unwrap();
+            assert!(h.is_finite() && lo <= h && h <= hi, "{h} at {x},{z}");
+            let again = field.height_m_blocking(x + lap, z, 3).unwrap().unwrap();
+            assert!((h - again).abs() < 0.05, "a lap on: {h} vs {again}");
+        }
+        // A strided window of seven laps and of 900 degrees of latitude is finite and equals the point reads.
+        let (x0, z0, stride, n) = (-60_000, -40_000, 9_000, 16);
+        load_for(
+            field,
+            x0,
+            z0,
+            x0 + stride * (n as i32 - 1),
+            z0 + stride * (n as i32 - 1),
+            2,
+        );
+        let ys = field.surface_ys_strided(x0, z0, n, n, stride, 2).unwrap();
+        for j in 0..n {
+            for i in 0..n {
+                let (x, z) = (x0 + i as i32 * stride, z0 + j as i32 * stride);
+                assert_eq!(Some(ys[j * n + i]), field.surface_y(x, z, 2), "{x},{z}");
+            }
+        }
+        // A row window seven laps wide still plans (its row has no pole) and equals the point reads bit for bit.
+        load_for(field, -70_000, 0, 65_000, 0, 3);
+        let plan = field
+            .window_plan(-70_000, 0, 16, 1, 9_000, 3)
+            .expect("a plan across laps");
+        let want = field
+            .heights_strided_reference(-70_000, 0, 16, 1, 9_000, 3)
+            .unwrap();
+        let got = plan.heights_m();
+        assert_eq!(
+            got.iter().map(|h| h.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|h| h.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(got.iter().all(|h| h.is_finite()));
+    }
+
+    #[test]
+    fn block_coordinates_up_to_two_to_the_thirty_do_not_overflow() {
+        let far = 1i32 << 30;
+        for (lat0, lon0, scale) in [
+            (60.0, 20.0, 1.0),
+            (0.0, 0.0, 1.0),
+            (84.9, 179.9, 100.0),
+            (-60.0, -170.0, 0.5),
+        ] {
+            let rig = polar_rig(lat0, lon0, scale);
+            let field = &rig.field;
+            for &(x, z) in &[
+                (far, far),
+                (-far, far),
+                (far, -far),
+                (-far, -far),
+                (i32::MAX, i32::MIN),
+                (i32::MIN, i32::MAX),
+                (0, far),
+                (far, 0),
+            ] {
+                let h = field
+                    .height_m_blocking(f64::from(x) + 0.5, f64::from(z) + 0.5, 2)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{lat0}: no height at {x},{z}"));
+                assert!(h.is_finite(), "{h} at {x},{z}");
+                assert_eq!(
+                    field.surface_y_blocking(x, z, 2).unwrap(),
+                    Some(field.block_y_of(h))
+                );
+                // A node-sized rectangle (2^26 blocks) around the point, clamped to i32.
+                let half = 1i32 << 25;
+                let (xa, xb) = (x.saturating_sub(half), x.saturating_add(half));
+                let (za, zb) = (z.saturating_sub(half), z.saturating_add(half));
+                let (lo, hi) = field
+                    .range_blocking(xa, za, xb, zb, 2)
+                    .unwrap()
+                    .expect("a range");
+                assert!(lo.is_finite() && hi.is_finite() && lo <= hi);
+                let ids = field.tiles_for(xa, za, xb, zb, 2);
+                assert!(ids.iter().filter(|id| id.z == 2).count() <= 16);
+                assert!(ids.iter().all(|id| id.validate().is_ok()));
+                // A strided far node window of 16 by 16 samples 2^26 blocks apart.
+                let (x0, z0) = (
+                    x.clamp(-far, far - 16 * (1 << 26)),
+                    z.clamp(-far, far - 16 * (1 << 26)),
+                );
+                load_for(field, x0, z0, x0 + 15 * (1 << 26), z0 + 15 * (1 << 26), 2);
+                let ys = field
+                    .surface_ys_strided(x0, z0, 16, 16, 1 << 26, 2)
+                    .expect("a strided window");
+                assert_eq!(ys.len(), 256);
+                let (i, j) = (3, 11);
+                assert_eq!(
+                    Some(ys[j * 16 + i]),
+                    field.surface_y(x0 + i as i32 * (1 << 26), z0 + j as i32 * (1 << 26), 2)
+                );
+            }
+        }
     }
 
     #[test]

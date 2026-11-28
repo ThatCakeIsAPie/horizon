@@ -791,7 +791,7 @@ impl ClimateField {
     /// The climate at the world point `(x, z)` (fractional blocks; add 0.5 for a block's centre), read at the
     /// overview level that suits `metres_per_sample` of ground. See [`ClimateStore::lookup`].
     pub fn climate_at(&self, x: f64, z: f64, metres_per_sample: f64) -> ClimateLookup {
-        let at = self.projection.to_lat_lon(x, z);
+        let at = self.projection.to_lat_lon_flat(x, z);
         self.store.lookup(at.lat, at.lon, metres_per_sample)
     }
 
