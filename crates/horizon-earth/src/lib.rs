@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod clean;
+pub mod coarse;
 pub mod climate;
 pub mod climatefield;
 pub mod climatesource;
@@ -48,6 +49,7 @@ pub mod window;
 pub use climate::{CLIMATE_RULES, Climate, ClimateVar};
 pub use climatefield::{ClimateFetch, ClimateField, ClimateGrid, ClimateLookup, ClimateStore};
 pub use climatesource::{ClimateFetcher, ClimateSource};
+pub use coarse::{COARSE_PREFETCH_ZOOM, SEA_MASK_ZOOM, SeaMask, coarse_class, coarse_tiles};
 pub use height::ElevationField;
 pub use landcover::{LAND_COVER_RULES, LandClass, WorldCoverFile};
 pub use landfield::gpu::{

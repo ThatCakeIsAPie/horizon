@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use horizon_earth::{Fetch, LandClass, TileId};
 
+use super::biome::Biome;
 use super::far_trees::ColumnsDecor;
 use super::generator::{Access, EarthGenerator, Gap, NotReady, Rect, node_box};
 use super::surface::SurfaceKind;
@@ -54,6 +55,9 @@ pub struct NodeColumns {
     pub(super) classes: Option<Vec<LandClass>>,
     /// Trees and snow over the columns, once [`EarthGenerator::decorate_columns`] has made them.
     pub(super) decor: Option<Box<ColumnsDecor>>,
+    /// The biome of each column, made with the columns on the coarse path ([`super::coarse`]); `None` on the
+    /// others, whose biomes are read from the map.
+    pub(super) coarse_biomes: Option<Vec<Biome>>,
 }
 
 impl NodeColumns {
@@ -65,6 +69,34 @@ impl NodeColumns {
     /// The land class of column `i`; `None` without land cover.
     pub fn class(&self, i: usize) -> Option<LandClass> {
         self.classes.as_ref().map(|c| c[i])
+    }
+
+    /// The biome of column `i` when the columns came from the coarse path ([`super::coarse`]); `None` on the
+    /// others.
+    pub fn coarse_biome(&self, i: usize) -> Option<Biome> {
+        self.coarse_biomes.as_ref().map(|b| b[i])
+    }
+
+    /// Columns of the coarse path, with their classes and biomes.
+    pub(super) fn coarse(
+        step: i32,
+        width: usize,
+        origin: [i32; 2],
+        surfaces: Vec<i32>,
+        kinds: Vec<SurfaceKind>,
+        classes: Vec<LandClass>,
+        biomes: Vec<Biome>,
+    ) -> Self {
+        Self {
+            step,
+            width,
+            origin,
+            surfaces,
+            kinds,
+            classes: Some(classes),
+            decor: None,
+            coarse_biomes: Some(biomes),
+        }
     }
 
     /// The block `(x, z)` column `i` is sampled at.
@@ -138,6 +170,10 @@ impl EarthGenerator {
         zoom_step: i32,
     ) -> Result<NodeColumns, NotReady> {
         let stride = stride.max(1);
+        // Voxels kilometres wide read the coarse global set, never the fine data.
+        if self.is_coarse_step(stride) && self.is_coarse_step(zoom_step) {
+            return self.columns_coarse(x0, z0, width, stride);
+        }
         let (sx, sz) = (x0.saturating_add(stride / 2), z0.saturating_add(stride / 2));
         let zoom = self.zoom_for_step(zoom_step);
         let span = (width as i32 - 1) * stride;
@@ -196,6 +232,7 @@ impl EarthGenerator {
             kinds,
             classes,
             decor: None,
+            coarse_biomes: None,
         })
     }
 
@@ -244,6 +281,7 @@ impl EarthGenerator {
                 kinds,
                 classes,
                 decor: None,
+                coarse_biomes: None,
             })
         })
     }

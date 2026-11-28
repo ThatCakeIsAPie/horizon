@@ -137,7 +137,7 @@ fn a_node_is_what_the_generator_gives_voxel_by_voxel_and_its_cover_is_ground_ove
             .unwrap();
         for y in s_mid.div_euclid(side) - 2..=s_mid.div_euclid(side) + 3 {
             let key = CubeKey::new(level, x, y, 0);
-            let made = node(g, key, AIR, &biome, &kind, FarDecor::default()).unwrap();
+            let made = node(g, key, AIR, &biome, &|_| 0u16, &kind, FarDecor::default()).unwrap();
             let o = key.origin();
             for i in (0..4096).step_by(5) {
                 let (vx, vy, vz) = ((i & 15) as i32, (i >> 8) as i32, (i >> 4 & 15) as i32);
@@ -198,7 +198,7 @@ fn the_sea_ends_on_the_top_of_its_node_at_every_level() {
         let x = -3000 / side - 1;
         rig.load(u32::from(level), x, 0);
         let key = CubeKey::new(level, x, -1, 0);
-        let made = node(g, key, AIR, &biome, &kind, FarDecor::default()).unwrap();
+        let made = node(g, key, AIR, &biome, &|_| 0u16, &kind, FarDecor::default()).unwrap();
         let tops = fluid_tops(&made, &water_surfaces(g, &surfaces(g, key).unwrap()), fluid);
         let made = made.with_fluid_tops(tops);
         let mut sea = 0;
@@ -216,9 +216,12 @@ fn the_sea_ends_on_the_top_of_its_node_at_every_level() {
         }
         assert_eq!(sea, 256, "level {level}: open sea");
         let under = CubeKey::new(level, x, -2, 0);
-        let deep = node(g, under, AIR, &biome, &kind, FarDecor::default()).unwrap();
+        let deep = node(g, under, AIR, &biome, &|_| 0u16, &kind, FarDecor::default()).unwrap();
         let surfaces = water_surfaces(g, &surfaces(g, under).unwrap());
-        assert!(fluid_tops(&deep, &surfaces, fluid).is_none(), "level {level}");
+        assert!(
+            fluid_tops(&deep, &surfaces, fluid).is_none(),
+            "level {level}"
+        );
     }
 }
 
@@ -233,7 +236,7 @@ fn a_node_whose_tile_is_missing_is_not_ready_and_names_the_tile() {
         CubeKey::new(1, 3, 0, 3),
         CubeKey::new(4, 2, 1, -1),
     ] {
-        let missing = node(g, key, AIR, &biome, &kind, FarDecor::default()).unwrap_err();
+        let missing = node(g, key, AIR, &biome, &|_| 0u16, &kind, FarDecor::default()).unwrap_err();
         assert!(!missing.tiles.is_empty(), "{key:?}");
         assert!(class(g, key, FarDecor::default()).is_ok() || key.level >= 2);
         let missing = cover(g, key).err();
@@ -292,7 +295,7 @@ fn with_land_cover_a_node_is_later_until_its_class_is_held_and_then_shows_the_cl
     let key = CubeKey::new(level, x, s_mid(&g).div_euclid(side), 0);
     // The biomes read a coarse elevation zoom of their own: have those tiles too, so that only land cover lacks.
     let err = loop {
-        match node(&g, key, AIR, &biome, &kind, FarDecor::default()) {
+        match node(&g, key, AIR, &biome, &|_| 0u16, &kind, FarDecor::default()) {
             Err(e) if !e.tiles.is_empty() => {
                 for t in e.tiles {
                     store.load(t).unwrap();
@@ -313,7 +316,7 @@ fn with_land_cover_a_node_is_later_until_its_class_is_held_and_then_shows_the_cl
         for fetch in asked.drain(..) {
             source.satisfy(&fetch).unwrap();
         }
-        match node(&g, key, AIR, &biome, &kind, FarDecor::default()) {
+        match node(&g, key, AIR, &biome, &|_| 0u16, &kind, FarDecor::default()) {
             Ok(n) => {
                 made = Some(n);
                 break;
@@ -346,7 +349,16 @@ fn with_land_cover_a_node_is_later_until_its_class_is_held_and_then_shows_the_cl
     let mut off = settings.clone();
     off.land_cover = false;
     let plain = EarthGenerator::new(&off, store.clone(), blocks).unwrap();
-    let plain_node = node(&plain, key, AIR, &biome, &kind, FarDecor::default()).unwrap();
+    let plain_node = node(
+        &plain,
+        key,
+        AIR,
+        &biome,
+        &|_| 0u16,
+        &kind,
+        FarDecor::default(),
+    )
+    .unwrap();
     assert!((0..4096).any(|i| plain_node.at(i).state.0 == blocks.grass_block));
     // The sky cover reads heights only: it is ready without any land cover.
     let fresh = EarthGenerator::new(&settings, store.clone(), blocks)
@@ -537,7 +549,10 @@ fn far_nodes_over_tree_cover_get_trees_and_a_node_just_over_the_ground_is_not_sk
             land = land.with_classes(file, 192, 96, 2, move |_, _| class);
         }
         let source = settings
-            .land_cover_source(Arc::new(LandCoverStore::new(land_dir.path(), 16)), Arc::new(land))
+            .land_cover_source(
+                Arc::new(LandCoverStore::new(land_dir.path(), 16)),
+                Arc::new(land),
+            )
             .unwrap();
         let blocks = EarthBlocks::from_registry(default_registry()).unwrap();
         let g = EarthGenerator::new(&settings, store.clone(), blocks)
@@ -555,7 +570,7 @@ fn far_nodes_over_tree_cover_get_trees_and_a_node_just_over_the_ground_is_not_sk
     let build = |class: u8, key: CubeKey, decor: FarDecor| {
         let (g, store, source, blocks, _dirs) = rig_of(class);
         for _ in 0..80 {
-            match node(&g, key, AIR, &biome, &kind, decor) {
+            match node(&g, key, AIR, &biome, &|_| 0u16, &kind, decor) {
                 Ok(n) => return (n, blocks),
                 Err(missing) => {
                     for t in missing.tiles {
@@ -571,7 +586,9 @@ fn far_nodes_over_tree_cover_get_trees_and_a_node_just_over_the_ground_is_not_sk
     };
     let count = |n: &CubeNode, blocks: &EarthBlocks, ids: &[u32]| {
         let _ = blocks;
-        (0..4096).filter(|&i| ids.contains(&n.at(i).state.0)).count()
+        (0..4096)
+            .filter(|&i| ids.contains(&n.at(i).state.0))
+            .count()
     };
     // The slope 500 m east of the coast (the spire is further out): ground at about 200 blocks.
     let (g, ..) = rig_of(10);
@@ -598,7 +615,11 @@ fn far_nodes_over_tree_cover_get_trees_and_a_node_just_over_the_ground_is_not_sk
     let (n, blocks) = build(10, key0, FarDecor::default());
     assert_eq!(count(&n, &blocks, &leaves) + count(&n, &blocks, &logs), 0);
     let (n, blocks) = build(40, key0, trees);
-    assert_eq!(count(&n, &blocks, &leaves) + count(&n, &blocks, &logs), 0, "trees on farmland");
+    assert_eq!(
+        count(&n, &blocks, &leaves) + count(&n, &blocks, &logs),
+        0,
+        "trees on farmland"
+    );
     // Level 3: the voxels of the canopy.
     let s3 = ground_y(3, 500 / 128);
     let key3 = CubeKey::new(3, 500 / 128, s3.div_euclid(128), 0);
@@ -632,7 +653,11 @@ fn far_nodes_over_tree_cover_get_trees_and_a_node_just_over_the_ground_is_not_sk
     );
     assert!(probe.contains(&(NodeClass::Air, NodeClass::Air)));
     // Trees only ever take away sky.
-    assert!(probe.iter().all(|&(p, t)| p != NodeClass::Mixed || t == NodeClass::Mixed));
+    assert!(
+        probe
+            .iter()
+            .all(|&(p, t)| p != NodeClass::Mixed || t == NodeClass::Mixed)
+    );
 }
 
 /// The far view's water tops (`CubeNode::fluid_tops`) over the sea of the test terrain, through the sampler, on
@@ -718,7 +743,10 @@ mod water_tops {
         // Level 0: the saved cube itself. Its tiles missing, it is later (and they are asked for), not drawn
         // without tops.
         assert!(e.sampler.node(key0).is_none());
-        assert!(!earth.take_requests().is_empty(), "the tiles were asked for");
+        assert!(
+            !earth.take_requests().is_empty(),
+            "the tiles were asked for"
+        );
         let (node, laters) = when_ready(&level, || e.sampler.node(key0));
         assert!(laters > 0);
         // Its voxels are the saved ones (stone floor, water over it), its tops the sea's.
@@ -803,7 +831,14 @@ mod water_tops {
         let biome = |x: i32, z: i32| level.biome_id_at(x, z);
         for key in [CubeKey::new(0, -190, -1, 0), CubeKey::new(1, -100, -1, 0)] {
             let (node, _) = when_ready(&level, || {
-                let made = from_surfaces(earth, key, e.sampler.air, &biome, FarDecor::default());
+                let made = from_surfaces(
+                    earth,
+                    key,
+                    e.sampler.air,
+                    &biome,
+                    &|_| 0u16,
+                    FarDecor::default(),
+                );
                 match made {
                     Ok(node) => e.sampler.earth_covered(key, node),
                     Err(missing) => {
@@ -844,7 +879,10 @@ fn a_cover_proven_from_the_bounds_is_the_cover_its_columns_give_and_every_rock_n
                     rock += usize::from(is_rock && level >= 2);
                     let Some(mask) = proven_cover(g, key) else {
                         // Level 1's rock is classed at its own zoom, its cover proven at a block's.
-                        assert!(!is_rock || level == 1, "{key:?} is rock but its cover is not proven");
+                        assert!(
+                            !is_rock || level == 1,
+                            "{key:?} is rock but its cover is not proven"
+                        );
                         continue;
                     };
                     proven += 1;
@@ -855,4 +893,107 @@ fn a_cover_proven_from_the_bounds_is_the_cover_its_columns_give_and_every_rock_n
         }
     }
     assert!(rock > 50 && proven >= rock, "{proven} {rock}");
+}
+
+/// A coarse node (voxels of 8,192 m) takes its biomes from the coarse columns by name and never calls the
+/// blocking biome closure (which would read land cover at 500 m and fetch); its water tops are the fine path's.
+#[test]
+fn a_coarse_node_takes_its_biomes_from_its_columns_never_the_blocking_closure_and_keeps_its_water_tops()
+ {
+    use horizon_earth::testing::MemoryLandCover;
+    use horizon_earth::{LandCoverStore, WorldCoverFile};
+
+    // A deep sea west of the meridian, a plateau east of it.
+    let coast = |_: f64, lon: f64| if lon < LON0 { -3000.0 } else { 800.0 };
+    let mut settings = EarthSettings::at(LAT0, LON0);
+    settings.metres_per_block = 1024.0;
+    settings.land_cover = true;
+    let dir = TempDir::new();
+    let land_dir = TempDir::new();
+    let store = Arc::new(TileStore::new(
+        dir.path(),
+        Arc::new(MemoryFetcher::new(coast)),
+        512,
+    ));
+    let file = WorldCoverFile::containing(LAT0, LON0).unwrap();
+    let land = MemoryLandCover::new().with_classes(file, 192, 96, 2, |_, _| 30);
+    let source = settings
+        .land_cover_source(
+            Arc::new(LandCoverStore::new(land_dir.path(), 16)),
+            Arc::new(land),
+        )
+        .unwrap();
+    let blocks = EarthBlocks::from_registry(default_registry()).unwrap();
+    let g = EarthGenerator::new(&settings, store.clone(), blocks)
+        .unwrap()
+        .with_land_cover(source);
+    assert!(
+        g.is_coarse_step(8),
+        "voxels of 8 blocks of 1,024 m are coarse"
+    );
+    for id in g.coarse_tiles_missing((0, 0)) {
+        store.load(id).unwrap();
+    }
+    g.prepare_coarse().unwrap();
+
+    let blocking =
+        |_: i32, _: i32| -> u16 { panic!("a coarse node called the blocking biome closure") };
+    let by_name = |name: &str| name.bytes().map(u16::from).sum::<u16>() + 7;
+    let water = state(&blocks, blocks.water);
+    let kind = move |s: BlockStateId| match s.0 {
+        AIR => Kind::Air,
+        s if s == water => Kind::Fluid,
+        _ => Kind::Solid,
+    };
+    let fluid = |s: BlockStateId| kind(s) == Kind::Fluid;
+    let level = 3u8;
+    let side = 16 << level;
+    let columns = g.node_columns(u32::from(level), -2, 0).unwrap();
+    let expected = |i: usize| by_name(columns.coarse_biome(i).expect("a coarse biome").name());
+
+    // Out at sea: the node whose top voxel is the sea, and the water ends on its top.
+    let key = CubeKey::new(level, -2, -1, 0);
+    let made = from_surfaces(&g, key, AIR, &blocking, &by_name, FarDecor::default()).unwrap();
+    let tops = fluid_tops(
+        &made,
+        &water_surfaces(&g, &surfaces(&g, key).unwrap()),
+        fluid,
+    );
+    let made = made.with_fluid_tops(tops);
+    for z in 0..16 {
+        for x in 0..16 {
+            assert_eq!(made.get(x, 15, z).state.0, water, "column {x},{z}");
+            assert_eq!(made.fluid_top(x, z), Some(side as f32), "column {x},{z}");
+            for y in 0..16 {
+                assert_eq!(
+                    made.get(x, y, z).biome,
+                    expected(z << 4 | x),
+                    "voxel {x},{y},{z}"
+                );
+            }
+        }
+    }
+    // `node` (the way the far view asks) is the same node, also without the blocking closure.
+    let again = node(
+        &g,
+        key,
+        AIR,
+        &blocking,
+        &by_name,
+        &kind,
+        FarDecor::default(),
+    )
+    .unwrap();
+    assert_eq!(again.at(4095), made.at(4095));
+
+    // Uniform nodes (the sky over the sea, the rock under it) carry a coarse biome too.
+    for y in [0, -3] {
+        let key = CubeKey::new(level, -2, y, 0);
+        let uniform =
+            from_surfaces(&g, key, AIR, &blocking, &by_name, FarDecor::default()).unwrap();
+        let v = uniform
+            .as_uniform()
+            .unwrap_or_else(|| panic!("{key:?} is not uniform"));
+        assert_eq!(v.biome, expected(0), "{key:?}");
+    }
 }

@@ -973,7 +973,7 @@ impl LandCoverField {
     /// rounded (see [`LandCoverField`]). The store's [`LandCoverStore::lookup`] is the same read without either.
     pub fn class_at(&self, x: f64, z: f64, metres_per_sample: f64) -> Lookup {
         let (x, z) = self.warped(x, z, metres_per_sample);
-        let at = self.projection.to_lat_lon(x, z);
+        let at = self.projection.to_lat_lon_flat(x, z);
         self.store.lookup_smooth(at.lat, at.lon, metres_per_sample)
     }
 

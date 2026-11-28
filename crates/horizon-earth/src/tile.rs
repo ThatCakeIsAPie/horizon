@@ -150,6 +150,8 @@ pub struct Tile {
     max: f32,
     cell_min: [f32; GRID * GRID],
     cell_max: [f32; GRID * GRID],
+    north_mean: f32,
+    south_mean: f32,
     repaired: usize,
 }
 
@@ -209,12 +211,18 @@ impl Tile {
         }
         let min = cell_min.iter().copied().fold(f32::INFINITY, f32::min);
         let max = cell_max.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let edge_mean =
+            |row: &[f32]| (row.iter().map(|&h| f64::from(h)).sum::<f64>() / side as f64) as f32;
+        let north_mean = edge_mean(&heights[..side]);
+        let south_mean = edge_mean(&heights[heights.len() - side..]);
         Self {
             heights,
             min,
             max,
             cell_min,
             cell_max,
+            north_mean,
+            south_mean,
             repaired: 0,
         }
     }
@@ -234,6 +242,17 @@ impl Tile {
             "pixel ({px}, {py}) is outside the tile"
         );
         self.heights[py * TILE_SIZE as usize + px]
+    }
+
+    /// The mean height in metres of the tile's northern edge row (row 0). For the zoom 0 tile this is the mean
+    /// around the world at the northern Mercator limit, which the elevation field blends to at the north pole.
+    pub fn north_edge_mean(&self) -> f32 {
+        self.north_mean
+    }
+
+    /// The mean height in metres of the tile's southern edge row (row 255), see [`Tile::north_edge_mean`].
+    pub fn south_edge_mean(&self) -> f32 {
+        self.south_mean
     }
 
     /// The lowest height in the tile, in metres.
@@ -433,6 +452,16 @@ mod tests {
             Err(TileError::Png(_))
         ));
         assert!(matches!(Tile::decode(&[], 0), Err(TileError::Png(_))));
+    }
+
+    #[test]
+    fn a_tile_knows_the_mean_of_its_north_and_south_edge_rows() {
+        let tile = tile_from(|x, y| x as f64 * 0.5 + y as f64 * 0.25);
+        // Row 0 is 0..127.5 by halves, mean 63.75; row 255 adds 63.75.
+        assert_eq!(tile.north_edge_mean(), 63.75);
+        assert_eq!(tile.south_edge_mean(), 127.5);
+        assert_eq!(Tile::flat(12.5).north_edge_mean(), 12.5);
+        assert_eq!(Tile::flat(-3.0).south_edge_mean(), -3.0);
     }
 
     #[test]

@@ -810,7 +810,8 @@ impl EarthGenerator {
     /// loading anything. When not, what is missing is requested like any other read's. A far view calls this
     /// before it asks for the biomes of a node, so it never waits for them.
     pub fn biomes_ready(&self, x0: i32, z0: i32, stride: i32) -> Result<(), NotReady> {
-        if self.land_source().is_none() {
+        // Coarse columns carry their own biomes ([`super::coarse`]).
+        if self.land_source().is_none() || self.is_coarse_step(stride) {
             return Ok(());
         }
         let stride = stride.max(1);

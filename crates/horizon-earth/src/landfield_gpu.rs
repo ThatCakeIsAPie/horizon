@@ -530,7 +530,7 @@ impl LandCoverField {
 }
 
 impl ClassWindowPlan {
-    /// `(lat, lon)` of the warped world point `(x, z)`: [`crate::projection::Projection::to_lat_lon`] from the
+    /// `(lat, lon)` of the warped world point `(x, z)`: [`crate::projection::Projection::to_lat_lon_flat`] from the
     /// plan's numbers (longitude wrapped into `[-180, 180)`).
     pub fn lat_lon(&self, x: f64, z: f64) -> (f64, f64) {
         let east = x * self.metres_per_block;
@@ -987,7 +987,7 @@ mod tests {
             for _ in 0..2000 {
                 let scale = [100.0, 1e4, 1e6][rng.below(3) as usize];
                 let (x, z) = ((rng.unit() - 0.5) * scale, (rng.unit() - 0.5) * scale);
-                let at = f.projection().to_lat_lon(x, z);
+                let at = f.projection().to_lat_lon_flat(x, z);
                 let (lat, lon) = plan.lat_lon(x, z);
                 assert_eq!(lat.to_bits(), at.lat.to_bits(), "{lat0} {lon0} {x} {z}");
                 assert_eq!(lon.to_bits(), at.lon.to_bits(), "{lat0} {lon0} {x} {z}");

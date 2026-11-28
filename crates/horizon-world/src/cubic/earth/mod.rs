@@ -21,6 +21,9 @@
 
 pub mod biome;
 pub mod blocking;
+pub mod coarse;
+#[cfg(test)]
+mod coarse_tests;
 #[cfg(test)]
 mod climate_tests;
 pub mod cover;

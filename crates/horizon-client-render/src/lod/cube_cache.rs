@@ -60,7 +60,8 @@ const _: () = assert!(MAX_CACHED_LEVEL <= MAX_CUBE_LEVEL);
 /// A world's cache size when `HORIZON_FAR_DISK_MB` does not say.
 pub const DEFAULT_CAP_MB: u64 = 1024;
 /// 5: levels 15 to 22 are stored too (4 stopped at 14, and its coarser
-/// parents were never written).
+/// parents were never written), and the coarse far levels (voxels of 4 km and up) read the
+/// whole-world coarse set, not WorldCover, so their nodes differ.
 const FORMAT: u32 = 5;
 const FINGERPRINT: &str = "fingerprint.txt";
 /// Nodes along one side of a bucket file.

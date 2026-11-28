@@ -235,16 +235,34 @@ pub(super) fn fluid_tops(
     any.then_some(tops)
 }
 
+/// The client biome id of column `i` of coarse `cols`: the coarse biome the columns carry, by its name in the
+/// client's table (`by_name`). Never the blocking biome closure: that one reads the land cover at 500 m and would
+/// fetch. A column without one (not a coarse read) is id 0.
+fn coarse_id(
+    cols: &horizon_world::cubic::earth::far::NodeColumns,
+    i: usize,
+    by_name: &dyn Fn(&str) -> u16,
+) -> u16 {
+    cols.coarse_biome(i).map_or(0, |b| by_name(b.name()))
+}
+
 /// Node `key` (without its sky cover) as the generator makes it, with the trees and snow `decor` asks for.
-/// `biome` is the biome id of a block column; `kind` how downsampling counts a state.
+/// `biome` is the biome id of a block column (the fine paths'; it can block on a download); `coarse_biome` the
+/// client id of a biome by name, for the coarse levels, whose columns carry their own biomes; `kind` how
+/// downsampling counts a state.
 pub(super) fn node(
     earth: &EarthGenerator,
     key: CubeKey,
     air: u32,
     biome: &dyn Fn(i32, i32) -> u16,
+    coarse_biome: &dyn Fn(&str) -> u16,
     kind: &dyn Fn(BlockStateId) -> Kind,
     decor: FarDecor,
 ) -> Result<CubeNode, NotReady> {
+    // Voxels this wide come from the coarse columns at every level (the fine cube path reads the land cover).
+    if earth.is_coarse_step(1i32 << key.level) {
+        return from_surfaces(earth, key, air, biome, coarse_biome, decor);
+    }
     let origin = key.origin();
     // With land cover the biomes read the map at a coarse level: have them before building, never wait for them.
     match key.level {
@@ -288,12 +306,12 @@ pub(super) fn node(
             // Eight exact cubes, downsampled: a node this near is made as the saved ones are.
             let mut nodes = Vec::with_capacity(8);
             for child in key.children() {
-                nodes.push(node(earth, child, air, biome, kind, decor)?);
+                nodes.push(node(earth, child, air, biome, coarse_biome, kind, decor)?);
             }
             let refs: [&CubeNode; 8] = std::array::from_fn(|i| &nodes[i]);
             Ok(downsample(refs, BlockStateId(air), kind))
         }
-        _ => from_surfaces(earth, key, air, biome, decor),
+        _ => from_surfaces(earth, key, air, biome, coarse_biome, decor),
     }
 }
 
@@ -306,21 +324,33 @@ thread_local! {
 }
 
 /// Node `key` from its columns' surfaces at the zoom of its step (levels 2 and up; levels 0 and 1 too in the
-/// coarse pass, [`coarse_from_surfaces`]): its class first, uniform when the class says so.
+/// coarse pass, [`coarse_from_surfaces`]): its class first, uniform when the class says so. A coarse node
+/// (`EarthGenerator::is_coarse_step`) reads its columns before that, and every biome, a uniform node's too, is
+/// the coarse biome of its column by name (`coarse_biome`); `biome` is not called for it.
 fn from_surfaces(
     earth: &EarthGenerator,
     key: CubeKey,
     air: u32,
     biome: &dyn Fn(i32, i32) -> u16,
+    coarse_biome: &dyn Fn(&str) -> u16,
     decor: FarDecor,
 ) -> Result<CubeNode, NotReady> {
     let origin = key.origin();
     let level = key.level;
     let step = 1i32 << level;
-    // The biomes are read at the columns' middles: have them first, never wait for them.
-    earth.biomes_ready(origin[0] + step / 2, origin[2] + step / 2, step)?;
-    earth.biomes_ready(origin[0], origin[2], step)?;
+    let coarse = earth.is_coarse_step(step);
+    // The biomes are read at the columns' middles: have them first, never wait for them (the coarse columns carry
+    // theirs).
+    if !coarse {
+        earth.biomes_ready(origin[0] + step / 2, origin[2] + step / 2, step)?;
+        earth.biomes_ready(origin[0], origin[2], step)?;
+    }
     let state = |id: u32| BlockStateId(if id == 0 { air } else { id });
+    let early = if coarse {
+        Some(earth.node_columns(u32::from(level), key.x, key.z)?)
+    } else {
+        None
+    };
     let fill = if decor.trees {
         earth.classify_node_above(u32::from(level), key.x, key.y, key.z)?
     } else {
@@ -328,27 +358,38 @@ fn from_surfaces(
     };
     if let Some(id) = earth.fill_block(fill) {
         BUILT[0].fetch_add(1, Relaxed);
+        let biome = match &early {
+            Some(cols) => coarse_id(cols, 0, coarse_biome),
+            None => biome(origin[0], origin[2]),
+        };
         return Ok(CubeNode::uniform(
             key,
             Voxel {
                 state: state(id),
-                biome: biome(origin[0], origin[2]),
+                biome,
             },
         ));
     }
     BUILT[1].fetch_add(1, Relaxed);
-    let mut cols = earth.node_columns(u32::from(level), key.x, key.z)?;
+    let mut cols = match early {
+        Some(cols) => cols,
+        None => earth.node_columns(u32::from(level), key.x, key.z)?,
+    };
     // Level 1's sky cover reads its surfaces at the base zoom, not at its step's.
     if level != 1 && earth.land_cover_active() {
         LAST_SURFACES.with(|m| *m.borrow_mut() = Some((key, cols.surfaces.clone())));
     }
     earth.decorate_columns(&mut cols, decor)?;
-    let biomes: Vec<u16> = (0..256)
+    let biomes: Vec<u16> = (0..256usize)
         .map(|i| {
-            biome(
-                origin[0] + (i & 15) * step + step / 2,
-                origin[2] + (i >> 4) * step + step / 2,
-            )
+            if coarse {
+                coarse_id(&cols, i, coarse_biome)
+            } else {
+                biome(
+                    origin[0] + (i & 15) as i32 * step + step / 2,
+                    origin[2] + (i >> 4) as i32 * step + step / 2,
+                )
+            }
         })
         .collect();
     Ok(CubeNode::from_fn(key, |x, y, z| {
@@ -402,6 +443,9 @@ impl CubicLodSampler {
         let earth = generator.earth_generator()?;
         let level = self.level.clone();
         let biome = |x: i32, z: i32| level.biome_id_at(x, z);
+        // The coarse levels carry their biomes by name: the client's table gives the ids.
+        let table = level.client_biomes().clone();
+        let coarse_biome = |name: &str| table.id(name);
         let decor = self.far_decor();
         let pass = match &self.refine {
             Some(refine) if decor.trees => refine.pass(key),
@@ -417,9 +461,17 @@ impl CubicLodSampler {
         let started = std::time::Instant::now();
         let shallow = pass == Pass::Coarse && key.level < 2 && coarse_from_surfaces();
         let made = if shallow {
-            from_surfaces(earth, key, self.air, &biome, made_with)
+            from_surfaces(earth, key, self.air, &biome, &coarse_biome, made_with)
         } else {
-            node(earth, key, self.air, &biome, &|s| self.kind(s), made_with)
+            node(
+                earth,
+                key,
+                self.air,
+                &biome,
+                &coarse_biome,
+                &|s| self.kind(s),
+                made_with,
+            )
         };
         if crate::lod::cube::profile::on() && made.is_ok() {
             let how = if shallow || key.level >= 2 {

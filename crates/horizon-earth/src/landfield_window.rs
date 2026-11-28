@@ -452,7 +452,7 @@ impl LandCoverField {
             for (i, &x) in xs.iter().enumerate() {
                 let (cx, cz) = coarse.offset(i, j);
                 let (fx, fz) = fine.offset(i, j);
-                let at = self.projection.to_lat_lon(x + cx + fx, z + cz + fz);
+                let at = self.projection.to_lat_lon_flat(x + cx + fx, z + cz + fz);
                 out.push(reader.read(at.lat, at.lon)?);
             }
         }

@@ -2,7 +2,7 @@
 use super::*;
 use horizon_earth::projection::latlon_to_tile_pixel;
 use horizon_earth::testing::{MemoryFetcher, TempDir};
-use horizon_earth::{Projection, TileStore};
+use horizon_earth::{COARSE_PREFETCH_ZOOM, Projection, TileFetcher, TileStore};
 use horizon_world::cubic::custom::testing::default_registry;
 use horizon_world::cubic::earth::EarthSettings;
 
@@ -307,7 +307,10 @@ fn a_far_node_that_waited_for_its_class_is_built_once_the_prefetcher_has_the_dat
     let file = WorldCoverFile::containing(LAT, LON).unwrap();
     let land = Arc::new(MemoryLandCover::new().with_classes(file, 192, 96, 2, |_, _| 30));
     let source = settings
-        .land_cover_source(Arc::new(LandCoverStore::new(land_dir.path(), 16)), land.clone())
+        .land_cover_source(
+            Arc::new(LandCoverStore::new(land_dir.path(), 16)),
+            land.clone(),
+        )
         .unwrap();
     let generator = Arc::new(
         CustomCubicGenerator::earth_with_land_cover(
@@ -360,5 +363,157 @@ fn a_far_node_that_waited_for_its_class_is_built_once_the_prefetcher_has_the_dat
     let count = land.fetch_count();
     std::thread::sleep(Duration::from_millis(400));
     assert_eq!(land.fetch_count(), count);
+    prefetcher.stop();
+}
+
+/// The tiles a plan names are few whatever the far distance: a whole-world far view plans the same handful of
+/// tiles per level a ring of nodes touches, down to level 22, and never more than the world has.
+#[test]
+fn a_whole_world_far_distance_plans_a_bounded_list_with_the_coarse_zooms_last_and_small() {
+    for metres in [METRES_PER_BLOCK, 1.0] {
+        let dir = TempDir::new();
+        let store = Arc::new(TileStore::new(
+            dir.path(),
+            Arc::new(MemoryFetcher::new(terrain)),
+            256,
+        ));
+        let mut settings = EarthSettings::at(LAT, LON);
+        settings.metres_per_block = metres;
+        let generator = CustomCubicGenerator::earth(&settings, store, default_registry()).unwrap();
+        let earth = generator.earth_generator().unwrap();
+        let base = earth.base_zoom();
+        let started = Instant::now();
+        let planned = plan(earth, &around(4, MAX_FAR_CHUNKS));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{metres} m: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !planned.is_empty() && planned.len() < 1500,
+            "{metres} m: {} tiles",
+            planned.len()
+        );
+        let unique: HashSet<_> = planned.iter().collect();
+        assert_eq!(unique.len(), planned.len(), "{metres} m: a tile twice");
+        // The base zoom first, then the zooms only go coarser: the far levels read the coarse ones, a few tiles
+        // each.
+        let mut zooms: Vec<u8> = planned.iter().map(|id| id.z).collect();
+        zooms.dedup();
+        assert!(
+            zooms.windows(2).all(|w| w[0] > w[1]),
+            "{metres} m: {zooms:?}"
+        );
+        assert_eq!(zooms[0], base, "{metres} m");
+        let coarsest = *zooms.last().unwrap();
+        assert!(coarsest <= COARSE_PREFETCH_ZOOM, "{metres} m: {zooms:?}");
+        let coarse = planned.iter().filter(|id| id.z <= COARSE_PREFETCH_ZOOM);
+        assert!(coarse.count() <= 341, "{metres} m: more than the world has");
+        // A far distance past the cap plans what the cap does.
+        let capped = plan(earth, &around(4, i32::MAX));
+        assert_eq!(capped, planned, "{metres} m");
+    }
+}
+
+/// A world with land cover (the far view's coarse path is on) whose fetcher records the order of its requests.
+struct Recording {
+    inner: MemoryFetcher,
+    order: Mutex<Vec<TileId>>,
+}
+
+impl TileFetcher for Recording {
+    fn fetch(&self, id: TileId) -> Result<Vec<u8>, FetchError> {
+        lock(&self.order).push(id);
+        self.inner.fetch(id)
+    }
+}
+
+struct LandRig {
+    fetcher: Arc<Recording>,
+    generator: Arc<CustomCubicGenerator>,
+    _dirs: (TempDir, TempDir),
+}
+
+fn land_rig() -> LandRig {
+    use horizon_earth::testing::MemoryLandCover;
+    use horizon_earth::{LandCoverStore, WorldCoverFile};
+
+    let dir = TempDir::new();
+    let land_dir = TempDir::new();
+    let fetcher = Arc::new(Recording {
+        inner: MemoryFetcher::new(terrain),
+        order: Mutex::default(),
+    });
+    let store = Arc::new(TileStore::new(dir.path(), fetcher.clone(), 512));
+    let mut settings = EarthSettings::at(LAT, LON);
+    settings.metres_per_block = METRES_PER_BLOCK;
+    settings.land_cover = true;
+    let file = WorldCoverFile::containing(LAT, LON).unwrap();
+    let land = Arc::new(MemoryLandCover::new().with_classes(file, 192, 96, 2, |_, _| 30));
+    let source = settings
+        .land_cover_source(Arc::new(LandCoverStore::new(land_dir.path(), 16)), land)
+        .unwrap();
+    let generator = Arc::new(
+        CustomCubicGenerator::earth_with_land_cover(
+            &settings,
+            store,
+            Some(source),
+            default_registry(),
+        )
+        .unwrap(),
+    );
+    LandRig {
+        fetcher,
+        generator,
+        _dirs: (dir, land_dir),
+    }
+}
+
+#[test]
+fn the_coarse_set_is_wanted_only_when_the_far_view_reaches_coarse_nodes() {
+    let rig = land_rig();
+    let earth = rig.generator.earth_generator().unwrap();
+    // 40 m a block: voxels of 4 km from level 7 up, nodes of 2,048 blocks (128 chunks) and more.
+    assert!(wants_coarse(earth, &around(4, 400)));
+    assert!(!wants_coarse(earth, &around(4, 0)), "no far view");
+    assert!(
+        !wants_coarse(earth, &around(4, 20)),
+        "a far view of fine nodes"
+    );
+    assert!(coarse_plan(earth, &around(4, 0)).is_empty());
+    let planned = coarse_plan(earth, &around(4, 400));
+    assert_eq!(planned.len(), 341, "the whole coarse set, zooms 0 to 4");
+    assert!(planned.iter().all(|id| id.z <= COARSE_PREFETCH_ZOOM));
+    assert_eq!(planned[0].z, 0, "the coarsest zoom first");
+    // Without land cover the world has no coarse path at all.
+    let plain = self::rig();
+    assert!(!wants_coarse(plain.earth(), &around(4, 400)));
+}
+
+#[test]
+fn the_prefetcher_fetches_the_coarse_set_first_and_builds_the_mask_on_its_thread() {
+    let rig = land_rig();
+    let earth = rig.generator.earth_generator().unwrap();
+    let target = around(2, 400);
+    let expected = earth.coarse_tiles_missing((8, 8));
+    assert_eq!(expected.len(), 341);
+    assert!(!earth.coarse_ready());
+    let prefetcher = Prefetcher::start(&rig.generator, Duration::from_millis(1)).unwrap();
+    prefetcher.follow(target);
+    let mut ready = false;
+    for _ in 0..1200 {
+        if earth.coarse_ready() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "the mask was never built");
+    // Before any other tile the thread fetched exactly the coarse set, in the order it names (zoom ascending,
+    // the player's place first).
+    let order = lock(&rig.fetcher.order).clone();
+    assert!(order.len() >= expected.len());
+    assert_eq!(order[..expected.len()], expected[..]);
+    assert!(earth.coarse_tiles_missing((8, 8)).is_empty());
     prefetcher.stop();
 }
