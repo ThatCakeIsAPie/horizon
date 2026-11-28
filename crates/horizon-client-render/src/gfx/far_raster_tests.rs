@@ -209,7 +209,14 @@ fn read(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, asp
 #[test]
 fn far_raster_matches_hardware_raster() {
     let _gpu = test_gpu::lock();
-    let Some(adapter) = test_gpu::adapter() else { return };
+    // The fast GPU: the default adapter may be an integrated one without 64-bit atomics.
+    let Ok(adapter) = pollster::block_on(test_gpu::instance().request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    })) else {
+        eprintln!("skipped: no adapter");
+        return;
+    };
     let needed = wgpu::Features::SHADER_INT64
         | wgpu::Features::SHADER_INT64_ATOMIC_MIN_MAX
         | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
@@ -242,7 +249,7 @@ fn far_raster_matches_hardware_raster() {
         s | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC,
     );
     let n = f.draws.len() as u32;
-    let counts = init(&device, "counts", bytemuck::cast_slice(&[0, 0, 0, 0, 0, 0, 0, 0, n, n, 0, 0]), s);
+    let counts = init(&device, "counts", bytemuck::cast_slice(&[0, 0, 0, 0, 0, 0, 0, 0, n, n, 0, 0]), s | wgpu::BufferUsages::INDIRECT);
     let mut params = vec![0u32; 56];
     params[2] = 1;
     params[40..56].copy_from_slice(&view_proj.to_cols_array().map(f32::to_bits));

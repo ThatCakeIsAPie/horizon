@@ -1697,6 +1697,8 @@ pub struct Renderer {
     vis_toggle: vis_terrain::Toggle,
     /// The terrain visibility buffer's default (`vis_terrain::env_default`).
     vis_default: bool,
+    /// Part C's compute raster's default (`far_raster::env_default`).
+    raster_default: bool,
     /// The far tiles' compute raster into the terrain visibility buffer (`far_raster`).
     far_raster: Option<far_raster::FarRaster>,
     /// Hardware task+mesh solid terrain (`mesh_shader`, `HORIZON_MESH_SHADER=1`).
@@ -4931,6 +4933,7 @@ impl Renderer {
             vis_terrain,
             vis_toggle: vis_terrain::Toggle::from_env(),
             vis_default: vis_terrain::env_default(),
+            raster_default: far_raster::env_default(),
             far_raster,
             mesh_terrain,
             mesh_visible_scratch: Vec::new(),
@@ -11635,7 +11638,7 @@ impl Renderer {
                     if let Some(vis) = vis {
                         drop(pass);
                         if far_gpu_frame
-                            && self.vis_toggle.raster().unwrap_or(true)
+                            && self.vis_toggle.raster().unwrap_or(self.raster_default)
                             && let (Some(raster), Some(far)) = (&mut self.far_raster, self.far_cull.as_ref())
                         {
                             let depth = world_depth.texture();

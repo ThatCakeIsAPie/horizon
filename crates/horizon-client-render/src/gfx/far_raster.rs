@@ -15,8 +15,8 @@
 //!
 //! Needs `SHADER_INT64` and `SHADER_INT64_ATOMIC_MIN_MAX` ([`features`]); without them the far
 //! tiles stay hardware drawn (the 32-bit two-pass scheme measured slower than hardware).
-//! `HORIZON_FAR_RASTER=0` turns it off, `raster=0/1` in the `HORIZON_VISBUFFER_TOGGLE` file
-//! flips it within a session.
+//! Default off ([`DEFAULT_ON`]: slower in the game on the GTX 1070 Ti), `HORIZON_FAR_RASTER=1` on,
+//! `0` off (no pipelines); `raster=0/1` in the `HORIZON_VISBUFFER_TOGGLE` file flips it in a session.
 //!
 //! The compact ID (`vis_terrain::id::RASTER`'s 32 bits, never in the IDs texture): arena page
 //! << 26 | the page's compute quad, which the merge turns into its draw and corner 0's vertex
@@ -70,9 +70,19 @@ pub fn features(adapter: &wgpu::Adapter) -> wgpu::Features {
     }
 }
 
-/// `HORIZON_FAR_RASTER=0` turns it off.
+/// Whether frames on the visibility buffer use it when the toggle file does not say: off, measured
+/// slower in the game on the GTX 1070 Ti (horizon-farworld-bc-notes.md "C built"). On with
+/// `HORIZON_FAR_RASTER=1`.
+pub const DEFAULT_ON: bool = false;
+
+/// `HORIZON_FAR_RASTER=1` asks for it (see [`DEFAULT_ON`]); `0` turns it off, pipelines too.
 pub fn env_allows() -> bool {
     std::env::var(ENV).as_deref() != Ok("0")
+}
+
+/// The raster's default for this run: `HORIZON_FAR_RASTER=1` on, else [`DEFAULT_ON`].
+pub fn env_default() -> bool {
+    std::env::var(ENV).as_deref() == Ok("1") || DEFAULT_ON
 }
 
 /// terrain.wgsl's items the passes read the corners with, verbatim: the arena page binding,
