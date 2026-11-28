@@ -805,6 +805,10 @@ struct Globals {
     /// A mod's world view's own (`world_views::ViewCamera`), zero outside one: x -1 when it is
     /// mirrored, else 1; y the clip-space depth its entities come forward; z 1 with a clip plane.
     world_view: [f32; 4],
+    /// The far view's air (`crate::fog::Atmosphere::uniform`, terrain.wgsl's
+    /// `atmosphere_fade`): the eye's height over sea level, the haze per block at sea level,
+    /// 1 / scale height, the strength (0 without a far view or with a shader pack).
+    atmosphere: [f32; 4],
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -7829,9 +7833,28 @@ impl Renderer {
             .taa_render_size([self.config.width, self.config.height]);
         self.asked_world_views(taa_frustum(views.cull().view_proj(bob), size))
     }
-    fn screen_view(&self, fov_degrees: f32, yaw: f32, pitch: f32, far: f32) -> View {
+    fn screen_view(&self, fov_degrees: f32, yaw: f32, pitch: f32, depth_far: f32) -> View {
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        View::screen(yaw, pitch, fov_degrees, aspect, far)
+        View::screen(yaw, pitch, fov_degrees, aspect, self.lens_far(depth_far))
+    }
+    /// Whether far terrain is drawn: the column LOD's tiles, the cube octree's (CPU-meshed or
+    /// GPU-meshed nodes) or surface tiles. The far view's air (`Globals::atmosphere`) is on
+    /// only then, so a world without one looks as it did.
+    fn far_view_drawn(&self) -> bool {
+        !self.lods.is_empty()
+            || !self.lod_cubes.is_empty()
+            || self.cube_far.as_ref().is_some_and(|c| c.has_nodes())
+            || self.surface_tiles.as_ref().is_some_and(|s| s.keys().next().is_some())
+    }
+    /// The far plane the world is drawn with (`world_projection`): `depth_far` while a shader
+    /// pack runs, which reads the world's depth and matrices with the finite lens it always
+    /// had; else none (`WORLD_FAR`), for terrain out to the planet's far side.
+    fn lens_far(&self, depth_far: f32) -> f32 {
+        if self.shader_pack_kind().is_some() {
+            depth_far
+        } else {
+            WORLD_FAR
+        }
     }
     fn update_lightmap(
         &mut self,
@@ -8611,6 +8634,10 @@ impl Renderer {
             hdr_settings,
             view_origin: [0.0; 4],
             world_view: [0.0; 4],
+            atmosphere: crate::fog::Atmosphere::configured().uniform(
+                frame.camera.y,
+                self.far_view_drawn() && self.shader_pack_kind().is_none(),
+            ),
         };
         self.uploads
             .buffer(&mut encoder, &self.globals, 0, bytemuck::bytes_of(&globals));
@@ -12655,7 +12682,7 @@ impl Renderer {
                 jitter: self.world_post.jitter_pixels(),
                 reproject: self.frame_gen.camera_motion(view_proj, frame.camera),
                 near: NEAR_PLANE,
-                far: frame.depth_far,
+                far: self.lens_far(frame.depth_far),
                 fov_y: frame.fov_degrees.to_radians(),
             };
             let overlay = Overlay {
@@ -13575,9 +13602,21 @@ struct Overlay {
     hand_view_proj: Mat4,
 }
 
+/// The world's lens: reversed-Z (the near plane at depth 1). An infinite `far`
+/// (`WORLD_FAR`, the game's own frames) has no far plane: depth is `NEAR_PLANE / distance`,
+/// above 0 at every finite distance (2.5e-9 at 2e7 blocks), 0 only for the sky's clear, with
+/// the same relative precision at every distance. A finite `far` is the lens shader packs
+/// read and rebuild positions with, as they always had it (`Renderer::lens_far`).
 pub(crate) fn world_projection(fov_degrees: f32, aspect: f32, far: f32) -> Mat4 {
-    Mat4::perspective_rh(fov_degrees.to_radians(), aspect, far, NEAR_PLANE)
+    if far.is_infinite() {
+        Mat4::perspective_infinite_reverse_rh(fov_degrees.to_radians(), aspect, NEAR_PLANE)
+    } else {
+        Mat4::perspective_rh(fov_degrees.to_radians(), aspect, far, NEAR_PLANE)
+    }
 }
+
+/// The far plane of the game's own world lens (`world_projection`): none.
+pub(crate) const WORLD_FAR: f32 = f32::INFINITY;
 
 /// Calls `draw(first, quads)` for each run of a mesh's solid quads that can
 /// face `eye` (`view::projection_center`), the mesh at the camera-relative
@@ -13629,6 +13668,40 @@ mod tests {
         assert!(!want_packed_layout(false, false, false, true));
         assert!(!want_packed_layout(true, false, false, false));
     }
+    /// The world's lens has no far plane (`WORLD_FAR`): reversed depth `0.05 / distance`
+    /// falls strictly between surfaces a block apart at 0.05, 100 and 1e5 blocks, and at 2e7
+    /// between surfaces `STEP_AT_2E7` apart (f32 holds 2e7 blocks to 2 blocks, and the depth to
+    /// 2^-24 of itself: a block there is 5e-8 of the distance, at that limit). The sky's clear
+    /// (0) stays farther than any terrain, which is above 0 out to 3e7 blocks. A finite far
+    /// keeps the lens shader packs had.
+    #[test]
+    fn the_world_lens_is_reversed_and_infinite() {
+        const STEP_AT_2E7: f32 = 4.0;
+        let lens = super::world_projection(70.0, 16.0 / 9.0, super::WORLD_FAR);
+        let depth = |d: f32| {
+            let clip = lens * glam::Vec4::new(0.3 * d, -0.2 * d, -d, 1.0);
+            clip.z / clip.w
+        };
+        assert_eq!(depth(super::NEAR_PLANE), 1.0);
+        for (from, step) in [(0.05f32, 1.0f32), (100.0, 1.0), (1e5, 1.0), (2e7, STEP_AT_2E7)] {
+            let mut last = depth(from);
+            for k in 1..64 {
+                let next = depth(from + k as f32 * step);
+                assert!(next < last && next.is_finite(), "{from} + {k} x {step}: {next} {last}");
+                last = next;
+            }
+        }
+        for d in [1e3f32, 2e7, 3e7] {
+            assert!(depth(d) > 0.0 && depth(d) < 1.0, "{d}");
+        }
+        assert!(lens.inverse().is_finite(), "positions rebuild from depth");
+        let packs = super::world_projection(70.0, 16.0 / 9.0, 512.0);
+        assert_eq!(
+            packs,
+            Mat4::perspective_rh(70f32.to_radians(), 16.0 / 9.0, 512.0, super::NEAR_PLANE)
+        );
+    }
+
     /// #16769: a graphics driver that never answers the device search must end the
     /// start with a message, not hold it on the boot screen forever.
     #[test]

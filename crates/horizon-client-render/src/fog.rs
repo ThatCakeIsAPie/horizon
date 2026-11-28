@@ -415,6 +415,13 @@ pub fn setup_fog(tables: &FogTables, state: &FogState, input: &FogInputs) -> Fog
     let span = (rd / 10.0).clamp(4.0, 64.0);
     fog.render_distance_start = rd - span;
     fog.render_distance_end = rd;
+    // A far view over the whole world has no edge to hide: the far view's air
+    // (`Atmosphere`) melts it into the sky instead.
+    if input.distant_terrain
+        && i64::from(input.render_distance_chunks) >= i64::from(crate::lod::MAX_CHUNKS)
+    {
+        (fog.render_distance_start, fog.render_distance_end) = NO_FOG;
+    }
     if input.distant_terrain
         && input.skybox
         && input.fog_type == FogType::Atmospheric
@@ -441,10 +448,121 @@ pub fn clear_distance_fog(fog: &mut FogData, input: &FogInputs) {
         && !input.boss_world_fog
         && input.blindness.is_none()
     {
-        (fog.render_distance_start, fog.render_distance_end) = (1e9, 2e9);
-        (fog.environmental_start, fog.environmental_end) = (1e9, 2e9);
+        (fog.render_distance_start, fog.render_distance_end) = NO_FOG;
+        (fog.environmental_start, fog.environmental_end) = NO_FOG;
     }
 }
+/// A fog's start and end past anything drawn (the world is 6e7 blocks across).
+const NO_FOG: (f32, f32) = (1e9, 2e9);
+
+/// Sea level the far view's air thins from, in blocks (vanilla's).
+pub const FAR_SEA_LEVEL: f64 = 63.0;
+/// How far one sees through the air at sea level, in blocks (1 block = 1 m): 95% of the way
+/// into the fog colour (an optical depth of 3).
+pub const FAR_VISIBILITY: f32 = 200_000.0;
+/// The air's scale height, in blocks: its density falls by e every this much higher.
+pub const FAR_SCALE_HEIGHT: f32 = 8_000.0;
+/// How much of the air's haze is mixed in (1 all of it).
+pub const FAR_ATMOSPHERE_STRENGTH: f32 = 1.0;
+/// Heights below this many scale heights under sea level have its density (`atmosphere_fade`):
+/// the exponential stays finite in the deepest cave.
+const ATMOSPHERE_FLOOR: f32 = -4.0;
+/// Under this rise (in scale heights) along a ray, its mid-point's density is its mean.
+const ATMOSPHERE_LEVEL_RISE: f32 = 1e-2;
+/// The optical depth taken as whole haze.
+const ATMOSPHERE_MAX_DEPTH: f32 = 80.0;
+
+/// Planet-scale aerial perspective: distant terrain hazes into the fog colour (the sky's at
+/// the horizon) through air thinning exponentially with height, without curvature. On only
+/// while a far view is drawn; `HORIZON_FAR_ATMOSPHERE=0` turns it off,
+/// `HORIZON_FAR_VISIBILITY` and `HORIZON_FAR_SCALE_HEIGHT` (blocks) set the air.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Atmosphere {
+    pub visibility: f32,
+    pub scale_height: f32,
+    pub strength: f32,
+}
+impl Default for Atmosphere {
+    fn default() -> Self {
+        Self {
+            visibility: FAR_VISIBILITY,
+            scale_height: FAR_SCALE_HEIGHT,
+            strength: FAR_ATMOSPHERE_STRENGTH,
+        }
+    }
+}
+impl Atmosphere {
+    /// The defaults with the environment's knobs, read once.
+    pub fn configured() -> Self {
+        static AIR: std::sync::OnceLock<Atmosphere> = std::sync::OnceLock::new();
+        *AIR.get_or_init(|| {
+            let var = |name: &str| std::env::var(name).ok();
+            Self::with_knobs(
+                var("HORIZON_FAR_ATMOSPHERE").as_deref(),
+                var("HORIZON_FAR_VISIBILITY").as_deref(),
+                var("HORIZON_FAR_SCALE_HEIGHT").as_deref(),
+            )
+        })
+    }
+    /// The defaults, `off` "0" turning it off, and a positive `visibility` and `scale_height`
+    /// (blocks) replacing theirs.
+    pub fn with_knobs(
+        off: Option<&str>,
+        visibility: Option<&str>,
+        scale_height: Option<&str>,
+    ) -> Self {
+        let blocks = |v: Option<&str>| {
+            v.and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+        };
+        let mut air = Self::default();
+        if off.is_some_and(|v| v.trim() == "0") {
+            air.strength = 0.0;
+        }
+        air.visibility = blocks(visibility).unwrap_or(air.visibility);
+        air.scale_height = blocks(scale_height).unwrap_or(air.scale_height);
+        air
+    }
+    /// `Globals::atmosphere` for an eye at absolute height `eye_y`: its height over sea level,
+    /// the haze per block at sea level (an optical depth of 3 over the visibility), 1 / scale
+    /// height, the strength; all 0 strength without a far view (`far_view`).
+    pub fn uniform(&self, eye_y: f64, far_view: bool) -> [f32; 4] {
+        [
+            (eye_y - FAR_SEA_LEVEL) as f32,
+            3.0 / self.visibility,
+            1.0 / self.scale_height,
+            if far_view { self.strength } else { 0.0 },
+        ]
+    }
+}
+/// The integral of the air's density over height `h` in scale heights (`atmosphere_fade`).
+fn atmosphere_integral(h: f32) -> f32 {
+    if h >= ATMOSPHERE_FLOOR {
+        -(-h).exp()
+    } else {
+        (-ATMOSPHERE_FLOOR).exp() * (h - ATMOSPHERE_FLOOR - 1.0)
+    }
+}
+/// terrain.wgsl's `atmosphere_fade`: the share of the fog colour over a point `distance`
+/// blocks from the eye and `rel_height` above it, for the uniform `air` (`Atmosphere::uniform`).
+/// The optical depth along the straight ray is the haze at sea level times the distance times
+/// the ray's mean density, `(F(top) - F(bottom)) / rise` in scale heights.
+pub fn atmosphere_fade(air: [f32; 4], distance: f32, rel_height: f32) -> f32 {
+    let [height, k, inverse_h, strength] = air;
+    if strength <= 0.0 {
+        return 0.0;
+    }
+    let eye = height * inverse_h;
+    let rise = rel_height * inverse_h;
+    let density = if rise.abs() >= ATMOSPHERE_LEVEL_RISE {
+        (atmosphere_integral(eye + rise) - atmosphere_integral(eye)) / rise
+    } else {
+        (-(eye + 0.5 * rise).max(ATMOSPHERE_FLOOR)).exp()
+    };
+    let depth = (k * distance * density).clamp(0.0, ATMOSPHERE_MAX_DEPTH);
+    ((1.0 - (-depth).exp()) * strength).clamp(0.0, 1.0)
+}
+
 /// What `AtmosphericFogEnvironment.updateRainFogState` eases the rain fog toward: the rain, where
 /// the sky reaches the eye, halved in a biome without precipitation.
 pub fn rain_fog_target(rain: f32, sky_light: u8, biome_rains: bool) -> f32 {
@@ -757,6 +875,96 @@ mod tests {
         assert!((fog.render_distance_start - (192.0 - 19.2)).abs() < 1e-4);
         assert_eq!(fog.render_distance_end, 192.0);
         assert_eq!(fog.sky_end, 192.0);
+    }
+    /// The far view's air from the ground (2000 blocks up): clear at a kilometre, hazy at
+    /// 50 to 100, gone into the horizon's colour by 300 and 1000; from 1e7 blocks up the
+    /// ground stays clearly visible; finite everywhere; nothing without a far view.
+    #[test]
+    fn the_far_air_hazes_with_distance_and_thins_with_height() {
+        let air = Atmosphere::default();
+        let ground = air.uniform(2000.0, true);
+        let level = |d: f32| atmosphere_fade(ground, d, 0.0);
+        assert!(level(1e3) < 0.05, "{}", level(1e3));
+        assert!(
+            level(5e4) > 0.2 && level(1e5) < 0.9,
+            "{} {}",
+            level(5e4),
+            level(1e5)
+        );
+        assert!(level(3e5) > 0.9, "{}", level(3e5));
+        assert!(level(1e6) > 0.9, "{}", level(1e6));
+        let mut last = 0.0;
+        for d in [0.0, 10.0, 1e3, 1e4, 5e4, 1e5, 3e5, 1e6, 1e7] {
+            assert!(level(d) >= last, "{d}");
+            last = level(d);
+        }
+        // Down from 1e7 blocks to sea level, straight and slanted.
+        let space = air.uniform(1e7, true);
+        let down = (1e7 - FAR_SEA_LEVEL) as f32;
+        assert!(atmosphere_fade(space, down, -down) < 0.3);
+        assert!(atmosphere_fade(space, 2.0 * down, -down) < 0.3);
+        // Up from the ground, the air thins: less haze than along the ground.
+        assert!(atmosphere_fade(ground, 1e5, 5e4) < level(1e5));
+        for eye in [0.0, 63.0, 2000.0, 1e5, 1e7, -2000.0] {
+            let u = air.uniform(eye, true);
+            for d in [0.0, 1.0, 1e3, 1e6, 2e7, 3e7] {
+                for rel in [0.0, 1e-3, -1e-3, 50.0, -50.0, 1e4, -1e4, 1e7, -1e7, 3e7] {
+                    let f = atmosphere_fade(u, d, rel);
+                    assert!(
+                        f.is_finite() && (0.0..=1.0).contains(&f),
+                        "{eye} {d} {rel}: {f}"
+                    );
+                }
+            }
+            assert_eq!(air.uniform(eye, false)[3], 0.0);
+            assert_eq!(atmosphere_fade(air.uniform(eye, false), 1e6, 0.0), 0.0);
+        }
+        // The level shortcut meets the slanted formula.
+        let near = atmosphere_fade(ground, 1e5, 79.0);
+        let far = atmosphere_fade(ground, 1e5, 81.0);
+        assert!((near - far).abs() < 1e-3, "{near} {far}");
+    }
+    #[test]
+    fn the_far_air_knobs() {
+        assert_eq!(
+            Atmosphere::with_knobs(None, None, None),
+            Atmosphere::default()
+        );
+        assert_eq!(Atmosphere::with_knobs(Some("0"), None, None).strength, 0.0);
+        assert_eq!(Atmosphere::with_knobs(Some("1"), None, None).strength, 1.0);
+        let air = Atmosphere::with_knobs(None, Some("50000"), Some("abc"));
+        assert_eq!(
+            (air.visibility, air.scale_height),
+            (50_000.0, FAR_SCALE_HEIGHT)
+        );
+        let air = Atmosphere::with_knobs(None, Some("-3"), Some("12000"));
+        assert_eq!(
+            (air.visibility, air.scale_height),
+            (FAR_VISIBILITY, 12_000.0)
+        );
+    }
+    /// A far view over the whole world drops the render-distance fog; a nearer one keeps it at
+    /// its end; the environmental fog stays the environment's.
+    #[test]
+    fn a_whole_world_far_view_has_no_render_distance_fog() {
+        let sky = Sky {
+            fog_end: 1024.,
+            ..Sky::default()
+        };
+        let tables = FogTables {
+            water_fog_end: vec![1.],
+        };
+        let mut input = inputs(&sky);
+        input.distant_terrain = true;
+        input.render_distance_chunks = 4096;
+        let fog = setup_fog(&tables, &FogState::default(), &input);
+        assert_eq!(fog.render_distance_end, 65536.);
+        input.render_distance_chunks = crate::lod::MAX_CHUNKS as i32;
+        let fog = setup_fog(&tables, &FogState::default(), &input);
+        assert!(fog.render_distance_start >= 1e9);
+        input.fog_type = FogType::Water;
+        let fog = setup_fog(&tables, &FogState::default(), &input);
+        assert_eq!(fog.environmental_end, 24.);
     }
     #[test]
     fn distant_atmosphere_extends_without_extending_environmental_overrides() {

@@ -82,7 +82,13 @@ impl Frustum {
     /// normals cancel and say nothing about which way is forward.
     pub fn pulled_back(&self, blocks: f32) -> Frustum {
         let sides: Vec3 = self.planes[..4].iter().map(|p| p.truncate()).sum();
-        let depth = self.planes[4].truncate();
+        // The far plane's normal, or the near plane's (the opposite one) for a lens without a
+        // far plane (`WORLD_FAR`), whose far plane takes in everything.
+        let depth = if self.planes[4] == Vec4::W {
+            self.planes[5].truncate()
+        } else {
+            self.planes[4].truncate()
+        };
         let along = depth.dot(sides);
         // A perspective frustum's four side normals each lean forward, so this is well above 1.
         if along.abs() < 1.0e-3 {
@@ -257,5 +263,46 @@ mod tests {
         ] {
             assert_eq!(flat.contains_point(p), moved.contains_point(p));
         }
+    }
+
+    /// The world's lens without a far plane: no NaN plane, nothing culled for being far (a box
+    /// 2e7 blocks ahead), and still culled behind and far to the side. Looking down -Z.
+    #[test]
+    fn the_infinite_lens_culls_only_behind_and_beside() {
+        let view =
+            Frustum::from_view_projection(world_projection(FOV, ASPECT, crate::gfx::WORLD_FAR));
+        assert!(
+            view.planes.iter().all(|p| p.is_finite()),
+            "{:?}",
+            view.planes
+        );
+        assert_eq!(view.planes[4], glam::Vec4::W);
+        let cube = |c: Vec3, h: f32| (c - Vec3::splat(h), c + Vec3::splat(h));
+        for (c, h) in [
+            (Vec3::new(0.0, 0.0, -2e7), 1e3),
+            (Vec3::new(0.0, 0.0, -3e7), 16.0),
+        ] {
+            let (min, max) = cube(c, h);
+            assert!(
+                view.intersects(min, max) && view.intersects_depth(min, max),
+                "{c}"
+            );
+            assert!(view.contains_point(c));
+        }
+        // A level-22 node (67,108,864 wide) whose corners reach behind the camera.
+        let node = 67_108_864.0;
+        assert!(view.intersects(
+            Vec3::new(-node / 2.0, -100.0, -node),
+            Vec3::new(node / 2.0, 0.0, 10.0)
+        ));
+        let (min, max) = cube(Vec3::new(0.0, 0.0, 2e7), 1e3);
+        assert!(!view.intersects(min, max), "behind");
+        let (min, max) = cube(Vec3::new(4e7, 0.0, -2e7), 1e3);
+        assert!(!view.intersects(min, max), "to the side");
+        // Pulling back still moves along the view direction (the near plane's).
+        let moved = view.pulled_back(3.0);
+        assert!(moved.planes.iter().all(|p| p.is_finite()));
+        assert!(moved.contains_point(Vec3::new(0.0, 0.0, 1.0)));
+        assert!(!view.contains_point(Vec3::new(0.0, 0.0, 1.0)));
     }
 }

@@ -200,7 +200,7 @@ impl Renderer {
                     }
                 })
                 .or_insert_with(|| Target::new(&self.device, view.size, format));
-            let camera = ViewCamera::new(view, frame.camera, frame.depth_far);
+            let camera = ViewCamera::new(view, frame.camera, self.lens_far(frame.depth_far));
             let globals = Globals {
                 view_proj: camera.view_proj.to_cols_array_2d(),
                 inverse_view: camera.view.inverse().to_cols_array_2d(),
@@ -213,6 +213,11 @@ impl Renderer {
                 outline_params: super::outline_params(view.size[0], view.size[1]),
                 view_origin: [camera.offset.x, camera.offset.y, camera.offset.z, 0.0],
                 world_view: camera.world_view,
+                // The air from the view's own eye.
+                atmosphere: {
+                    let [height, k, h, strength] = lists.globals.atmosphere;
+                    [height + camera.offset.y, k, h, strength]
+                },
                 ..lists.globals
             };
             self.uploads

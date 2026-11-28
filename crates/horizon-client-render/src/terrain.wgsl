@@ -46,6 +46,10 @@ struct Globals {
     // mirrored (its screen runs right to left), else 1; y the clip-space depth its clip plane's
     // entities come forward (`fs_entity_clipped`), 0 without one; z 1 with a clip plane.
     world_view: vec4<f32>,
+    // The far view's air (fog.rs's `Atmosphere`, terrain.wgsl's `atmosphere_fade`): x the eye's
+    // height over sea level, y the haze per block at sea level, z 1 / scale height (blocks),
+    // w its strength, 0 without a far view or with a shader pack.
+    atmosphere: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var sprites: texture_2d_array<f32>;
@@ -724,6 +728,54 @@ fn apply_fog(color: vec4<f32>, spherical: f32, cylindrical: f32) -> vec4<f32> {
                 linear_fog(cylindrical, globals.fog.z, globals.fog.w));
     return vec4(mix(color.rgb, globals.fog_color.rgb, f * globals.fog_color.a), color.a);
 }
+// Planet-scale aerial perspective (fog.rs's `atmosphere_fade` is this on the CPU): the share
+// of the fog colour, the sky's at the horizon, the air between the eye and a point
+// `distance` away and `rel_height` above the eye puts over it. The air thins as
+// exp(-height / H): along the straight ray (no curvature) its mean density is
+// (F(top) - F(bottom)) / rise over the heights in scale heights, F the integral of
+// exp(-max(h, ATMOSPHERE_FLOOR)), so the exponentials stay finite from the deepest cave to
+// 1e7 blocks up. 0 without a far view (`globals.atmosphere.w`).
+const ATMOSPHERE_FLOOR: f32 = -4.0;
+const ATMOSPHERE_LEVEL_RISE: f32 = 1e-2;
+const ATMOSPHERE_MAX_DEPTH: f32 = 80.0;
+fn atmosphere_integral(h: f32) -> f32 {
+    if h >= ATMOSPHERE_FLOOR {
+        return -exp(-h);
+    }
+    return exp(-ATMOSPHERE_FLOOR) * (h - ATMOSPHERE_FLOOR - 1.0);
+}
+fn atmosphere_fade(distance: f32, rel_height: f32) -> f32 {
+    let a = globals.atmosphere;
+    if a.w <= 0.0 {
+        return 0.0;
+    }
+    let eye = a.x * a.z;
+    let rise = rel_height * a.z;
+    var density = exp(-max(eye + 0.5 * rise, ATMOSPHERE_FLOOR));
+    if abs(rise) >= ATMOSPHERE_LEVEL_RISE {
+        density = (atmosphere_integral(eye + rise) - atmosphere_integral(eye)) / rise;
+    }
+    let depth = clamp(a.y * distance * density, 0.0, ATMOSPHERE_MAX_DEPTH);
+    return clamp((1.0 - exp(-depth)) * a.w, 0.0, 1.0);
+}
+// How much of the fog colour every terrain path mixes in: the vanilla fog (`apply_fog`),
+// then the far view's air over what it left.
+fn world_fog_amount(spherical: f32, cylindrical: f32, rel_height: f32) -> f32 {
+    let f = max(linear_fog(spherical, globals.fog.x, globals.fog.y),
+                linear_fog(cylindrical, globals.fog.z, globals.fog.w)) * globals.fog_color.a;
+    return 1.0 - (1.0 - f) * (1.0 - atmosphere_fade(spherical, rel_height));
+}
+// The terrain's fog, the one every terrain, fluid and far path calls (near sections, far
+// tiles, cube nodes, surface tiles, the visibility buffer's resolve): `apply_fog` with the
+// far view's air. `rel_height`: the point's height over the eye (blocks).
+fn apply_world_fog(color: vec4<f32>, spherical: f32, cylindrical: f32, rel_height: f32) -> vec4<f32> {
+    let f = world_fog_amount(spherical, cylindrical, rel_height);
+    return vec4(mix(color.rgb, globals.fog_color.rgb, f), color.a);
+}
+// A `TerrainOut`'s height over the eye (its `height` is camera-relative).
+fn terrain_rel_height(in: TerrainOut) -> f32 {
+    return in.height - globals.view_origin.y;
+}
 @fragment fn fs_solid(wire: TerrainWire) -> @location(0) vec4<f32> {
     let in = from_wire(wire);
     return solid_color(in);
@@ -822,8 +874,7 @@ fn solid_finish_at(in: TerrainOut, texel: vec4<f32>, color: vec4<f32>, du: vec2<
         // All over means all over: the sprite's range is one frame's, and an animated sprite's
         // other frames dip below it. Fog hides a light source as it hides everything else.
         if whole || y >= t.r {
-            let fogged = max(linear_fog(in.spherical, globals.fog.x, globals.fog.y),
-                linear_fog(in.cylindrical, globals.fog.z, globals.fog.w)) * globals.fog_color.a;
+            let fogged = world_fog_amount(in.spherical, in.cylindrical, terrain_rel_height(in));
             emissive = hdr_mark(tier, y * (1.0 - fogged));
             if globals.hdr_settings.z > 0.5 {
                 // Where the world shows lifted (hdr_written): the pixel's light
@@ -842,9 +893,9 @@ fn solid_finish_at(in: TerrainOut, texel: vec4<f32>, color: vec4<f32>, du: vec2<
         if (in.emissive_layer & 0x80000000u) != 0u {
             mask.a = select(0.0, 1.0, mask.a >= 0.1);
         }
-        return apply_fog(vec4(mix(lit, mask.rgb, mask.a), mix(emissive, hdr_mark(3u, 1.0), mask.a)), in.spherical, in.cylindrical);
+        return apply_world_fog(vec4(mix(lit, mask.rgb, mask.a), mix(emissive, hdr_mark(3u, 1.0), mask.a)), in.spherical, in.cylindrical, terrain_rel_height(in));
     }
-    return apply_fog(vec4(lit, emissive), in.spherical, in.cylindrical);
+    return apply_world_fog(vec4(lit, emissive), in.spherical, in.cylindrical, terrain_rel_height(in));
 }
 // Water, glass and other see-through faces draw whole as they fade in, the
 // layer drawn first in front (gfx.rs's water tiers): dithered, the faded-out
@@ -855,7 +906,7 @@ fn solid_finish_at(in: TerrainOut, texel: vec4<f32>, color: vec4<f32>, du: vec2<
     let texel = sprite(in.uv, in.layer & 0x7fffu);
     let color = texel * in.color;
     if color.a < 0.01 { discard; }
-    let finished = apply_fog(color, in.spherical, in.cylindrical);
+    let finished = apply_world_fog(color, in.spherical, in.cylindrical, terrain_rel_height(in));
     if HDR_WRITE_LIGHT && globals.hdr_light.w != 0.0 {
         // The surface's own light, whatever its texel's alpha: what is behind it is light already.
         return vec4(hdr_written(finished.rgb, 1.0, globals.hdr_settings), finished.a);
@@ -872,6 +923,7 @@ struct NativeFluidOut {
     @location(2) @interpolate(flat) sprite: u32,
     @location(3) spherical: f32,
     @location(4) cylindrical: f32,
+    @location(5) height: f32,
 }
 @vertex fn vs_native_fluid(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>,
     @location(3) color: vec4<f32>, @location(4) light: vec4<u32>,
@@ -882,12 +934,12 @@ struct NativeFluidOut {
         lit = vec4(min(lit.rgb + color.rgb * native_colored_light(position), vec3(1.0)), lit.a);
     }
     return NativeFluidOut(globals.view_proj * vec4(position, 1.0), uv, lit, u32(sprite.x),
-        length(position), max(length(position.xz), abs(position.y)));
+        length(position), max(length(position.xz), abs(position.y)), position.y);
 }
 @fragment fn fs_native_fluid(in: NativeFluidOut) -> @location(0) vec4<f32> {
     // The source translucent shader has no alpha discard; transparent texels write depth too.
     let color = sprite_grad(in.uv, in.sprite, dpdx(in.uv), dpdy(in.uv)) * in.color;
-    return frame_stored(apply_fog(color, in.spherical, in.cylindrical));
+    return frame_stored(apply_world_fog(color, in.spherical, in.cylindrical, in.height - globals.view_origin.y));
 }
 
 // Native terrain models retain floating-point transformed normals. Fullbright still receives
@@ -903,6 +955,7 @@ struct NativeModelOut {
     @location(3) spherical: f32,
     @location(4) cylindrical: f32,
     @location(5) normal: vec3<f32>,
+    @location(6) height: f32,
 }
 @vertex fn vs_native_model(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>,
     @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec4<u32>,
@@ -914,7 +967,7 @@ struct NativeModelOut {
     }
     return NativeModelOut(globals.view_proj * vec4(position, 1.0), uv, lit, layer >> 16u,
         length(position), max(length(position.xz), abs(position.y)),
-        vec3(normal_xy, bitcast<f32>(normal_z)));
+        vec3(normal_xy, bitcast<f32>(normal_z)), position.y);
 }
 @fragment fn fs_native_model(in: NativeModelOut) -> @location(0) vec4<f32> {
     var color = sprite_grad(in.uv, in.sprite, dpdx(in.uv), dpdy(in.uv)) * in.color;
@@ -926,7 +979,7 @@ struct NativeModelOut {
             + max(0.0, dot(light1, in.normal))) * 0.6 + 0.4);
         color = vec4(color.rgb * shade, color.a);
     }
-    let finished = apply_fog(color, in.spherical, in.cylindrical);
+    let finished = apply_world_fog(color, in.spherical, in.cylindrical, in.height - globals.view_origin.y);
     return frame_stored(vec4(finished.rgb, select(finished.a, 1.0, HDR_WRITE_LIGHT)));
 }
 

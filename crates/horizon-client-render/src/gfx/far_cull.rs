@@ -1660,6 +1660,51 @@ mod tests {
         p.z / p.w
     }
 
+    /// The world's lens without a far plane, 20 million blocks out (looking west, toward -x):
+    /// the level-22 node (67,108,864 blocks wide) holding the camera, and the one ahead of it
+    /// whose near side is 2e7 blocks away, pass the frustum and, over the sky (depth 0), the
+    /// Hi-Z test; a ridge 1e7 blocks out hides the one ahead.
+    #[test]
+    fn a_level_22_node_stays_in_view_of_the_infinite_lens() {
+        let vp = world_projection(70.0, 16.0 / 9.0, crate::gfx::WORLD_FAR)
+            * Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2);
+        let input = FarInputs {
+            camera: DVec3::new(20_000_000.3, 2_000.5, -19_999_999.7),
+            planes: Frustum::from_view_projection(vp).planes,
+            eye: None,
+            view_proj: vp,
+            occlude: true,
+        };
+        let f = Frame::new(&input);
+        assert!(f.planes.iter().all(|p| p.is_finite()));
+        let size = 16 << crate::lod::cube::MAX_CUBE_LEVEL;
+        assert_eq!(size, 67_108_864);
+        let sky = pyramid(128, 72, |_, _| 0.0);
+        let ridge = {
+            let ahead = vp * Vec4::new(-1e7, 0.0, 0.0, 1.0);
+            pyramid(128, 72, move |_, _| ahead.z / ahead.w)
+        };
+        assert!(ridge[0].0[0] > 0.0, "terrain at 1e7 blocks is not the sky");
+        // Node-local mesh bounds: its whole width, the ground from 0 to 300.
+        let (min, max) = (Vec3::ZERO, Vec3::new(size as f32, 300.0, size as f32));
+        for (x, ahead) in [(0, false), (-1, true)] {
+            let key = CubeKey::new(crate::lod::cube::MAX_CUBE_LEVEL, x, 0, -1);
+            let o = origin_rel(key.origin(), f.cam_int, f.cam_frac);
+            assert!(o.is_finite());
+            let (lo, hi) = (o + min, o + max);
+            assert!(
+                in_frustum(&f.planes, lo, hi, 1.0),
+                "{key:?}: in the frustum"
+            );
+            assert!(box_seen_in(&vp, lo, hi, &sky), "{key:?}: seen over the sky");
+            assert_eq!(
+                !box_seen_in(&vp, lo, hi, &ridge),
+                ahead,
+                "{key:?} behind the ridge"
+            );
+        }
+    }
+
     #[test]
     fn the_hiz_test_is_conservative() {
         let vp = world_projection(70.0, 16.0 / 9.0, 1000.0);

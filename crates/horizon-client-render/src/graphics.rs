@@ -866,12 +866,26 @@ impl Graphics {
 pub const CUBIC_VERTICAL_MIN: u32 = 2;
 pub const CUBIC_VERTICAL_MAX: u32 = 32;
 pub const CUBIC_VERTICAL_DEFAULT: u32 = 8;
+/// LOD Distance "World" (`lodDistance:world`): far terrain reaches the whole world, past the
+/// world border. The far planners treat any distance this big as the whole world.
+pub const LOD_WORLD: u32 = crate::lod::MAX_CHUNKS;
+/// Whether a fresh settings file (or one without `lodDistance`) has LOD Distance Auto. Off for
+/// now: World is a new choice and the default stays Off until Lyle says otherwise; `true` makes
+/// Auto (World in a cubic world, off in a vanilla one) the default.
+pub const LOD_DISTANCE_AUTO_DEFAULT: bool = false;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Graphics {
     pub preset: Preset,
-    /// Distant surface terrain range, in chunks; 0 disables LODs.
+    /// Distant surface terrain range, in chunks; 0 disables LODs, [`LOD_WORLD`] is the whole
+    /// world. While [`Graphics::lod_distance_auto`] is set this is 0 and unused: read the
+    /// distance through [`Graphics::lod_distance_for`].
     pub lod_distance: u32,
+    /// LOD Distance is Auto (`lodDistance:auto`; a fresh file and one without the key too when
+    /// [`LOD_DISTANCE_AUTO_DEFAULT`]): the whole
+    /// world in an Earth or Custom Cubic world, off elsewhere. Moving the slider or picking a
+    /// preset sets an explicit [`Graphics::lod_distance`].
+    pub lod_distance_auto: bool,
     /// Cubic levels: cubes loaded above and below the player's cube
     /// (`CUBIC_VERTICAL_MIN..=CUBIC_VERTICAL_MAX`), the vertical view distance.
     pub cubic_vertical: u32,
@@ -1027,6 +1041,7 @@ impl Default for Graphics {
         Self {
             preset: Preset::Custom,
             lod_distance: 0,
+            lod_distance_auto: LOD_DISTANCE_AUTO_DEFAULT,
             cubic_vertical: CUBIC_VERTICAL_DEFAULT,
             gpu_far: true,
             far_detail: FarDetail::Full,
@@ -1156,6 +1171,29 @@ impl Graphics {
             ..before.clone()
         }
     }
+    /// The LOD Distance far terrain uses, in chunks: the explicit choice, or for Auto the whole
+    /// world ([`LOD_WORLD`]) in a `cubic_world` (Earth, Custom Cubic) and off elsewhere.
+    pub fn lod_distance_for(&self, cubic_world: bool) -> u32 {
+        match (self.lod_distance_auto, cubic_world) {
+            (true, true) => LOD_WORLD,
+            (true, false) => 0,
+            (false, _) => self.lod_distance,
+        }
+    }
+    /// Sets an explicit LOD Distance (the slider, a preset, `horizon-ctl lod-distance`).
+    pub fn set_lod_distance(&mut self, chunks: u32) {
+        (self.lod_distance, self.lod_distance_auto) = (chunks.min(LOD_WORLD), false);
+    }
+    /// `lodDistance`'s value in the file: `auto`, `world` or the chunks.
+    pub fn lod_distance_text(&self) -> String {
+        if self.lod_distance_auto {
+            "auto".into()
+        } else if self.lod_distance >= LOD_WORLD {
+            "world".into()
+        } else {
+            self.lod_distance.to_string()
+        }
+    }
     pub fn parse(text: &str) -> Self {
         let mut g = Self::default();
         // UI Brightness: `hdrUiNits`, else an older file's share of Paper White.
@@ -1175,9 +1213,15 @@ impl Graphics {
             let number = |d: u32| value.parse().unwrap_or(d);
             match key.trim() {
                 "preset" => g.preset = Preset::parse(value),
-                "lodDistance" => {
-                    g.lod_distance = number(g.lod_distance).min(crate::lod::MAX_CHUNKS)
-                }
+                "lodDistance" => match value {
+                    "auto" => (g.lod_distance, g.lod_distance_auto) = (0, true),
+                    "world" => (g.lod_distance, g.lod_distance_auto) = (LOD_WORLD, false),
+                    _ => {
+                        if let Ok(n) = value.parse::<u32>() {
+                            (g.lod_distance, g.lod_distance_auto) = (n.min(LOD_WORLD), false)
+                        }
+                    }
+                },
                 "cubicVertical" => {
                     g.cubic_vertical =
                         number(g.cubic_vertical).clamp(CUBIC_VERTICAL_MIN, CUBIC_VERTICAL_MAX)
@@ -1323,7 +1367,7 @@ impl Graphics {
         let mut text = format!(
             "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nopaqueIce:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\npbrBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\ndynamicResolution:{}\ntargetFps:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nupscalingSharpness:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiNits:{}\nhdrColorBoost:{}\nhdrLook:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\ngpuCulling:{}\nparallelTick:{}\ncubicVertical:{}\ngpuFarTerrain:{}\ncubicFarDetail:{}\n",
             self.preset.name(),
-            self.lod_distance,
+            self.lod_distance_text(),
             self.far_detail.name(),
             bool_text(self.cave_culling),
             self.entity_culling.name(),
@@ -1765,6 +1809,7 @@ mod tests {
         let g = Graphics {
             preset: Preset::Balanced,
             lod_distance: 256,
+            lod_distance_auto: false,
             cubic_vertical: 13,
             gpu_far: false,
             far_detail: FarDetail::Reduced,
@@ -2091,18 +2136,60 @@ mod tests {
 
     #[test]
     fn lod_distance_is_opt_in_and_bounded() {
-        assert_eq!(Graphics::default().lod_distance, 0);
-        for distance in [0, 64, 128, 256, 512, 1024, 65_536, crate::lod::MAX_CHUNKS] {
-            let g = Graphics::parse(&format!("lodDistance:{distance}\n"));
-            assert_eq!(g.lod_distance, distance);
+        // A fresh file, one without the key or with nonsense: the default, Off for now.
+        let fresh = Graphics::default();
+        assert_eq!(fresh.lod_distance_auto, LOD_DISTANCE_AUTO_DEFAULT);
+        assert_eq!(fresh.lod_distance, 0);
+        for text in ["", "lodDistance:invalid\n", "lodDistance:-1\n"] {
+            let g = Graphics::parse(text);
+            assert_eq!(g.lod_distance_auto, LOD_DISTANCE_AUTO_DEFAULT, "{text:?}");
+            assert_eq!(g.lod_distance_for(false), 0);
             assert_eq!(Graphics::parse(&g.serialize()), g);
         }
+        if !LOD_DISTANCE_AUTO_DEFAULT {
+            assert_eq!(fresh.lod_distance_for(true), 0, "today's default: off in Earth too");
+        }
+        // Auto: the whole world in a cubic world, off in a vanilla one.
+        let auto = Graphics::parse("lodDistance:auto\n");
+        assert!(auto.lod_distance_auto);
+        assert_eq!(auto.lod_distance_for(false), 0);
+        assert_eq!(auto.lod_distance_for(true), 1 << 22);
+        assert!(auto.serialize().contains("\nlodDistance:auto\n"));
+        assert_eq!(Graphics::parse(&auto.serialize()), auto);
+        for distance in [0, 64, 128, 256, 512, 1024, 65_536] {
+            let g = Graphics::parse(&format!("lodDistance:{distance}\n"));
+            assert_eq!((g.lod_distance, g.lod_distance_auto), (distance, false));
+            assert_eq!(
+                g.lod_distance_for(true),
+                distance,
+                "explicit wins in a cubic world"
+            );
+            assert!(
+                g.serialize()
+                    .contains(&format!("\nlodDistance:{distance}\n"))
+            );
+            assert_eq!(Graphics::parse(&g.serialize()), g);
+        }
+        // World, written as a word; a number at or past it reads as World.
+        for text in [
+            "lodDistance:world\n",
+            "lodDistance:99999999\n",
+            "lodDistance:4194304\n",
+        ] {
+            let g = Graphics::parse(text);
+            assert_eq!((g.lod_distance, g.lod_distance_auto), (LOD_WORLD, false));
+            assert_eq!(g.lod_distance_for(false), LOD_WORLD);
+            assert!(g.serialize().contains("\nlodDistance:world\n"));
+            assert_eq!(Graphics::parse(&g.serialize()), g);
+        }
+        let mut g = Graphics::default();
+        g.set_lod_distance(0);
         assert_eq!(
-            Graphics::parse("lodDistance:99999999\n").lod_distance,
-            crate::lod::MAX_CHUNKS
+            g.lod_distance_for(true),
+            0,
+            "an explicit Off stays off in Earth"
         );
-        assert_eq!(Graphics::parse("lodDistance:-1\n").lod_distance, 0);
-        assert_eq!(Graphics::parse("lodDistance:invalid\n").lod_distance, 0);
+        assert_eq!(Graphics::parse(&g.serialize()), g);
     }
 
     #[test]

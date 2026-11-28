@@ -141,7 +141,7 @@ pub fn apply_preset(preset: Preset, s: &mut Settings) {
     s.graphics_preset = "custom".into();
     let g = &mut s.horizon;
     g.preset = preset;
-    g.lod_distance = t.lod_distance;
+    g.set_lod_distance(t.lod_distance);
     g.cave_culling = true;
     g.gpu_culling = GpuCullingMode::Auto;
     g.entity_culling = EntityCullingMode::Asynchronous;

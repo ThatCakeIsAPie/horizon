@@ -47,7 +47,10 @@ const NEW: u32 = 2u;
 // w: 1 alone for NEW.
 @fragment fn fs_motion(in: Out) -> @location(0) vec4<f32> {
     let stored = textureLoad(depth, vec2<i32>(in.clip.xy), 0).r;
-    let tolerance = stored * 1e-3 + 1e-7;
+    // Relative (reversed depth is 0.05 / distance, without a far plane): an absolute floor
+    // over 1e-12 would take a fragment 5e5 blocks out for the sky's 0, or for anything else
+    // far.
+    let tolerance = stored * 1e-3 + 1e-12;
     // Not what the world shows here: a transparent texel, or behind something.
     if (in.flags & TRANSLUCENT) != 0u {
         let alpha = textureSampleLevel(atlas, atlas_sampler, in.uv, 0.0).a;

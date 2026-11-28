@@ -29,13 +29,13 @@ fn oit_terrain_color(in: TerrainOut) -> vec4<f32> {
     let seen = oit_sample_transmittance(vec2<i32>(in.clip.xy),
         oit_normalize_depth(in.clip.z, in.clip.xy), 1.0 - color.a);
     let weighted = vec4(color.rgb * color.a, color.a) * seen;
-    let f = max(linear_fog(in.spherical, globals.fog.x, globals.fog.y),
-                linear_fog(in.cylindrical, globals.fog.z, globals.fog.w));
+    // The terrain's fog with the far view's air (terrain.wgsl's `apply_world_fog`).
+    let f = world_fog_amount(in.spherical, in.cylindrical, terrain_rel_height(in));
     // The fog colour is premultiplied by the same weight.
-    let rgb = mix(weighted.rgb, globals.fog_color.rgb * weighted.a, f * globals.fog_color.a);
+    let rgb = mix(weighted.rgb, globals.fog_color.rgb * weighted.a, f);
     if HDR_WRITE_LIGHT && globals.hdr_light.w != 0.0 {
         // Convert the surface before weighting: the light behind it is never its own.
-        let fogged = mix(color.rgb, globals.fog_color.rgb, f * globals.fog_color.a);
+        let fogged = mix(color.rgb, globals.fog_color.rgb, f);
         return vec4(hdr_written(fogged, 1.0, globals.hdr_settings) * weighted.a, weighted.a);
     }
     return vec4(rgb, weighted.a);

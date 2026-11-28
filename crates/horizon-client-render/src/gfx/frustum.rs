@@ -201,14 +201,23 @@ pub(super) fn block_entities_within_reach<'a>(
 pub(super) fn shadow_casters(view_proj: Mat4, light: Vec3) -> [Frustum; 2] {
     let faces = frustum(view_proj);
     let toward = faces.map(|p| p.truncate().dot(light) >= 0.0);
+    // A lens without a far plane (`WORLD_FAR`) has no far face (`frustum` makes it take in
+    // everything) and its far corners are at infinity: those corners are taken on the same
+    // rays at depth `NO_FAR_DEPTH` instead, and no edge of the far face makes a plane.
+    let no_far = faces[4] == Vec4::W;
     let inverse = view_proj.inverse();
     // Corner (x, y, z) of clip space's box; `frustum`'s faces at x -1 and 1 are 0 and 1, at
     // y -1 and 1 are 2 and 3, at depth 0 and 1 are 4 and 5.
     let corner = |c: [usize; 3]| {
+        let depth = if no_far && c[2] == 0 {
+            NO_FAR_DEPTH
+        } else {
+            c[2] as f32
+        };
         inverse.project_point3(Vec3::new(
             c[0] as f32 * 2.0 - 1.0,
             c[1] as f32 * 2.0 - 1.0,
-            c[2] as f32,
+            depth,
         ))
     };
     let corners: Vec<[usize; 3]> = (0..8).map(|i| [i & 1, (i >> 1) & 1, i >> 2]).collect();
@@ -230,7 +239,7 @@ pub(super) fn shadow_casters(view_proj: Mat4, light: Vec3) -> [Frustum; 2] {
             b[axis] = 1;
             // The edge from a to b lies on the faces of the two other axes.
             let [f, g] = [(axis + 1) % 3, (axis + 2) % 3].map(|o| o * 2 + a[o]);
-            if toward[f] == toward[g] {
+            if toward[f] == toward[g] || (no_far && (f == 4 || g == 4)) {
                 continue;
             }
             let (p, q) = (corner(*a), corner(b));
@@ -256,6 +265,10 @@ pub(super) fn shadow_casters(view_proj: Mat4, light: Vec3) -> [Frustum; 2] {
     });
     [a, b]
 }
+/// The depth `shadow_casters` takes a lens's far corners at when it has no far plane:
+/// `NEAR_PLANE / 1e-4` = 500 blocks out, on the same rays from the eye as the corners at
+/// infinity, so the side edges keep their directions.
+const NO_FAR_DEPTH: f32 = 1e-4;
 pub(super) fn taa_frustum(view_proj: Mat4, rendered_size: [u32; 2]) -> Frustum {
     // TAA shifts clip x/y by at most half a rendered pixel times clip w.
     // Widen x/y before extracting the planes: this includes every such shifted
@@ -266,6 +279,10 @@ pub(super) fn taa_frustum(view_proj: Mat4, rendered_size: [u32; 2]) -> Frustum {
     }
 }
 
+/// The six planes of `m`, each facing in and with a unit normal: x -1 and 1, y -1 and 1, then
+/// depth 0 (the far plane) and 1 (the near plane). A plane without a direction takes in
+/// everything (`Vec4::W`): the far plane of a lens without one (`WORLD_FAR`, whose depth row
+/// is the near plane's distance alone), which then culls nothing for being far.
 pub(super) fn frustum(m: Mat4) -> [Vec4; 6] {
     let r = |i| m.row(i);
     let planes = [
@@ -276,5 +293,12 @@ pub(super) fn frustum(m: Mat4) -> [Vec4; 6] {
         r(2),
         r(3) - r(2),
     ];
-    planes.map(|p| p / p.truncate().length())
+    planes.map(|p| {
+        let length = p.truncate().length();
+        if length.is_normal() {
+            p / length
+        } else {
+            Vec4::W
+        }
+    })
 }

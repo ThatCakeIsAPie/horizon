@@ -50,14 +50,18 @@ use std::{
     time::SystemTime,
 };
 
-/// The coarsest level kept on disk (nodes 262,144 blocks wide): above the
-/// root of any far view (`lodDistance` 1024 chunks = 16,384 blocks needs
-/// level 10).
-pub const MAX_CACHED_LEVEL: u8 = 14;
+/// The coarsest level kept on disk: every level, up to the octree's root
+/// ([`MAX_CUBE_LEVEL`], 67,108,864 blocks wide), so a far view of the whole
+/// world (`lodDistance:world`, roots of that level) is cached to its top.
+/// Bucket coordinates are node coordinates over [`BUCKET`] rounded down
+/// (negative included), exact at every level.
+pub const MAX_CACHED_LEVEL: u8 = MAX_CUBE_LEVEL;
 const _: () = assert!(MAX_CACHED_LEVEL <= MAX_CUBE_LEVEL);
 /// A world's cache size when `HORIZON_FAR_DISK_MB` does not say.
 pub const DEFAULT_CAP_MB: u64 = 1024;
-const FORMAT: u32 = 4;
+/// 5: levels 15 to 22 are stored too (4 stopped at 14, and its coarser
+/// parents were never written).
+const FORMAT: u32 = 5;
 const FINGERPRINT: &str = "fingerprint.txt";
 /// Nodes along one side of a bucket file.
 const BUCKET: i32 = 8;
@@ -184,6 +188,10 @@ impl Bucket {
                 }
                 let int = |at: usize| i32::from_le_bytes(head[at..at + 4].try_into().unwrap());
                 let key = CubeKey::new(head[1], int(2), int(6), int(10));
+                // No level past the root: the record is not one of ours.
+                if key.level > MAX_CACHED_LEVEL {
+                    break;
+                }
                 match head[0] {
                     NODE => index.insert(key, Some((content, length, false))),
                     COARSE => index.insert(key, Some((content, length, true))),
@@ -285,10 +293,8 @@ impl Bucket {
         // Writing is using: the file goes to the back of the eviction line.
         let _ = file.set_modified(SystemTime::now());
         for (&(kind, key, _), at) in records.iter().zip(placed) {
-            self.index.insert(
-                key,
-                (kind != ERASE).then_some((at.0, at.1, kind == COARSE)),
-            );
+            self.index
+                .insert(key, (kind != ERASE).then_some((at.0, at.1, kind == COARSE)));
         }
         self.end += out.len() as u64;
         Ok(())
@@ -929,10 +935,16 @@ mod tests {
         }
         let refs: [&CubeNode; 8] = std::array::from_fn(|i| &got[i]);
         let air = BlockStateId(0);
-        let merged = downsample(refs, air, |s| {
-            if s == air { Kind::Air } else { Kind::Fluid }
-        });
-        let tops = merged.fluid_tops().expect("the parent of cached children has tops");
+        let merged = downsample(
+            refs,
+            air,
+            |s| {
+                if s == air { Kind::Air } else { Kind::Fluid }
+            },
+        );
+        let tops = merged
+            .fluid_tops()
+            .expect("the parent of cached children has tops");
         assert!(tops.iter().all(|&h| h == 4096));
         // And the parent put and read back keeps them.
         cache.put(&merged);
@@ -1240,6 +1252,39 @@ mod tests {
         assert_eq!(bytes_of(&dir2), 30 * one);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn the_top_levels_round_trip_with_negative_keys() {
+        let dir = scratch("top");
+        // The whole world's roots and their children: level 22 at -1 (blocks
+        // -67,108,864 up), level 21 at the world's far corners.
+        let keys = [
+            CubeKey::new(MAX_CUBE_LEVEL, -1, -1, -1),
+            CubeKey::new(MAX_CUBE_LEVEL, 0, -1, 0),
+            CubeKey::new(MAX_CUBE_LEVEL - 1, -1, 0, 1),
+            CubeKey::new(15, -57, -16, 56),
+        ];
+        assert_eq!(BucketId::of(keys[0]).file(), "n22.-1.-1.-1.bin");
+        assert_eq!(BucketId::parse("n22.-1.-1.-1.bin").map(|b| b.0), Some(22));
+        {
+            let cache = CubeLodCache::open(&dir, "a").unwrap();
+            for (i, &key) in keys.iter().enumerate() {
+                cache.put(&dense(key, i as u32 + 1));
+            }
+        }
+        let cache = CubeLodCache::open(&dir, "a").unwrap();
+        for (i, &key) in keys.iter().enumerate() {
+            assert!(cache.contains(key), "{key:?}");
+            same(&cache.get(key).unwrap(), &dense(key, i as u32 + 1));
+        }
+        // A neighbour in the same bucket is not there.
+        assert!(
+            cache
+                .get(CubeKey::new(MAX_CUBE_LEVEL, -2, -1, -1))
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

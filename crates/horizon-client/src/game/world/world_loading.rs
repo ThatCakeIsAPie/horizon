@@ -1404,7 +1404,7 @@ pub(super) fn make_streaming(
                 let started = std::time::Instant::now();
                 let far = settings
                     .horizon
-                    .lod_distance
+                    .lod_distance_for(true)
                     .min(horizon_client::earth_prefetch::MAX_FAR_CHUNKS as u32)
                     as i32;
                 let done = horizon_client::earth_prefetch::preload(

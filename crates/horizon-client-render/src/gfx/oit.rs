@@ -1165,17 +1165,23 @@ mod tests {
 
     #[test]
     fn a_device_depth_gives_the_distance_along_the_view_axis() {
-        // The world's reversed-Z projection: near plane at depth 1.
-        let projection = super::super::world_projection(70.0, 16.0 / 9.0, 512.0);
-        let [x, y] = projection_terms(&projection);
-        for distance in [0.1_f32, 1.0, 7.5, 64.0, 500.0] {
-            let clip = projection * glam::Vec4::new(0.0, 0.0, -distance, 1.0);
-            let device = clip.z / clip.w;
-            let linear = y / (device + x);
-            assert!(
-                (linear - distance).abs() < distance * 2e-3,
-                "{distance}: {linear}"
-            );
+        // The world's reversed-Z projection: near plane at depth 1; a pack's finite one and
+        // the game's own without a far plane (out to 3e7 blocks).
+        for far in [512.0, crate::gfx::WORLD_FAR] {
+            let projection = super::super::world_projection(70.0, 16.0 / 9.0, far);
+            let [x, y] = projection_terms(&projection);
+            for distance in [0.1_f32, 1.0, 7.5, 64.0, 500.0, 1e5, 2e7, 3e7] {
+                if distance >= far {
+                    continue;
+                }
+                let clip = projection * glam::Vec4::new(0.0, 0.0, -distance, 1.0);
+                let device = clip.z / clip.w;
+                let linear = y / (device + x);
+                assert!(
+                    (linear - distance).abs() < distance * 2e-3,
+                    "{far} {distance}: {linear}"
+                );
+            }
         }
     }
 
