@@ -435,6 +435,22 @@ impl<'a> SectionLists<'a> {
         count: u32,
         pulled: bool,
     ) {
+        let flat = self.flat;
+        self.draw_grouped(pass, indirect, (base, first, count), pulled, |page| {
+            flat.and_then(|f| f.page_group(page))
+        });
+    }
+
+    /// `draw` with the pages' group 1 from `group` (the flat draws' page groups, or the
+    /// terrain visibility buffer's).
+    pub(super) fn draw_grouped<'g>(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        indirect: &wgpu::Buffer,
+        (base, first, count): (u32, u32, u32),
+        pulled: bool,
+        group: impl Fn(u32) -> Option<&'g wgpu::BindGroup>,
+    ) {
         let (draws, pages) = (self.draws, self.pages);
         let (mut i, end) = (first as usize, (first + count) as usize);
         while i < end {
@@ -462,7 +478,7 @@ impl<'a> SectionLists<'a> {
             // ones, and the translucent ones without an arena of their own.
             if pulled
                 && (index_page.is_none() || self.translucent_arena.is_none())
-                && let Some(group) = self.flat.and_then(|f| f.page_group(page))
+                && let Some(group) = group(page)
             {
                 pass.set_bind_group(1, group, &[]);
             }
@@ -631,6 +647,9 @@ mod upload_retry;
 use upload_retry::UploadRetries;
 mod view;
 mod view_sections;
+mod vis_terrain;
+#[cfg(test)]
+mod vis_terrain_tests;
 mod visbuffer;
 mod wgsl_prefix;
 mod world_handover;
@@ -1670,6 +1689,10 @@ pub struct Renderer {
     /// The visibility buffer for flat frames' solid terrain (`visbuffer`,
     /// `HORIZON_VISBUFFER=1`).
     visbuf: Option<visbuffer::Visbuffer>,
+    /// The terrain visibility buffer of the frames drawn per section (`vis_terrain`), and its
+    /// same-session A/B knob.
+    vis_terrain: Option<vis_terrain::VisTerrain>,
+    vis_toggle: vis_terrain::Toggle,
     /// Hardware task+mesh solid terrain (`mesh_shader`, `HORIZON_MESH_SHADER=1`).
     mesh_terrain: Option<surface_setup::mesh_shader::MeshTerrain>,
     /// Reusable per-frame scratch of `(page, solid_base, fading)` for visible Phase 1 mesh sections.
@@ -4643,6 +4666,27 @@ impl Renderer {
                     &sprite_constants,
                 )
             });
+        // The terrain visibility buffer of the frames drawn per section: the pulled solid
+        // pipelines' vertex stage and `SolidPipeline`'s two sets of fragment constants.
+        let vis_terrain = flat
+            .as_ref()
+            .filter(|_| vis_terrain::env_allows())
+            .and_then(|_| {
+                let origins = [None, terrain_buffers[1].clone()];
+                let frame = linear_blend::frame_constants(frame_format, linear_light);
+                let plain = [&plain_constants[..], &frame[..]].concat();
+                let lit = [&sprite_constants[..], &frame[..]].concat();
+                vis_terrain::VisTerrain::new(
+                    &device,
+                    &vis_terrain::SectionSetup {
+                        terrain: &bindings,
+                        buffers: &origins,
+                        format: frame_format,
+                        plain_constants: &plain,
+                        hdr_constants: hdr_output.is_some().then_some(&lit[..]),
+                    },
+                )
+            });
         let mesh_terrain = flat.as_ref().and_then(|f| {
             surface_setup::mesh_shader::MeshTerrain::new(
                 &device,
@@ -4876,6 +4920,8 @@ impl Renderer {
             cull,
             flat,
             visbuf,
+            vis_terrain,
+            vis_toggle: vis_terrain::Toggle::from_env(),
             mesh_terrain,
             mesh_visible_scratch: Vec::new(),
             sky,
@@ -6111,6 +6157,43 @@ impl Renderer {
     /// then bind each page's group, as `draw_solid_sections` does.
     fn translucent_pulled(&self) -> bool {
         translucent_pulled(&self.info, self.multi_draw, self.flat.is_some())
+    }
+    /// `draw_sections_from`, or with `vis` its draws into the terrain visibility buffer's IDs
+    /// (its page groups, which tag the IDs with the page).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_sections_vis(
+        &self,
+        vis: Option<&vis_terrain::VisTerrain>,
+        pass: &mut wgpu::RenderPass<'_>,
+        indirect: &wgpu::Buffer,
+        base: u32,
+        first: u32,
+        count: u32,
+        pulled: bool,
+    ) {
+        match vis {
+            Some(vis) => self.section_lists().draw_grouped(
+                pass,
+                indirect,
+                (base, first, count),
+                true,
+                |page| vis.page_group(vis_terrain::id::SECTION, page),
+            ),
+            None => self.draw_sections_from(pass, indirect, base, first, count, pulled),
+        }
+    }
+    fn section_lists(&self) -> SectionLists<'_> {
+        SectionLists {
+            draws: &self.draws,
+            pages: &self.draw_pages,
+            arena: &self.arena,
+            translucent_arena: self.translucent_arena.as_ref(),
+            sorted_indices: &self.sorted_indices,
+            indices: &self.indices,
+            flat: self.flat.as_ref(),
+            multi_draw: self.multi_draw,
+            looks: self.look_groups.as_ref(),
+        }
     }
     fn draw_sections_from(
         &self,
@@ -11028,6 +11111,34 @@ impl Renderer {
                 vis.fit(&self.device, [depth.width(), depth.height()], flat)
             };
         }
+        // Solid terrain through the terrain visibility buffer (`vis_terrain`) on the frames
+        // drawn per section, where nothing else owns the solid terrain or its look.
+        self.vis_toggle.poll(Instant::now());
+        let vis_terrain_frame = vis_terrain::frame_uses(&vis_terrain::Facts {
+            built: self.vis_terrain.is_some(),
+            wanted: self.vis_toggle.vis().unwrap_or(true),
+            flat_frame: flat_frame || mesh_frame,
+            pulled: self.flat.is_some(),
+            msaa: msaa_on,
+            title: frame.title,
+            pack_terrain: pack_terrain || pack_draws_terrain,
+            material: material.is_some(),
+            surface: surface.is_some(),
+            shadow: shadow_view.is_some(),
+            looks: self.look_groups.is_some(),
+            executor: self.executor.is_some(),
+            gpu_culling: gpu_frame && self.gpu_culling.is_some(),
+            pages: (self.arena.page_buffers())
+                .map(|(page, _)| page + 1)
+                .max()
+                .unwrap_or(0),
+        }) && self.vis_terrain.as_mut().is_some_and(|vis| {
+            let depth = world_depth.texture();
+            vis.fit(&self.device, [depth.width(), depth.height()])
+        });
+        if vis_terrain_frame && let Some(vis) = &mut self.vis_terrain {
+            vis.bind_pages(&self.device, self.arena.page_buffers());
+        }
         {
             let attachments = [Some(wgpu::RenderPassColorAttachment {
                 view: world_view,
@@ -11053,7 +11164,12 @@ impl Renderer {
                         load: wgpu::LoadOp::Clear(0.0),
                         // The visibility buffer's passes, and those after an occlusion test,
                         // draw on after it.
-                        store: if cull.is_some() || gpu_occluding || far_occluding || keep_depth || vis_frame
+                        store: if cull.is_some()
+                            || gpu_occluding
+                            || far_occluding
+                            || keep_depth
+                            || vis_frame
+                            || vis_terrain_frame
                         {
                             wgpu::StoreOp::Store
                         } else {
@@ -11490,6 +11606,28 @@ impl Renderer {
                         ],
                         _ => &[(solid_pipeline, 0..phase1_draws, phase1_draws..solid_draws)],
                     };
+                    // The terrain visibility buffer: the same draws, their IDs into its ID
+                    // passes (the occlusion test in a pass of its own), resolved below.
+                    let vis = self.vis_terrain.as_ref().filter(|_| vis_terrain_frame);
+                    let vis_passes;
+                    let passes = match vis {
+                        Some(vis) => {
+                            let ids = vis.section_ids();
+                            vis_passes = [(ids, 0..phase1_draws, phase1_draws..solid_draws)];
+                            &vis_passes[..]
+                        }
+                        None => passes,
+                    };
+                    if let Some(vis) = vis {
+                        drop(pass);
+                        pass = vis.id_pass(
+                            &mut encoder,
+                            world_depth,
+                            true,
+                            self.own_timing.as_mut(),
+                        );
+                        pass.set_bind_group(0, &self.group, &[]);
+                    }
                     // The solid pipelines, a native material's too, read the page themselves.
                     let pulled = self.flat.is_some();
                     pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -11499,10 +11637,11 @@ impl Renderer {
                     // phase 0 in the first pass, phase 1 (what its Hi-Z test saw) in the next.
                     let far = self.far_cull.as_ref().filter(|_| far_gpu_frame);
                     // Pulled pipelines read the page's vertices through its flat group.
-                    let far_group = |page: u32| {
-                        pulled
+                    let far_group = |page: u32| match vis {
+                        Some(vis) => vis.page_group(vis_terrain::id::FAR_TILE, page),
+                        None => (pulled)
                             .then(|| self.flat.as_ref()?.page_group(page))
-                            .flatten()
+                            .flatten(),
                     };
                     match cull {
                         Some(cull) => {
@@ -11512,7 +11651,8 @@ impl Renderer {
                             // both targets (it reads the test's results).
                             for (pipeline, draws, _) in passes {
                                 pass.set_pipeline(pipeline);
-                                self.draw_sections_from(
+                                self.draw_sections_vis(
+                                    vis,
                                     &mut pass,
                                     &self.indirect,
                                     0,
@@ -11532,7 +11672,7 @@ impl Renderer {
                                 }
                             }
                             if cull.early() {
-                                if surface.is_some() {
+                                if surface.is_some() || vis.is_some() {
                                     drop(pass);
                                     pass = plain_pass(&mut encoder);
                                 }
@@ -11553,6 +11693,14 @@ impl Renderer {
                             }
                             pass = match &surface {
                                 Some(surface) => terrain_pass(&mut encoder, surface, false),
+                                None if let Some(vis) = vis => {
+                                    vis.id_pass(
+                                        &mut encoder,
+                                        world_depth,
+                                        false,
+                                        self.own_timing.as_mut(),
+                                    )
+                                }
                                 None => world_pass_after_culling(
                                     &mut encoder,
                                     world_view,
@@ -11573,7 +11721,8 @@ impl Renderer {
                             pass.stage(self.own_timing.as_mut(), "solid terrain phase 2");
                             for (pipeline, _, draws) in passes {
                                 pass.set_pipeline(pipeline);
-                                self.draw_sections_from(
+                                self.draw_sections_vis(
+                                    vis,
                                     &mut pass,
                                     &cull.phase2,
                                     phase1_draws,
@@ -11617,7 +11766,8 @@ impl Renderer {
                                     pass.set_vertex_buffer(1, self.instances.slice(..));
                                 }
                                 if !occluding {
-                                    self.draw_sections_from(
+                                    self.draw_sections_vis(
+                                        vis,
                                         &mut pass,
                                         &self.indirect,
                                         0,
@@ -11669,6 +11819,14 @@ impl Renderer {
                                 gpu.compact(&mut encoder, self.own_timing.as_mut());
                                 pass = match &surface {
                                     Some(surface) => terrain_pass(&mut encoder, surface, false),
+                                    None if let Some(vis) = vis => {
+                                        vis.id_pass(
+                                            &mut encoder,
+                                            world_depth,
+                                            false,
+                                            self.own_timing.as_mut(),
+                                        )
+                                    }
                                     None => world_pass_after_culling(
                                         &mut encoder,
                                         world_view,
@@ -11696,7 +11854,8 @@ impl Renderer {
                                         self.look_groups.as_ref(),
                                     );
                                     pass.set_vertex_buffer(1, self.instances.slice(..));
-                                    self.draw_sections_from(
+                                    self.draw_sections_vis(
+                                        vis,
                                         &mut pass,
                                         &self.indirect,
                                         0,
@@ -11728,6 +11887,14 @@ impl Renderer {
                                 }
                                 pass = match &surface {
                                     Some(surface) => terrain_pass(&mut encoder, surface, false),
+                                    None if let Some(vis) = vis => {
+                                        vis.id_pass(
+                                            &mut encoder,
+                                            world_depth,
+                                            false,
+                                            self.own_timing.as_mut(),
+                                        )
+                                    }
                                     None => world_pass_after_culling(
                                         &mut encoder,
                                         world_view,
@@ -11761,14 +11928,79 @@ impl Renderer {
                     }
                 }
             }
-            if !frame.title
-                && !pack_draws_terrain
-                && material.is_none()
-                && let Some(far) = &self.cube_far
-            {
+            let cube_far = (self.cube_far.as_ref())
+                .filter(|_| !frame.title && !pack_draws_terrain && material.is_none());
+            let surface_tiles = cube_far.and(self.surface_tiles.as_ref());
+            // The terrain visibility buffer: the GPU far nodes' and surface tiles' IDs too, then
+            // the resolve shades the solid terrain, and the world pass goes on over it. What
+            // has no ID pipelines draws forward after it.
+            if vis_terrain_frame && let Some(vis) = &mut self.vis_terrain {
                 pass.set_bind_group(0, &self.group, &[]);
-                far.draw(&mut pass, false);
-                if let Some(tiles) = &self.surface_tiles {
+                if let Some(far) = cube_far {
+                    far.draw_ids(&mut pass);
+                }
+                if let Some(tiles) = surface_tiles {
+                    tiles.draw_ids(&mut pass);
+                }
+                drop(pass);
+                let sections = vis.group(&self.device, &self.instances);
+                let far = self.far_cull.as_ref().filter(|_| far_gpu_frame);
+                let far_instances = far.map(|f| vis.group(&self.device, f.instance_buffer()));
+                let mut resolve = vis.resolve_pass(
+                    &mut encoder,
+                    world_view,
+                    world_pixels,
+                    self.own_timing.as_mut(),
+                );
+                resolve.set_bind_group(0, &self.group, &[]);
+                let drawn = &self.draw_pages[..(solid_draws as usize).min(self.draw_pages.len())];
+                let pages = vis_terrain::distinct_pages(drawn.iter().map(|&(page, _)| page));
+                vis.resolve_arena(
+                    &mut resolve,
+                    hdr,
+                    vis_terrain::id::SECTION,
+                    pages.into_iter(),
+                    &sections,
+                );
+                if let (Some(far), Some(group)) = (far, &far_instances) {
+                    let pages = vis_terrain::distinct_pages(far.drawn_pages());
+                    vis.resolve_arena(
+                        &mut resolve,
+                        hdr,
+                        vis_terrain::id::FAR_TILE,
+                        pages.into_iter(),
+                        group,
+                    );
+                }
+                if let Some(far) = cube_far {
+                    far.resolve(&mut resolve, hdr, &sections);
+                }
+                if let Some(tiles) = surface_tiles {
+                    tiles.resolve(&mut resolve, hdr, &sections);
+                }
+                drop(resolve);
+                pass = world_pass_after_culling(
+                    &mut encoder,
+                    world_view,
+                    world_depth,
+                    keep_depth,
+                    self.own_timing.as_mut(),
+                    "World after visibility buffer",
+                    world_pixels,
+                );
+                pass.set_bind_group(0, &self.group, &[]);
+                pack_frame(&mut pass);
+                pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.set_vertex_buffer(1, self.instances.slice(..));
+            }
+            if let Some(far) = cube_far {
+                pass.set_bind_group(0, &self.group, &[]);
+                if !vis_terrain_frame || !far.draws_ids() {
+                    far.draw(&mut pass, false);
+                }
+                if let Some(tiles) = surface_tiles
+                    && (!vis_terrain_frame || !tiles.draws_ids())
+                {
                     tiles.draw(&mut pass, false);
                 }
             }

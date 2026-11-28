@@ -1139,6 +1139,17 @@ impl FarCull {
     }
 
     /// Draw calls `draw` makes.
+    /// The arena pages this frame's draws read (the terrain visibility buffer resolves each).
+    pub fn drawn_pages(&self) -> impl Iterator<Item = u32> + '_ {
+        self.pages.iter().map(|&(page, _, _)| page)
+    }
+
+    /// The draws' origins, which their first instance indexes (the visibility buffer's
+    /// resolve reads them as storage).
+    pub fn instance_buffer(&self) -> &wgpu::Buffer {
+        &self.instances.buffer
+    }
+
     pub fn draw_calls(&self) -> usize {
         self.pages.len()
     }

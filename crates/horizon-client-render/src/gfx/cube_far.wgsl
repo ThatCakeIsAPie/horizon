@@ -39,6 +39,12 @@ fn cf_shade(dir: u32) -> f32 {
 // What crosses to terrain.wgsl's fragment stages is `TerrainWire` (`to_wire`).
 @vertex fn vs_cube_quads(@builtin(vertex_index) vertex: u32,
     @builtin(instance_index) node: u32) -> TerrainWire {
+    return to_wire(cf_quad_vertex(vertex, node));
+}
+
+// `vs_cube_quads`'s vertex, which the terrain visibility buffer's resolve calls for a
+// triangle's corners (gfx/vis_terrain_cube.wgsl).
+fn cf_quad_vertex(vertex: u32, node: u32) -> TerrainOut {
     let qi = vertex / 6u;
     let k = vertex % 6u;
     var corner = k;
@@ -127,9 +133,9 @@ fn cf_shade(dir: u32) -> f32 {
         sky = 64u;
     }
     let light = vec2<u32>(sky, 0u);
-    return to_wire(cf_by_level(
+    return cf_by_level(
         terrain_vertex(position, uv, f.layer, unorm8x4(f.color), light, instance.xyz, instance.w),
-        countTrailingZeros(u32(scale))));
+        countTrailingZeros(u32(scale)));
 }
 
 struct CfFace {
