@@ -180,6 +180,12 @@ impl Record {
             tile.bounds_box(),
         )
         .facing(&s.sides)
+        .voxel(1 << key.level)
+    }
+    /// The record with its voxel size (blocks): `far_raster`'s switch reads it from `a[3]`.
+    fn voxel(mut self, blocks: u32) -> Self {
+        self.a[3] = blocks;
+        self
     }
     pub fn page(&self) -> u32 {
         self.origin[3] as u32
@@ -1141,7 +1147,32 @@ impl FarCull {
         }
     }
 
+    /// What `far_raster` reads of this frame's lists: their buffers and pages, with the
+    /// world pass's `globals`.
+    pub fn raster_inputs<'a>(&'a self, globals: &'a wgpu::Buffer) -> super::far_raster::Inputs<'a> {
+        super::far_raster::Inputs {
+            globals,
+            params: &self.params,
+            records: &self.table.buffer,
+            instances: &self.instances.buffer,
+            draws: &self.draws.buffer,
+            counts: &self.counts.buffer,
+            pages: &self.pages,
+        }
+    }
+
     /// Draw calls `draw` makes.
+    /// The arena pages this frame's draws read (the terrain visibility buffer resolves each).
+    pub fn drawn_pages(&self) -> impl Iterator<Item = u32> + '_ {
+        self.pages.iter().map(|&(page, _, _)| page)
+    }
+
+    /// The draws' origins, which their first instance indexes (the visibility buffer's
+    /// resolve reads them as storage).
+    pub fn instance_buffer(&self) -> &wgpu::Buffer {
+        &self.instances.buffer
+    }
+
     pub fn draw_calls(&self) -> usize {
         self.pages.len()
     }

@@ -204,6 +204,43 @@ fn composed() -> Vec<(&'static str, Vec<&'static str>, String)> {
             vec!["terrain.wgsl", "cube_far.wgsl", "surface_draw.wgsl"],
             crate::gfx::surface_tile::draw_shader_source(),
         ),
+        // The terrain visibility buffer's families (gfx/vis_terrain.rs).
+        (
+            "terrain visibility sections",
+            vec![
+                "terrain.wgsl",
+                "vis_terrain.wgsl",
+                "vis_terrain_section.wgsl",
+            ],
+            super::vis_terrain::source(&super::terrain_shader(), super::vis_terrain::SECTION),
+        ),
+        (
+            "terrain visibility far nodes",
+            vec![
+                "terrain.wgsl",
+                "cube_far.wgsl",
+                "vis_terrain.wgsl",
+                "vis_terrain_cube.wgsl",
+            ],
+            super::vis_terrain::source(
+                &crate::gfx::cube_far::shader_source(),
+                super::vis_terrain::CUBE,
+            ),
+        ),
+        (
+            "terrain visibility surface tiles",
+            vec![
+                "terrain.wgsl",
+                "cube_far.wgsl",
+                "surface_draw.wgsl",
+                "vis_terrain.wgsl",
+                "vis_terrain_surface.wgsl",
+            ],
+            super::vis_terrain::source(
+                &crate::gfx::surface_tile::draw_shader_source(),
+                super::vis_terrain::SURFACE,
+            ),
+        ),
         (
             "far terrain generation",
             vec!["cwg_noise.wgsl", "cube_gen.wgsl"],

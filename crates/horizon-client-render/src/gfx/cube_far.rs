@@ -146,6 +146,8 @@ pub struct CubeFar {
     draw_group: wgpu::BindGroup,
     solid: wgpu::RenderPipeline,
     translucent: wgpu::RenderPipeline,
+    /// The terrain visibility buffer's pipelines (`vis_terrain`), where the device took them.
+    vis: Option<super::vis_terrain::FamilyPipelines>,
     counts: bool,
     nodes: FxHashMap<CubeKey, Held>,
     free_ids: Vec<u32>,
@@ -299,9 +301,10 @@ impl CubeFar {
             label: Some("Cube far terrain"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source())),
         });
+        // The visibility buffer's resolve reads the quads in its fragment stage.
         let vertex_storage = |binding| wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::VERTEX,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: storage(true),
             count: None,
         };
@@ -376,6 +379,29 @@ impl CubeFar {
             "fs_translucent",
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
+        let vis = super::vis_terrain::env_allows()
+            .then(|| {
+                super::vis_terrain::family_pipelines(
+                    device,
+                    &super::vis_terrain::FamilyDesc {
+                        label: "Cube far visibility",
+                        source: super::vis_terrain::source(
+                            &shader_source(),
+                            super::vis_terrain::CUBE,
+                        ),
+                        terrain: setup.bindings,
+                        group1: &draw_layout,
+                        buffers: &[],
+                        cull: Some(wgpu::Face::Back),
+                        id_entry: "vs_vis_cube",
+                        resolve_entry: "fs_vis_resolve_cube",
+                        constants: &constants,
+                        hdr_constants: None,
+                        format: setup.format,
+                    },
+                )
+            })
+            .flatten();
         if let Some(error) = pollster::block_on(validation.pop()) {
             log::warn!("Horizon renderer: far terrain not drawn on the GPU ({error})");
             return None;
@@ -401,6 +427,7 @@ impl CubeFar {
             draw_group,
             solid,
             translucent,
+            vis,
             counts: setup.counts,
             nodes: FxHashMap::default(),
             free_ids: Vec::new(),
@@ -886,6 +913,36 @@ impl CubeFar {
         } else {
             &self.solid
         });
+        self.draw_nodes(pass, water);
+    }
+
+    /// Whether the solid nodes go through the terrain visibility buffer (its pipelines made).
+    pub fn draws_ids(&self) -> bool {
+        self.vis.is_some()
+    }
+
+    /// The solid nodes into the visibility buffer's ID pass (`draws_ids`).
+    pub fn draw_ids(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if let Some(vis) = &self.vis
+            && self.next_id != 0
+            && !self.nodes.is_empty()
+        {
+            pass.set_pipeline(&vis.ids);
+            self.draw_nodes(pass, false);
+        }
+    }
+
+    /// The visibility buffer's resolve of the solid nodes' pixels (`group` its group 2).
+    pub fn resolve(&self, pass: &mut wgpu::RenderPass<'_>, hdr: bool, group: &wgpu::BindGroup) {
+        if let Some(vis) = &self.vis
+            && self.next_id != 0
+            && !self.nodes.is_empty()
+        {
+            vis.resolve_draw(pass, hdr, &self.draw_group, group);
+        }
+    }
+
+    fn draw_nodes(&self, pass: &mut wgpu::RenderPass<'_>, water: bool) {
         pass.set_bind_group(1, &self.draw_group, &[]);
         let args = if water {
             &self.translucent_args

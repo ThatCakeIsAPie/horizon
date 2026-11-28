@@ -1042,6 +1042,8 @@ struct Drawer {
     draw_group: wgpu::BindGroup,
     solid: wgpu::RenderPipeline,
     water: wgpu::RenderPipeline,
+    /// The terrain visibility buffer's pipelines (`vis_terrain`), where the device took them.
+    vis: Option<super::vis_terrain::FamilyPipelines>,
     counts: bool,
 }
 
@@ -1306,9 +1308,10 @@ impl SurfaceTiles {
                 entry(6, &draw_counts),
             ],
         });
+        // The visibility buffer's resolve reads the tiles in its fragment stage.
         let vertex = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::VERTEX,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty,
             count: None,
         };
@@ -1390,6 +1393,29 @@ impl SurfaceTiles {
             "fs_translucent",
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
+        let vis = super::vis_terrain::env_allows()
+            .then(|| {
+                super::vis_terrain::family_pipelines(
+                    device,
+                    &super::vis_terrain::FamilyDesc {
+                        label: "Surface tiles visibility",
+                        source: super::vis_terrain::source(
+                            &draw_shader_source(),
+                            super::vis_terrain::SURFACE,
+                        ),
+                        terrain: setup.bindings,
+                        group1: &draw_layout,
+                        buffers: &[],
+                        cull: Some(wgpu::Face::Back),
+                        id_entry: "vs_vis_surface",
+                        resolve_entry: "fs_vis_resolve_surface",
+                        constants: &constants,
+                        hdr_constants: None,
+                        format: setup.format,
+                    },
+                )
+            })
+            .flatten();
         if let Some(error) = pollster::block_on(validation.pop()) {
             log::warn!("Horizon renderer: surface tiles not drawn ({error})");
             return false;
@@ -1420,6 +1446,7 @@ impl SurfaceTiles {
             draw_group,
             solid,
             water,
+            vis,
             counts: setup.counts,
         });
         true
@@ -1843,6 +1870,38 @@ impl SurfaceTiles {
             return;
         }
         pass.set_pipeline(if water { &d.water } else { &d.solid });
+        self.draw_tiles(pass, d, water);
+    }
+
+    /// Whether the solid tiles go through the terrain visibility buffer (its pipelines made).
+    pub fn draws_ids(&self) -> bool {
+        self.draw.as_ref().is_some_and(|d| d.vis.is_some())
+    }
+
+    /// The solid tiles into the visibility buffer's ID pass (`draws_ids`).
+    pub fn draw_ids(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if let Some(d) = &self.draw
+            && let Some(vis) = &d.vis
+            && self.high_water != 0
+            && !self.tiles.is_empty()
+        {
+            pass.set_pipeline(&vis.ids);
+            self.draw_tiles(pass, d, false);
+        }
+    }
+
+    /// The visibility buffer's resolve of the solid tiles' pixels (`group` its group 2).
+    pub fn resolve(&self, pass: &mut wgpu::RenderPass<'_>, hdr: bool, group: &wgpu::BindGroup) {
+        if let Some(d) = &self.draw
+            && let Some(vis) = &d.vis
+            && self.high_water != 0
+            && !self.tiles.is_empty()
+        {
+            vis.resolve_draw(pass, hdr, &d.draw_group, group);
+        }
+    }
+
+    fn draw_tiles(&self, pass: &mut wgpu::RenderPass<'_>, d: &Drawer, water: bool) {
         pass.set_bind_group(1, &d.draw_group, &[]);
         let args = if water { &d.water_args } else { &d.solid_args };
         if d.counts {

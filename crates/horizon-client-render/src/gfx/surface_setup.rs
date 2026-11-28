@@ -203,6 +203,7 @@ pub(super) async fn open_adapter(
         | oit::features(adapter)
         | super::rt::query::features(adapter, needs.rays)
         | mesh_shader::features(adapter)
+        | super::far_raster::features(adapter)
         | (adapter.features()
             & (wgpu::Features::INDIRECT_FIRST_INSTANCE
                 | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
