@@ -46,7 +46,7 @@ const HELP: &[&str] = &[
     "hotbar 1-9                     select a hotbar slot",
     "give ITEM [COUNT]              add items to the inventory",
     "render-distance N              chunks, 2..128",
-    "lod-distance N                 far surface chunks, 0 disables, up to1024",
+    "lod-distance N|world|auto      far terrain chunks, 0 disables, world reaches the whole world",
     "time TICKS                     set the time of day",
     "summon KIND [X Y Z] [baby]     spawn a mob (in front of the player without a position)",
     "mobs [RADIUS]                  list mobs near the player with their AI state",
@@ -1090,15 +1090,22 @@ impl Game<'_> {
                 ok()
             }
             "lod-distance" => {
-                let n: u32 = arg(1)?.parse()?;
-                if n > horizon_client::lod::MAX_CHUNKS {
-                    return Err(format!(
-                        "LOD distance must be 0..{}",
-                        horizon_client::lod::MAX_CHUNKS
-                    )
-                    .into());
+                let g = &mut self.settings.horizon;
+                match arg(1)? {
+                    "auto" => (g.lod_distance, g.lod_distance_auto) = (0, true),
+                    "world" => g.set_lod_distance(horizon_client::graphics::LOD_WORLD),
+                    n => {
+                        let n: u32 = n.parse()?;
+                        if n > horizon_client::graphics::LOD_WORLD {
+                            return Err(format!(
+                                "LOD distance must be 0..{}, world or auto",
+                                horizon_client::graphics::LOD_WORLD
+                            )
+                            .into());
+                        }
+                        g.set_lod_distance(n);
+                    }
                 }
-                self.settings.horizon.lod_distance = n;
                 self.apply_settings();
                 ok()
             }
@@ -1650,8 +1657,11 @@ impl Game<'_> {
             .collect();
         physical_keys.sort();
         let lod = json!({
-            "distance": self.settings.horizon.lod_distance,
-            "effective_distance": self.lod_distance(),
+            "distance": lod_distance_json(
+                self.settings.horizon.lod_distance_auto,
+                self.settings.horizon.lod_distance
+            ),
+            "effective_distance": lod_distance_json(false, self.lod_distance()),
             "terrain_distance": self.terrain_distance(),
             "source": if self.lod.is_none() { "none" } else if self.integrated.is_some() { "integrated" } else if self.server_far_terrain().is_some() { "server" } else if self.remote.is_some() { "server-terrain" } else { "local" },
             "source_attempted": self.lod_source_attempted,
@@ -1916,6 +1926,17 @@ impl Game<'_> {
     }
 }
 
+/// A LOD Distance in `horizon-ctl status`: `"auto"`, `"world"` or the chunks.
+fn lod_distance_json(auto: bool, chunks: u32) -> Value {
+    if auto {
+        json!("auto")
+    } else if chunks >= horizon_client::graphics::LOD_WORLD {
+        json!("world")
+    } else {
+        json!(chunks)
+    }
+}
+
 /// PCI vendor IDs of the GPU makers players have (Apple's is wgpu's Metal value).
 fn vendor_name(id: u32) -> String {
     match id {
@@ -2087,6 +2108,14 @@ pub(super) fn title_owns_text(screen: &Screen, title_up: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_names_lod_distance_world_and_auto_and_keeps_numbers() {
+        assert_eq!(lod_distance_json(true, 0), json!("auto"));
+        assert_eq!(lod_distance_json(false, 1 << 22), json!("world"));
+        assert_eq!(lod_distance_json(false, 4096), json!(4096));
+        assert_eq!(lod_distance_json(false, 0), json!(0));
+    }
 
     #[test]
     fn the_title_takes_text_only_on_its_own_screens() {

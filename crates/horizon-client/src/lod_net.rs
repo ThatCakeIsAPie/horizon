@@ -66,10 +66,14 @@ pub const MAX_REPLY: usize = 512 * 1024;
 const HEIGHTS: std::ops::RangeInclusive<i32> = -2048..=4096;
 
 /// [`PROPERTY`]'s value: [`DEFAULT_DISTANCE`] when absent or unreadable,
-/// at most [`MAX_DISTANCE`].
+/// at most [`MAX_DISTANCE`]; `world` (as the client's LOD Distance names the
+/// whole world, `graphics::LOD_WORLD`) is the farthest it serves.
 pub fn distance_property(value: Option<&str>) -> u32 {
     value
-        .and_then(|v| v.trim().parse::<u32>().ok())
+        .and_then(|v| match v.trim() {
+            "world" => Some(crate::graphics::LOD_WORLD),
+            v => v.parse::<u32>().ok(),
+        })
         .unwrap_or(DEFAULT_DISTANCE)
         .min(MAX_DISTANCE)
 }
@@ -547,6 +551,7 @@ mod tests {
         assert_eq!(distance_property(Some(" 64 ")), 64);
         assert_eq!(distance_property(Some("5000")), MAX_DISTANCE);
         assert_eq!(distance_property(Some("far")), 0);
+        assert_eq!(distance_property(Some(" world ")), MAX_DISTANCE);
     }
 
     #[test]

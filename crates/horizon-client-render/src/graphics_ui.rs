@@ -705,7 +705,7 @@ const LOD_STEPS: [u32; 24] = [
     524288,
     1048576,
     2097152,
-    crate::lod::MAX_CHUNKS,
+    crate::graphics::LOD_WORLD,
 ];
 
 /// `out`: the output of the renderer the settings are shown for, with what its display reports.
@@ -892,10 +892,11 @@ impl H {
         match self {
             H::Preset => labelled("Horizon Preset", g.preset.label()),
             H::LodDistance => match g.lod_distance {
+                _ if g.lod_distance_auto => labelled("LOD Distance", "Auto"),
                 0 => labelled("LOD Distance", "Off"),
                 // The top step reaches past the world border (cubic levels draw the
                 // whole world's far terrain).
-                n if n >= crate::lod::MAX_CHUNKS => labelled("LOD Distance", "Whole World"),
+                n if n >= crate::graphics::LOD_WORLD => labelled("LOD Distance", "World"),
                 n => labelled("LOD Distance", lang::tr("%s chunks", &[&n])),
             },
             H::CubicVertical => labelled(
@@ -1046,7 +1047,7 @@ impl H {
                     UPLOAD_STEPS[(v * (UPLOAD_STEPS.len() - 1) as f32).round() as usize]
             }
             H::LodDistance => {
-                g.lod_distance = LOD_STEPS[(v * (LOD_STEPS.len() - 1) as f32).round() as usize]
+                g.set_lod_distance(LOD_STEPS[(v * (LOD_STEPS.len() - 1) as f32).round() as usize])
             }
             H::Workers => g.workers = (v * max_workers() as f32).round() as u32,
             H::CubicVertical => {
@@ -2233,6 +2234,9 @@ mod tests {
         let near = s.render_distance;
         assert_eq!(item.label(&s, &NONE).plain(), "LOD Distance: Off");
         assert_eq!(item.slider(&s), Some(0.0));
+        // Auto (from the file or horizon-ctl) reads as such until the slider moves.
+        s.horizon.lod_distance_auto = true;
+        assert_eq!(item.label(&s, &NONE).plain(), "LOD Distance: Auto");
         let items: Vec<_> = items().into_iter().map(|(_, i)| i).collect();
         let render = items
             .iter()
@@ -2249,10 +2253,15 @@ mod tests {
         }
         // The ends are off and the whole world, which the far terrain plans.
         item.set_slider(&mut s, 0.0, &NONE);
-        assert_eq!(s.horizon.lod_distance, 0);
+        assert_eq!(
+            (s.horizon.lod_distance, s.horizon.lod_distance_auto),
+            (0, false)
+        );
+        assert_eq!(item.label(&s, &NONE).plain(), "LOD Distance: Off");
         item.set_slider(&mut s, 1.0, &NONE);
-        assert_eq!(s.horizon.lod_distance, crate::lod::MAX_CHUNKS);
-        assert_eq!(item.label(&s, &NONE).plain(), "LOD Distance: Whole World");
+        assert_eq!(s.horizon.lod_distance, 1 << 22);
+        assert_eq!(item.label(&s, &NONE).plain(), "LOD Distance: World");
+        assert!(s.horizon.serialize().contains("\nlodDistance:world\n"));
         item.set_slider(&mut s, 11.0 / 23.0, &NONE);
         assert_eq!(s.horizon.lod_distance, 1024);
         assert_eq!(item.label(&s, &NONE).plain(), "LOD Distance: 1024 chunks");

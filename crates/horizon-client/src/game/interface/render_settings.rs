@@ -206,12 +206,16 @@ impl Game<'_> {
 
     /// LOD Distance and Far Detail Reduced as the player chose them, the
     /// distance no farther than a server sampling far terrain for us allows.
+    /// Auto is the whole world in a cubic level (Earth, Custom, Hybrid, Flat: the
+    /// cube octree's far view) and off in a vanilla one
+    /// (`Graphics::lod_distance_for`).
     pub(super) fn far_terrain_choice(&self) -> (u32, bool) {
         let g = &self.settings.horizon;
         let reduced = g.far_detail == horizon_client::graphics::FarDetail::Reduced;
+        let chosen = g.lod_distance_for(self.world.shape.cubic);
         let distance = match self.server_far_terrain() {
-            Some(offer) => g.lod_distance.min(offer.distance),
-            None => g.lod_distance,
+            Some(offer) => chosen.min(offer.distance),
+            None => chosen,
         };
         (distance, reduced)
     }
