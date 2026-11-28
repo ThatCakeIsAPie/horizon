@@ -782,6 +782,22 @@ pub fn budget_weight(distance: f64) -> f64 {
     }
 }
 
+/// [`budget_weight`] in a plan out to `max_distance` blocks: only the whole
+/// world ([`reaches_world`]) weighs the far end down; a numeric LOD distance
+/// keeps the plain order (every voxel as big on screen as the budget allows),
+/// so its look is unchanged. `HORIZON_FAR_BUDGET_FALLOFF=1` weighs numeric
+/// distances too (faster to complete, coarser far end).
+pub fn budget_weight_at(distance: f64, max_distance: f64) -> f64 {
+    static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let always = *ALWAYS
+        .get_or_init(|| std::env::var("HORIZON_FAR_BUDGET_FALLOFF").is_ok_and(|v| v.trim() == "1"));
+    if always || reaches_world(max_distance) {
+        budget_weight(distance)
+    } else {
+        1.0
+    }
+}
+
 /// A cone of directions from the camera: the view, widened.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cone {
@@ -1334,7 +1350,7 @@ fn plan_tiles(
         if ratio > 1.0 {
             TileFate::Split(TileCandidate {
                 forced: false,
-                ratio: ratio * budget_weight(distance),
+                ratio: ratio * budget_weight_at(distance, input.max_distance),
                 distance,
                 key: t,
             })
@@ -1570,7 +1586,7 @@ pub fn plan_far(input: &PlanInput) -> Plan {
                     } else if ratio > 1.0 {
                         Fate::Split(Candidate {
                             forced: false,
-                            ratio: ratio * budget_weight(distance),
+                            ratio: ratio * budget_weight_at(distance, max_distance),
                             distance,
                             key: node,
                             region,
@@ -9499,7 +9515,9 @@ mod world_plan_tests {
                 }
                 // What stays whole is what the order weighs least: the voxels'
                 // size on screen times the distance's weight.
-                let order = |k: CubeKey| over(camera, k) * budget_weight(k.distance(camera));
+                let order = |k: CubeKey| {
+                    over(camera, k) * budget_weight_at(k.distance(camera), f64::from(chunks) * 16.0)
+                };
                 let roots = root_nodes(camera, f64::from(chunks) * 16.0);
                 for &leaf in plan.leaves.iter().filter(|k| k.level > 0) {
                     if flat(leaf) != NodeClass::Mixed || roots.contains(&leaf) {
