@@ -121,10 +121,16 @@ fn wgsl_item<'a>(source: &'a str, head: &str) -> Option<&'a str> {
     None
 }
 
+/// What terrain.wgsl's `fade_depth` reads of `globals`, for the modules that take it without the
+/// world pass's `Globals`: `world_view` zero, the main view's branch (the raster only runs in the
+/// main view's ID pass; a mod's world view with a clip plane keeps hardware raster).
+pub const FADE_PRELUDE: &str = "struct FrFadeGlobals { world_view: vec4<f32> }\n\
+                                var<private> globals: FrFadeGlobals;\n";
+
 /// The passes' module: terrain.wgsl's corner items, then `far_raster.wgsl`.
 pub fn shader_source() -> String {
     let terrain = super::terrain_shader();
-    let mut out = String::new();
+    let mut out = String::from(FADE_PRELUDE);
     for head in TERRAIN_ITEMS {
         let item = wgsl_item(&terrain, head)
             .unwrap_or_else(|| panic!("terrain.wgsl lost `{head}` (far_raster.rs)"));

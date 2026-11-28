@@ -215,7 +215,7 @@ fn far_raster_matches_hardware_raster() {
         | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
         | wgpu::Features::INDIRECT_FIRST_INSTANCE;
     if !adapter.features().contains(needed) {
-        eprintln!("skipped: the adapter lacks {:?}", needed - adapter.features());
+        eprintln!("skipped: the adapter ({:?}) lacks {:?}", adapter.get_info(), needed - adapter.features());
         return;
     }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -261,7 +261,7 @@ fn far_raster_matches_hardware_raster() {
     let items: String = TERRAIN_ITEMS.iter().map(|h| wgsl_item(&terrain, h).unwrap().to_owned() + "\n").collect();
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("far raster test hw"),
-        source: wgpu::ShaderSource::Wgsl((items + HW).into()),
+        source: wgpu::ShaderSource::Wgsl((super::FADE_PRELUDE.to_owned() + &items + HW).into()),
     });
     let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
     let g0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
