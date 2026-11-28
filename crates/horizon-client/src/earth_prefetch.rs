@@ -10,6 +10,12 @@
 //!   the far view reads at each level (it reads zoom `zoom_for_step(1 << level)` for nodes of that level),
 //!   ring by ring.
 //!
+//! * The coarse set goes first when the far view reaches voxels that wide ([`wants_coarse`]): the climate's coarse
+//!   pieces (`EarthGenerator::coarse_climate_needs`), then the whole-world low-zoom tiles
+//!   (`EarthGenerator::coarse_tiles_missing`, the player's place first), then `EarthGenerator::prepare_coarse`,
+//!   which builds the sea mask on this thread so the far workers never do. The far nodes of those levels read
+//!   nothing else.
+//!
 //! * Tiles the far view found missing (`EarthGenerator::request_tiles`: its workers answer "later" and ask, and
 //!   never wait) are fetched first, ahead of the plan.
 //!
@@ -21,7 +27,7 @@
 //!
 //! A tile that fails is left alone for a while (doubling up to five minutes) so a dead server is not hammered;
 //! the generator's own blocking reads keep retrying what they need.
-use horizon_earth::{Fetch, FetchError, LoadError, TileId};
+use horizon_earth::{ClimateFetch, Fetch, FetchError, LoadError, TileId};
 use horizon_world::cubic::custom::CustomCubicGenerator;
 use horizon_world::cubic::earth::EarthGenerator;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -34,8 +40,14 @@ pub const MARGIN_CHUNKS: i32 = 6;
 /// The base-zoom radius kept local whatever the settings, in blocks: the finest far nodes (level 1) are built
 /// from cubes out to about this far.
 pub const MIN_RADIUS: i32 = 512;
-/// The farthest far view, in chunks, that tiles are kept for (about 65 km).
-pub const MAX_FAR_CHUNKS: i32 = 4096;
+/// The farthest far view, in chunks, that tiles are kept for: the whole planet (its girth is about 40,075 km, which
+/// is 2.5 million chunks at one metre a block). `far * 16` blocks still fits an `i32`.
+pub const MAX_FAR_CHUNKS: i32 = 1 << 22;
+/// The coarsest far level whose tiles [`plan`] asks for (nodes 2^22 blocks across, thousands of km at one metre a
+/// block). The ring of a level is capped by the far distance, so the planet-wide levels read the few coarse tiles.
+pub const MAX_PLAN_LEVEL: u32 = 22;
+/// Tries one pass makes at building the sea mask (each after the tiles it named were fetched).
+const COARSE_ROUNDS: u32 = 3;
 /// Between two requests of the prefetcher.
 pub const GAP: Duration = Duration::from_millis(150);
 /// A tile that failed is left alone this long at first, doubling.
@@ -87,7 +99,7 @@ pub fn plan(generator: &EarthGenerator, target: &Target) -> Vec<TileId> {
     // Level 1 reads the base zoom (it is built from level-0 cubes); each level from 2 up reads its own zoom
     // over a ring that widens with the level, to where the far view ends.
     if far > 0 {
-        for level in 2..=24u32 {
+        for level in 2..=MAX_PLAN_LEVEL {
             if (32i64 << level) >= i64::from(far) {
                 break;
             }
@@ -111,6 +123,38 @@ pub fn plan(generator: &EarthGenerator, target: &Target) -> Vec<TileId> {
     tiles
 }
 
+/// Whether the far view of `target` reaches nodes whose voxels are wide enough for the coarse path
+/// (`EarthGenerator::is_coarse_step`): then the coarse set is fetched first.
+pub fn wants_coarse(generator: &EarthGenerator, target: &Target) -> bool {
+    let far = i64::from(target.far_chunks.clamp(0, MAX_FAR_CHUNKS)) * 16;
+    // A level's nodes are 16 << level blocks wide; the far view needs the levels whose nodes it spans (or half).
+    far > 0
+        && (2..=MAX_PLAN_LEVEL)
+            .any(|level| (16i64 << level) <= far * 2 && generator.is_coarse_step(1 << level))
+}
+
+/// The coarse set's tiles still missing for the players, the first player's place first (the crosshair), then the
+/// others'; none when the far view does not reach coarse nodes ([`wants_coarse`]).
+pub fn coarse_plan(generator: &EarthGenerator, target: &Target) -> Vec<TileId> {
+    if !wants_coarse(generator, target) {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    let mut tiles = Vec::new();
+    for &(cx, cz) in &target.centres {
+        let at = (
+            cx.saturating_mul(16).saturating_add(8),
+            cz.saturating_mul(16).saturating_add(8),
+        );
+        for id in generator.coarse_tiles_missing(at) {
+            if seen.insert(id) {
+                tiles.push(id);
+            }
+        }
+    }
+    tiles
+}
+
 /// Rounds of `land_needs` one pass asks for (an index first, then its tiles, and a second file's); each piece that
 /// arrives gives a round back, so a pass goes on while it makes progress and ends when a round finds nothing.
 const LAND_ROUNDS: u32 = 6;
@@ -120,7 +164,11 @@ pub fn land_plan(generator: &EarthGenerator, target: &Target) -> Vec<Fetch> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     let near = (target.near_chunks.max(0) + MARGIN_CHUNKS).saturating_mul(16);
-    let radius = if target.far_chunks > 0 { near.max(MIN_RADIUS) } else { near };
+    let radius = if target.far_chunks > 0 {
+        near.max(MIN_RADIUS)
+    } else {
+        near
+    };
     for &(cx, cz) in &target.centres {
         let (x, z) = (
             cx.saturating_mul(16).saturating_add(8),
@@ -262,6 +310,20 @@ fn run(shared: &Shared, generator: &Weak<CustomCubicGenerator>, gap: Duration) {
             .into_iter()
             .filter(|id| due(id))
             .collect();
+        // The coarse set goes ahead of everything else: its climate pieces, its tiles (the player's place first),
+        // then the sea mask built from them.
+        let coarse_wanted = wants_coarse(earth, &target);
+        let mut coarse_todo: VecDeque<TileId> = coarse_plan(earth, &target)
+            .into_iter()
+            .filter(|id| due(id))
+            .collect();
+        let mut climate_todo: VecDeque<ClimateFetch> = if coarse_wanted {
+            earth.coarse_climate_needs().into()
+        } else {
+            VecDeque::new()
+        };
+        let mut coarse_prepared = !coarse_wanted;
+        let mut coarse_tries = 0;
         let mut interrupted = false;
         let mut land_todo: VecDeque<Fetch> = VecDeque::new();
         let mut land_rounds = 0;
@@ -277,11 +339,44 @@ fn run(shared: &Shared, generator: &Weak<CustomCubicGenerator>, gap: Duration) {
                         Ok(()) => climate_failing = false,
                         Err(e) => {
                             if !std::mem::replace(&mut climate_failing, true) {
-                                log::warn!("Horizon: Earth climate {:?} did not download: {e}", fetch.var);
+                                log::warn!(
+                                    "Horizon: Earth climate {:?} did not download: {e}",
+                                    fetch.var
+                                );
                             }
                         }
                     }
                 }
+            }
+            // The coarse climate pieces come before the tiles; one a turn, with the gap between.
+            if let Some(climate) = earth.climate_source()
+                && let Some(fetch) = climate_todo.pop_front()
+            {
+                if shared.stop.load(Ordering::SeqCst)
+                    || earth.is_cancelled()
+                    || lock(&shared.wanted).epoch != epoch
+                {
+                    interrupted = true;
+                    break;
+                }
+                if !climate.field().store().is_missing(&fetch) {
+                    continue;
+                }
+                match climate.satisfy(&fetch) {
+                    Ok(()) => climate_failing = false,
+                    Err(e) => {
+                        if !std::mem::replace(&mut climate_failing, true) {
+                            log::warn!(
+                                "Horizon: Earth climate {:?} did not download: {e}",
+                                fetch.var
+                            );
+                        }
+                    }
+                }
+                if !sleep(shared, gap) {
+                    return;
+                }
+                continue;
             }
             // Land cover: what the far view asked for goes first, then the next round of what the area needs.
             if let Some(land) = earth.land_source() {
@@ -297,7 +392,11 @@ fn run(shared: &Shared, generator: &Weak<CustomCubicGenerator>, gap: Duration) {
                         land_todo.push_front(fetch);
                     }
                 }
-                if land_todo.is_empty() && todo.is_empty() && land_rounds < LAND_ROUNDS {
+                if land_todo.is_empty()
+                    && todo.is_empty()
+                    && coarse_todo.is_empty()
+                    && land_rounds < LAND_ROUNDS
+                {
                     land_rounds += 1;
                     land_todo.extend(
                         land_plan(earth, &target)
@@ -366,7 +465,29 @@ fn run(shared: &Shared, generator: &Weak<CustomCubicGenerator>, gap: Duration) {
                     todo.push_front(id);
                 }
             }
-            let Some(id) = todo.pop_front() else {
+            // The coarse tiles first. Once they are in, the sea mask is built here (never by a far worker).
+            if coarse_todo.is_empty() && !coarse_prepared {
+                match earth.prepare_coarse() {
+                    Ok(()) => coarse_prepared = true,
+                    Err(missing) => {
+                        coarse_tries += 1;
+                        let now = Instant::now();
+                        for id in missing.into_iter().rev() {
+                            if earth.field().store().cached(id).is_none()
+                                && failures.get(&id).is_none_or(|f| f.retry_at <= now)
+                            {
+                                coarse_todo.push_front(id);
+                            }
+                        }
+                        // Nothing to fetch for it (a failing tile, or another thread is building it), or too many
+                        // tries: this pass goes on, a later pass tries again.
+                        if coarse_todo.is_empty() || coarse_tries >= COARSE_ROUNDS {
+                            coarse_prepared = true;
+                        }
+                    }
+                }
+            }
+            let Some(id) = coarse_todo.pop_front().or_else(|| todo.pop_front()) else {
                 break;
             };
             if shared.stop.load(Ordering::SeqCst)
