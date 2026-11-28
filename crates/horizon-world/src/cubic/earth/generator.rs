@@ -257,6 +257,8 @@ pub struct EarthGenerator {
     pub(super) column_memo: ColumnMemo,
     /// The hook that may compute padded windows elsewhere, and its switch ([`super::gpu_window`]).
     pub(super) window_gpu: super::gpu_window::WindowGpuSlot,
+    /// What the far view's coarse levels keep ([`super::coarse`]).
+    pub(super) coarse: super::coarse::CoarseState,
 }
 
 /// The final surfaces and the kinds of one cube column's 16 by 16 blocks (`z << 4 | x`).
@@ -338,6 +340,7 @@ impl EarthGenerator {
             biome_memo: super::biome::BiomeMemo::default(),
             column_memo: ColumnMemo::default(),
             window_gpu: super::gpu_window::WindowGpuSlot::default(),
+            coarse: super::coarse::CoarseState::default(),
         })
     }
 

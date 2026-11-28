@@ -358,6 +358,9 @@ struct ColDecor {
 impl EarthGenerator {
     /// The biome of each column of `cols` (at the block it is sampled at), without loading anything.
     pub(super) fn column_biomes(&self, cols: &NodeColumns) -> Result<Vec<Biome>, NotReady> {
+        if let Some(biomes) = &cols.coarse_biomes {
+            return Ok(biomes.clone());
+        }
         let n = cols.width * cols.width;
         let mut seen: HashMap<(i32, i32), Biome> = HashMap::new();
         let mut out = Vec::with_capacity(n);
