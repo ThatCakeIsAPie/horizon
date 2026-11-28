@@ -397,8 +397,13 @@ fn a_whole_world_far_distance_plans_a_bounded_list_with_the_coarse_zooms_last_an
         let unique: HashSet<_> = planned.iter().collect();
         assert_eq!(unique.len(), planned.len(), "{metres} m: a tile twice");
         // The base zoom first, then the zooms only go coarser: the far levels read the coarse ones, a few tiles
-        // each.
-        let mut zooms: Vec<u8> = planned.iter().map(|id| id.z).collect();
+        // each. The pole's tile (zoom 0, the polar cap's height) comes with the first ring that reaches a cap.
+        let pole = TileId { z: 0, x: 0, y: 0 };
+        let mut zooms: Vec<u8> = planned
+            .iter()
+            .filter(|id| **id != pole)
+            .map(|id| id.z)
+            .collect();
         zooms.dedup();
         assert!(
             zooms.windows(2).all(|w| w[0] > w[1]),
