@@ -39,6 +39,10 @@ struct Globals {
     // mirrored (its screen runs right to left), else 1; y the clip-space depth its clip plane's
     // entities come forward (`fs_entity_clipped`), 0 without one; z 1 with a clip plane.
     world_view: vec4<f32>,
+    // The far view's air (fog.rs's `Atmosphere`, terrain.wgsl's `atmosphere_fade`): x the eye's
+    // height over sea level, y the haze per block at sea level, z 1 / scale height (blocks),
+    // w its strength, 0 without a far view or with a shader pack.
+    atmosphere: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var atlas: texture_2d<f32>;

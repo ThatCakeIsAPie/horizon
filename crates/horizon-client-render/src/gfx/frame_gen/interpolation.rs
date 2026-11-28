@@ -290,14 +290,22 @@ fn whole(b: &wgpu::Buffer) -> wgpu::BindingResource<'_> {
     b.as_entire_binding()
 }
 
-/// `setupDeviceDepthToViewSpaceDepthParams` for inverted, finite depth, in blocks
-/// (`viewSpaceToMetersFactor` 1).
+/// `setupDeviceDepthToViewSpaceDepthParams` for inverted depth, in blocks
+/// (`viewSpaceToMetersFactor` 1). An infinite `far` (the world's lens without a far plane,
+/// `gfx::WORLD_FAR`) is the limit of the finite terms, depth `near / d`, kept finite at the
+/// sky's depth 0 by a far plane of `FAR_LIMIT` blocks.
 fn device_to_view(near: f32, far: f32, fov_y: f32, aspect: f32) -> [f32; 4] {
+    let far = far.min(FAR_LIMIT);
     let (f_min, f_max) = (near.max(far), near.min(far));
     let q = f_max / (f_min - f_max);
     let cot_half_fov = (0.5 * fov_y).cos() / (0.5 * fov_y).sin();
     [-q, q * f_min, aspect / cot_half_fov, 1.0 / cot_half_fov]
 }
+
+/// The farthest view depth frame interpolation rebuilds, in blocks: past any terrain (the
+/// world is 6e7 across), and a depth of 0 there is finite. Terrain at 3e7 blocks reads 0.3%
+/// nearer than it is, which no threshold of the interpolation can tell.
+const FAR_LIMIT: f32 = 1e10;
 
 impl Interpolation {
     /// For frames of `display` size; the render size may change between dispatches.
@@ -656,6 +664,24 @@ mod tests {
         )
         .validate(&module)
         .unwrap();
+    }
+
+    /// The world's lens without a far plane: the shader's `device_to_view_depth` gives each
+    /// terrain depth back within 0.5% out to 3e7 blocks, and a finite value at the sky's 0.
+    #[test]
+    fn view_depth_of_the_infinite_lens_is_finite_and_close() {
+        let lens = crate::gfx::world_projection(70.0, 16.0 / 9.0, crate::gfx::WORLD_FAR);
+        let [x, y, ..] = device_to_view(0.05, crate::gfx::WORLD_FAR, 70f32.to_radians(), 1.5);
+        let view = |d: f32| y / (d - x);
+        for distance in [0.1f32, 10.0, 1e3, 1e5, 2e7, 3e7] {
+            let clip = lens * glam::Vec4::new(0.0, 0.0, -distance, 1.0);
+            let back = view(clip.z / clip.w);
+            assert!(
+                (back - distance).abs() < distance * 5e-3,
+                "{distance}: {back}"
+            );
+        }
+        assert!(view(0.0).is_finite() && view(0.0) > 3e7);
     }
 
     fn f16(bits: u16) -> f32 {

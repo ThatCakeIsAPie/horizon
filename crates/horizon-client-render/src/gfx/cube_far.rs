@@ -705,7 +705,9 @@ impl CubeFar {
             // far view's new nodes undrawn for seconds.
             if idle {
                 let (new, old): (VecDeque<CubeKey>, VecDeque<CubeKey>) =
-                    std::mem::take(&mut self.order).into_iter().partition(|k| !self.nodes.contains_key(k));
+                    std::mem::take(&mut self.order)
+                        .into_iter()
+                        .partition(|k| !self.nodes.contains_key(k));
                 self.order = new;
                 self.order.extend(old);
             }
@@ -737,7 +739,10 @@ impl CubeFar {
             }
             self.order = keep;
             if !jobs.is_empty() {
-                self.meshing_new = jobs.iter().filter(|j| !self.nodes.contains_key(&j.key)).count();
+                self.meshing_new = jobs
+                    .iter()
+                    .filter(|j| !self.nodes.contains_key(&j.key))
+                    .count();
                 self.mesher.begin(jobs);
             }
         }
@@ -783,6 +788,11 @@ impl CubeFar {
         self.overlaps.frame();
     }
 
+    /// Whether any node is in the table (`Renderer::far_view_drawn`).
+    pub fn has_nodes(&self) -> bool {
+        !self.nodes.is_empty()
+    }
+
     /// Whether `key` is meshed and in the table (drawn or known empty).
     pub fn has(&self, key: CubeKey) -> bool {
         self.nodes.contains_key(&key)
@@ -799,7 +809,11 @@ impl CubeFar {
             pool_bytes: (u64::from(self.pool.capacity()) - free) * SLOT_BYTES,
             meshing: !self.mesher.idle(),
             waiting_new: self.meshing_new
-                + self.pending.keys().filter(|k| !self.nodes.contains_key(k)).count(),
+                + self
+                    .pending
+                    .keys()
+                    .filter(|k| !self.nodes.contains_key(k))
+                    .count(),
             ..self.stats
         }
     }

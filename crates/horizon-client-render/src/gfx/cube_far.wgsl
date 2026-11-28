@@ -19,7 +19,10 @@
 // as the rest takes (tens of seconds through a spyglass); their water and flat
 // ground lie in its very planes, and the two fought. The finer now win. 2e-5
 // of the distance a level: far over the depth buffer's precision, far under
-// anything that shows where the levels only meet.
+// anything that shows where the levels only meet. Without a far plane depth is
+// 0.05 / distance, so this is exactly 2e-5 of the distance at any distance (f32
+// keeps ~6e-8 of it): 4.4e-4 at level 22, still just a hair against nodes of
+// 67 million blocks, and only between levels that overlap anyway.
 const CF_LEVEL_DEPTH: f32 = 2e-5;
 fn cf_by_level(drawn: TerrainOut, level: u32) -> TerrainOut {
     var out = drawn;
