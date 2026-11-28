@@ -87,6 +87,7 @@ const OCCLUDED: usize = 1;
 const DRAWS: usize = 2;
 const TRIANGLES: usize = 4;
 const TESTED: usize = 6;
+const ALL_TRIANGLES: usize = 7;
 /// Threads per workgroup of the passes over ids.
 const WORKGROUP: u32 = 64;
 /// Workgroups along x of a dispatch over blocks of ids (the shader's `ROW`).
@@ -280,6 +281,8 @@ pub(super) struct FarGpuStats {
     /// Draws and triangles per phase.
     pub draws: [u32; 2],
     pub triangles: [u32; 2],
+    /// The triangles of every solid quad of the records drawn, each face direction.
+    pub all_triangles: u32,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1249,6 +1252,7 @@ impl FarCull {
                         tested: words[TESTED],
                         draws: [words[DRAWS], words[DRAWS + 1]],
                         triangles: [words[TRIANGLES], words[TRIANGLES + 1]],
+                        all_triangles: words[ALL_TRIANGLES],
                     });
                 }
             }

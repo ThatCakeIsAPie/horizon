@@ -969,13 +969,35 @@ fn mesh_voxels<L: Look>(
 ) {
     let faces = voxel_faces(node, air, sea_surface, material, lets_sky_through);
     let unit = (1_i32 << node.key.level) as f32;
+    let stats = crate::geometry_stats::on();
+    let quads_before = (out.solid.len() + out.translucent.len()) / 4;
+    let (mut unmerged, mut merged, mut plain, mut shell) = (0, 0, 0, 0);
     for (key, mut rects) in faces {
+        if stats {
+            unmerged += rects.len();
+            plain += plain_greedy_len(&rects, unit);
+        }
         if !merge_cells(&mut rects, unit) {
             merge(&mut rects);
         }
+        let quads = (out.solid.len() + out.translucent.len()) / 4;
+        merged += rects.len();
         for rect in rects {
             emit(out, key, rect);
         }
+        let plane = f32::from_bits(key.0.plane);
+        if stats && (plane == 0.0 || plane == unit * CELLS as f32) {
+            shell += (out.solid.len() + out.translucent.len()) / 4 - quads;
+        }
+    }
+    if stats {
+        use crate::geometry_stats as g;
+        g::FAR_NODES.add(1);
+        g::FAR_FACES.add(unmerged as u64);
+        g::FAR_MERGED_RECTS.add(merged as u64);
+        g::FAR_GREEDY_RECTS.add(plain as u64);
+        g::FAR_SHELL_QUADS.add(shell as u64);
+        g::FAR_QUADS.add(((out.solid.len() + out.translucent.len()) / 4 - quads_before) as u64);
     }
     out.finish_sprite_layers();
 }
@@ -1651,6 +1673,31 @@ fn merge(rects: &mut Vec<Rect>) {
         }
     }
     rects.truncate(end);
+}
+/// The rects a single rows-first greedy pass (`greedy`) leaves of one plane's faces, or what
+/// `merge` leaves where they are not whole cells: `geometry_stats`' comparison with
+/// `merge_cells`' best of four.
+fn plain_greedy_len(rects: &[Rect], unit: f32) -> usize {
+    let cell = |c: f32| {
+        let n = c / unit;
+        (n.fract() == 0.0 && (0.0..=CELLS as f32).contains(&n)).then_some(n as u8)
+    };
+    let mut grid: Grid = [0; CELLS];
+    for r in rects {
+        match (cell(r.u0), cell(r.v0), cell(r.u1), cell(r.v1)) {
+            (Some(u0), Some(v0), Some(u1), Some(v1))
+                if u1 == u0 + 1 && v1 == v0 + 1 && u0 < CELLS as u8 && v0 < CELLS as u8 =>
+            {
+                grid[v0 as usize] |= 1 << u0;
+            }
+            _ => {
+                let mut copy = rects.to_vec();
+                merge(&mut copy);
+                return copy.len();
+            }
+        }
+    }
+    greedy(grid, false).len
 }
 /// A cell rect of a plane: `[u0, v0, u1, v1]` in cells.
 type Cells = [u8; 4];
@@ -2868,6 +2915,30 @@ mod cube_tests {
     }
     fn quads(vertices: &[TerrainVertex]) -> Vec<[TerrainVertex; 4]> {
         vertices.as_chunks::<4>().0.to_vec()
+    }
+    #[test]
+    fn geometry_stats_count_far_faces() {
+        use crate::geometry_stats as g;
+        g::force(true);
+        // A 2x1x1 slab of stone in the middle and one block in the corner at the node's
+        // edge: 10 + 6 voxel faces; the slab's long sides merge (4 pairs), leaving 12.
+        let at = [([3, 3, 3], STONE), ([4, 3, 3], STONE), ([0, 0, 0], STONE)];
+        let (nodes, faces, merged, quads, shell) = (
+            g::FAR_NODES.get(),
+            g::FAR_FACES.get(),
+            g::FAR_MERGED_RECTS.get(),
+            g::FAR_QUADS.get(),
+            g::FAR_SHELL_QUADS.get(),
+        );
+        let m = mesh(&node(0, &at));
+        g::force(false);
+        // Other tests mesh at the same time: at least these.
+        assert!(g::FAR_NODES.get() > nodes);
+        assert!(g::FAR_FACES.get() - faces >= 16);
+        assert!(g::FAR_MERGED_RECTS.get() - merged >= 12);
+        assert!(g::FAR_QUADS.get() - quads >= (m.solid.len() / 4) as u64);
+        assert!(g::FAR_SHELL_QUADS.get() - shell >= 3);
+        assert_eq!(m.solid.len() / 4, 12);
     }
     fn centre(q: &[TerrainVertex; 4]) -> glam::Vec3 {
         q.iter()

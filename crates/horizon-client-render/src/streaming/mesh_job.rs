@@ -45,7 +45,22 @@ pub(super) fn mesh_section(
         biomes: &context.biomes,
         visibility,
     };
+    let timed = crate::geometry_stats::on().then(std::time::Instant::now);
     let mut mesh = mesher.mesh_reusing(&borrow(region), sy, recycled, scratch);
+    if let Some(t) = timed {
+        use crate::geometry_stats as g;
+        g::NEAR_MESH_NS.add(t.elapsed().as_nanos() as u64);
+        let quads = mesh.solid.len() / 4;
+        if quads > 0 {
+            let t = std::time::Instant::now();
+            let (candidates, after) = crate::mesher::greedy_count(&mesh);
+            g::NEAR_GREEDY_NS.add(t.elapsed().as_nanos() as u64);
+            g::NEAR_SECTIONS.add(1);
+            g::NEAR_QUADS.add(quads as u64);
+            g::NEAR_MERGEABLE_QUADS.add(candidates as u64);
+            g::NEAR_GREEDY_QUADS.add(after as u64);
+        }
+    }
     if settings.shader_pack {
         mesh.apply_block_layers(&settings.block_layers, &context.tables);
     }

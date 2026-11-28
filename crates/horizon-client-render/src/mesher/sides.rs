@@ -2479,4 +2479,151 @@ mod tests {
             assert_boundary_and_fallback(&solid, grouped, "fuzz");
         }
     }
+
+    /// A small xorshift for the random face-direction tests.
+    struct Xs(u64);
+    impl Xs {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        /// On the 1/16 grid in [lo, hi].
+        fn grid(&mut self, lo: i32, hi: i32) -> f32 {
+            (lo * 16 + self.below(((hi - lo) * 16 + 1) as u64) as i32) as f32 / 16.0
+        }
+    }
+
+    /// Random axis faces of random sizes and sides on the 1/16 grid, with a sloped quad now
+    /// and then; each quad's layer is its index.
+    fn random_faces(rng: &mut Xs, n: u16) -> Vec<TerrainVertex> {
+        let mut solid = Vec::new();
+        for layer in 0..n {
+            if rng.below(12) == 0 {
+                let y = rng.grid(0, 15);
+                solid.extend(quad(
+                    [
+                        [1.0, y, 1.0],
+                        [2.0, y, 1.0],
+                        [2.0, y + 1.0, 2.0],
+                        [1.0, y + 1.0, 2.0],
+                    ],
+                    layer,
+                ));
+                continue;
+            }
+            let axis = rng.below(3) as usize;
+            let (u, w) = match axis {
+                0 => (1, 2),
+                1 => (2, 0),
+                _ => (0, 1),
+            };
+            let plane = rng.grid(0, 16);
+            let (u0, w0) = (rng.grid(0, 15), rng.grid(0, 15));
+            let (u1, w1) = (
+                u0 + rng.grid(0, 1).max(1.0 / 16.0),
+                w0 + rng.grid(0, 1).max(1.0 / 16.0),
+            );
+            let at = |a: f32, b: f32| {
+                let mut p = [0.0; 3];
+                p[axis] = plane;
+                p[u] = a;
+                p[w] = b;
+                p
+            };
+            let ring = [at(u0, w0), at(u1, w0), at(u1, w1), at(u0, w1)];
+            let ring = if rng.below(2) == 0 {
+                ring
+            } else {
+                [ring[0], ring[3], ring[2], ring[1]]
+            };
+            solid.extend(quad(ring, layer));
+        }
+        solid
+    }
+
+    #[test]
+    fn facing_skip_is_conservative_for_random_meshes_and_eyes() {
+        let mut rng = Xs(0x2545_f491_4f6c_dd1d);
+        let mut skipped = 0;
+        for case in 0..400 {
+            let n = 1 + rng.below(120) as u16;
+            let mut solid = random_faces(&mut rng, n);
+            let sides = sort(&mut solid);
+            for _ in 0..40 {
+                // Eyes about the section, on the 1/16 grid now and then so that planes and
+                // planes less the margin are met exactly.
+                let eye: [f32; 3] = std::array::from_fn(|_| {
+                    if rng.below(2) == 0 {
+                        rng.grid(-2, 18)
+                    } else {
+                        (rng.next() % 40_000) as f32 / 1000.0 - 12.0
+                    }
+                });
+                let mut drawn = vec![false; usize::from(n)];
+                for (first, count) in runs(&sides, eye) {
+                    for q in first..first + count {
+                        drawn[usize::from(solid[q as usize * 4].layer)] = true;
+                    }
+                }
+                for layer in front_facing(&solid, eye) {
+                    assert!(
+                        drawn[usize::from(layer)],
+                        "case {case}: {eye:?} misses quad {layer}"
+                    );
+                }
+                skipped += drawn.iter().filter(|d| !**d).count();
+            }
+        }
+        // It does skip something.
+        assert!(skipped > 10_000, "{skipped}");
+    }
+
+    #[test]
+    fn facing_buckets_partition_the_mesh_by_direction() {
+        let mut rng = Xs(0x9e37_79b9_7f4a_7c15);
+        for case in 0..400 {
+            let n = rng.below(150) as u16;
+            let mut solid = random_faces(&mut rng, n);
+            let before: Vec<[TerrainVertex; 4]> = solid.as_chunks::<4>().0.to_vec();
+            let sides = sort(&mut solid);
+            assert_eq!(sides.quads(), u32::from(n));
+            let ends = bucket_ends(&sides);
+            // Every quad once (their layers are their indices), each in its own direction's
+            // bucket.
+            let mut seen = vec![0u8; usize::from(n)];
+            let mut start = 0;
+            for (b, &end) in ends.iter().enumerate() {
+                assert!(end >= start, "case {case}");
+                for q in start..end {
+                    let quad: &[TerrainVertex; 4] =
+                        solid[q as usize * 4..][..4].try_into().unwrap();
+                    seen[usize::from(quad[0].layer)] += 1;
+                    assert_eq!(bucket(quad), b, "case {case}: quad {q}");
+                    assert_eq!(
+                        bytemuck::bytes_of(quad),
+                        bytemuck::bytes_of(&before[usize::from(quad[0].layer)]),
+                        "case {case}"
+                    );
+                }
+                start = end;
+            }
+            assert_eq!(start, u32::from(n));
+            assert!(seen.iter().all(|&c| c == 1), "case {case}");
+            let mut all = Vec::new();
+            sides.every(Part::All, |first, quads| all.push((first, quads)));
+            assert_eq!(
+                all,
+                if n > 0 {
+                    vec![(0, u32::from(n))]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
 }

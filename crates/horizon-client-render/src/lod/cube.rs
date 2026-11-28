@@ -5975,8 +5975,12 @@ fn work(
                     }
                     let mut mesh = SectionMesh::default();
                     let sea = sampler.sea_surface();
+                    let timed = crate::geometry_stats::on().then(std::time::Instant::now);
                     mesh::mesh_cube(&mut mesher, &node, air, sea, &context, &mut mesh);
                     mesh.sort_solid();
+                    if let Some(t) = timed {
+                        crate::geometry_stats::FAR_MESH_NS.add(t.elapsed().as_nanos() as u64);
+                    }
                     Product::Mesh(mesh)
                 }),
             };

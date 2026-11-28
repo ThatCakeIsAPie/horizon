@@ -919,4 +919,84 @@ mod tests {
         assert_eq!(std::mem::size_of::<FrameUniform>(), 96 + 16 + 16 + 16);
         assert_eq!(NODE_WORDS, 8 + 12 * 2);
     }
+
+    /// cube_cull.wgsl's direction test, camera at the origin: which of Down, Up, North,
+    /// South, West, East a node from `lo` to `hi` (camera-relative) draws.
+    fn front(lo: [f32; 3], hi: [f32; 3]) -> [bool; 6] {
+        [
+            0.0 < hi[1],
+            0.0 > lo[1],
+            0.0 < hi[2],
+            0.0 > lo[2],
+            0.0 < hi[0],
+            0.0 > lo[0],
+        ]
+    }
+
+    #[test]
+    fn the_direction_test_is_the_shaders() {
+        let source: String = include_str!("cube_cull.wgsl").split_whitespace().collect();
+        assert!(
+            source.contains(
+                "front=array<bool,6>(0.0<hi.y,0.0>lo.y,0.0<hi.z,0.0>lo.z,0.0<hi.x,0.0>lo.x);"
+            )
+        );
+        assert!(source.contains("if!front[dir]{continue;}"));
+    }
+
+    /// Every face a node's mesh can hold (cube_far.wgsl's `vs_main`: direction `dir`, axis
+    /// `dir >> 1` of y, z, x, on the plane `coord + (dir & 1)` voxels, or an Up face on a
+    /// fluid top inside its voxel) that faces a camera at the origin is in a direction the
+    /// cull pass draws.
+    #[test]
+    fn the_direction_skip_is_conservative() {
+        let mut seed = 0x853c_49e6_748f_ea9bu64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let (mut faced, mut skipped) = (0, 0);
+        for _ in 0..20_000 {
+            let level = next(6) as u32;
+            let size = (16u32 << level) as f32;
+            let scale = (1u32 << level) as f32;
+            // The camera near the node: inside it, on its faces, or a few nodes out.
+            let lo: [f32; 3] = std::array::from_fn(|_| {
+                let span = 3 * (16i64 << level);
+                (next(2 * span as u64 + 1) as i64 - span) as f32
+                    - if next(4) == 0 { 0.0 } else { 0.5 }
+            });
+            let hi = lo.map(|v| v + size);
+            let shown = front(lo, hi);
+            for _ in 0..16 {
+                let dir = next(6) as usize;
+                let voxel: [f32; 3] = std::array::from_fn(|_| next(16) as f32);
+                // Axis 0 is y, 1 z, 2 x; a face's plane in camera-relative blocks.
+                let (axis, along) = match dir >> 1 {
+                    0 => (1, voxel[1]),
+                    1 => (2, voxel[2]),
+                    _ => (0, voxel[0]),
+                };
+                let up = (dir & 1) as f32;
+                let mut plane = lo[axis] + (along + up) * scale;
+                if dir == 1 && next(3) == 0 {
+                    plane = lo[axis] + (along + (1 + next(255)) as f32 / 256.0) * scale;
+                }
+                // The camera faces it: on its front side.
+                let faces = if dir & 1 == 1 {
+                    0.0 > plane
+                } else {
+                    0.0 < plane
+                };
+                if faces {
+                    faced += 1;
+                    assert!(shown[dir], "dir {dir} plane {plane} box {lo:?} {hi:?}");
+                }
+                skipped += usize::from(!shown[dir]);
+            }
+        }
+        assert!(faced > 10_000 && skipped > 10_000, "{faced} {skipped}");
+    }
 }

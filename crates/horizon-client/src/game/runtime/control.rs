@@ -1730,6 +1730,8 @@ impl Game<'_> {
             "streaming": self.streaming.stages().into_iter().map(|(k, v)| (k.to_string(), v.into())).collect::<serde_json::Map<_, _>>(),
             "dirty_light": self.world.dirty_light.len(),
             "renderer": renderer,
+            // Meshed and drawn geometry (HORIZON_GEOMETRY_STATS=1), else null.
+            "geometry": horizon_client::geometry_stats::snapshot(),
             "display": display,
             "uptime_seconds": self.started.elapsed().as_secs_f64(),
             "server": self.remote_status(),
