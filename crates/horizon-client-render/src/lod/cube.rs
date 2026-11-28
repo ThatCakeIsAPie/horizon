@@ -717,9 +717,9 @@ pub struct Rule {
     /// Where `in_view` applies; `None` when the two are the same.
     pub cone: Option<Cone>,
     /// The most leaves a plan has. Past it, the nodes whose voxels are
-    /// smallest on screen (the farthest for their size) stay whole: the plan
-    /// coarsens from the far end rather than failing. Splits around the
-    /// loaded cubes are made whatever the budget.
+    /// smallest on screen, weighted toward the far ones ([`budget_weight`]),
+    /// stay whole: the plan coarsens from the far end rather than failing.
+    /// Splits around the loaded cubes are made whatever the budget.
     pub budget: usize,
 }
 
@@ -756,6 +756,29 @@ impl Rule {
             Some(cone) if cone.meets_box(camera, lo, hi) => self.in_view,
             _ => self.out_of_view,
         }
+    }
+}
+
+/// Out to this many blocks, a split the budget allows is ordered by its
+/// voxels' size on screen alone ([`budget_weight`] 1) ...
+pub const FAR_BUDGET_NEAR_BLOCKS: f64 = 8192.0;
+/// ... and beyond, by that times `(FAR_BUDGET_NEAR_BLOCKS / d) ^` this: when
+/// the budget binds, the voxels kept whole at `d` are `(d /
+/// FAR_BUDGET_NEAR_BLOCKS) ^` this times bigger on screen than near ones,
+/// so the leaves an octave of distance takes fall by `2 ^ (2 * this)` an
+/// octave on a surface and their total converges however far the plan
+/// goes (the whole world included), and near detail is what the budget
+/// buys first.
+pub const FAR_BUDGET_FALLOFF: f64 = 0.5;
+
+/// The weight of a split `distance` blocks away in the budget's order (see
+/// [`FAR_BUDGET_FALLOFF`]): 1 out to [`FAR_BUDGET_NEAR_BLOCKS`], falling
+/// beyond.
+pub fn budget_weight(distance: f64) -> f64 {
+    if distance <= FAR_BUDGET_NEAR_BLOCKS {
+        1.0
+    } else {
+        (FAR_BUDGET_NEAR_BLOCKS / distance).powf(FAR_BUDGET_FALLOFF)
     }
 }
 
@@ -895,9 +918,69 @@ pub enum NodeClass {
     Rock,
 }
 
+/// A far view's `max_distance` from which it is the whole world: LOD
+/// Distance World (`graphics::LOD_WORLD` = [`crate::lod::MAX_CHUNKS`]
+/// chunks, 67,108,864 blocks) or farther. Such a plan starts from
+/// [`world_roots`] and has no distance cut: only the pixel error and the
+/// budget bound it.
+pub const WORLD_REACH: f64 = crate::lod::MAX_CHUNKS as f64 * 16.0;
+
+/// Whether a plan out to `max_distance` blocks is the whole world
+/// ([`WORLD_REACH`]).
+pub fn reaches_world(max_distance: f64) -> bool {
+    max_distance >= WORLD_REACH
+}
+
+/// The distance a plan out to `max_distance` cuts nodes at: infinite for the
+/// whole world, 0 for nonsense (NaN, negative).
+fn reach(max_distance: f64) -> f64 {
+    if reaches_world(max_distance) {
+        f64::INFINITY
+    } else if max_distance > 0.0 {
+        max_distance
+    } else {
+        0.0
+    }
+}
+
+/// The nodes of the top level ([`MAX_CUBE_LEVEL`]) that hold any of the
+/// world ([`in_world`]): 2 x 2 x 2, the octree's whole extent within the
+/// border and the cube range.
+pub fn world_roots() -> Vec<CubeKey> {
+    let top = i64::from(CubeKey::new(MAX_CUBE_LEVEL, 0, 0, 0).size());
+    let span = |lo: i64, hi: i64| lo.div_euclid(top) as i32..=hi.div_euclid(top) as i32;
+    let mut roots = Vec::new();
+    for x in span(-WORLD_BORDER, WORLD_BORDER - 1) {
+        for y in span(
+            i64::from(horizon_world::cubic::MIN_Y),
+            i64::from(horizon_world::cubic::MAX_Y),
+        ) {
+            for z in span(-WORLD_BORDER, WORLD_BORDER - 1) {
+                roots.push(CubeKey::new(MAX_CUBE_LEVEL, x, y, z));
+            }
+        }
+    }
+    roots
+}
+
 /// The nodes the plan starts from: those of the first level at least as wide
-/// as `max_distance` that the range around `camera` meets (at most 27).
+/// as `max_distance` that the range around `camera` meets (at most 27), or
+/// at the whole world's reach ([`reaches_world`]) [`world_roots`].
 pub fn root_nodes(camera: [f64; 3], max_distance: f64) -> Vec<CubeKey> {
+    if reaches_world(max_distance) {
+        return world_roots();
+    }
+    let max_distance = reach(max_distance);
+    // A camera outside the octree's extent (no real one is) is taken to its
+    // edge, so no root's coordinates overflow.
+    let edge = f64::from(i32::MAX / 2);
+    let camera = camera.map(|c| {
+        if c.is_finite() {
+            c.clamp(-edge, edge)
+        } else {
+            0.0
+        }
+    });
     let top = (0..=MAX_CUBE_LEVEL)
         .find(|&l| f64::from(16 << l) >= max_distance)
         .unwrap_or(MAX_CUBE_LEVEL);
@@ -934,9 +1017,13 @@ pub struct Plan {
     pub pruned: usize,
     /// The budget kept some nodes whole that the rule would have split.
     pub limited: bool,
-    /// How many times its target the first node the budget kept whole was
-    /// (its voxels' size on screen over the target; 1 when the budget did
-    /// not bind): the plan reaches about `target * coarsened`.
+    /// The split order's value ([`budget_weight`] times the voxels' size on
+    /// screen over the target) of the first node the budget kept whole; 1
+    /// when the budget did not bind. Within [`FAR_BUDGET_NEAR_BLOCKS`] the
+    /// plan reaches `target * coarsened` (all of it the target when this is
+    /// below 1); `d` blocks away past that, `target * coarsened *
+    /// (d / FAR_BUDGET_NEAR_BLOCKS) ^ FAR_BUDGET_FALLOFF`: the far end
+    /// coarsens first.
     pub coarsened: f64,
     /// The tile budget kept some tiles whole.
     pub tiles_limited: bool,
@@ -967,6 +1054,8 @@ pub struct Surface<'a> {
 #[derive(Clone, Copy)]
 pub struct PlanInput<'a> {
     pub camera: [f64; 3],
+    /// Blocks out to which nodes are planned; from [`WORLD_REACH`] the whole
+    /// world, with no distance cut.
     pub max_distance: f64,
     pub rule: &'a Rule,
     pub loaded: LoadedBox,
@@ -1014,6 +1103,10 @@ struct Candidate {
     /// It meets the loaded cubes, or both tiles and cube nodes: it splits
     /// whatever the budget.
     forced: bool,
+    /// How far over the target its voxels are, times [`budget_weight`] of
+    /// its distance: the order the budget takes splits in (the highest
+    /// first). Every node over its target splits when the budget allows, so
+    /// the weight only decides what stays whole when it does not.
     ratio: f64,
     distance: f64,
     key: CubeKey,
@@ -1217,7 +1310,7 @@ fn plan_tiles(
         let info = (surface.info)(t);
         let (lo, hi) = tile_box(t, info, surface.sea_level);
         let distance = box_distance(camera, lo, hi);
-        if distance > input.max_distance {
+        if distance > reach(input.max_distance) {
             return TileFate::Out;
         }
         let as_node = CubeKey::new(t.level, t.x, 0, t.z);
@@ -1241,7 +1334,7 @@ fn plan_tiles(
         if ratio > 1.0 {
             TileFate::Split(TileCandidate {
                 forced: false,
-                ratio,
+                ratio: ratio * budget_weight(distance),
                 distance,
                 key: t,
             })
@@ -1360,6 +1453,8 @@ pub fn plan_far(input: &PlanInput) -> Plan {
         surface,
         refined,
     } = *input;
+    let roots = root_nodes(camera, max_distance);
+    let max_distance = reach(max_distance);
     // One level a plan: a node not drawn (nor holding a drawn node) stays a
     // leaf, to be drawn before it splits.
     let may_split = |node: CubeKey| refined.is_none_or(|r| r.contains(&node));
@@ -1376,7 +1471,6 @@ pub fn plan_far(input: &PlanInput) -> Plan {
             }
         }
     }
-    let roots = root_nodes(camera, max_distance);
     let mut out = Plan {
         coarsened: 1.0,
         ..Plan::default()
@@ -1476,7 +1570,7 @@ pub fn plan_far(input: &PlanInput) -> Plan {
                     } else if ratio > 1.0 {
                         Fate::Split(Candidate {
                             forced: false,
-                            ratio,
+                            ratio: ratio * budget_weight(distance),
                             distance,
                             key: node,
                             region,
@@ -2322,6 +2416,38 @@ pub fn job_score(camera: [f64; 3], look: Look, key: CubeKey) -> f64 {
         look.edge,
         key.distance(camera),
     )
+}
+
+/// Holes (and coverage nodes) in the order the queue takes them: those within
+/// `near_reach` blocks of `camera` (over or beside the loaded ground: the
+/// loaded box's reach, [`CubeLod::update`]) first, whichever way the view
+/// looks, then the rest; each part by score ([`job_score`]) and then the
+/// bigger on-screen error. With the whole world planned, thousands of coarse
+/// far nodes in view outscore a near hole behind the camera; this keeps the
+/// ground round the player from waiting behind them.
+fn hole_order(
+    camera: [f64; 3],
+    look: Look,
+    near_reach: f64,
+    keys: impl IntoIterator<Item = CubeKey>,
+) -> Vec<CubeKey> {
+    let mut scored: Vec<(bool, f64, f64, CubeKey)> = keys
+        .into_iter()
+        .map(|k| {
+            (
+                k.distance(camera) > near_reach,
+                -job_score(camera, look, k),
+                -screen_error(camera, k),
+                k,
+            )
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        (a.0.cmp(&b.0))
+            .then(a.1.total_cmp(&b.1))
+            .then(a.2.total_cmp(&b.2))
+    });
+    scored.into_iter().map(|e| e.3).collect()
 }
 
 /// A job's on-screen error: its voxels' size over their distance.
@@ -3585,6 +3711,8 @@ pub struct CubeLod {
     /// that were queued already go first.
     linger_queued: FxHashSet<CubeKey>,
     budget: usize,
+    /// Blocks from the camera within which holes go first ([`hole_order`]).
+    near_reach: f64,
     /// The sampler's GPU generator, when it has one.
     backend: Option<GpuBackend>,
     /// Nodes finished for the GPU mesher, not yet taken.
@@ -3785,6 +3913,7 @@ impl CubeLod {
             look: None,
             linger_queued: FxHashSet::default(),
             budget: NODE_BUDGET,
+            near_reach: 0.0,
             gpu_out: Vec::new(),
             gpu_out_new: 0,
             backlog: VecDeque::new(),
@@ -4045,8 +4174,7 @@ impl CubeLod {
     }
 
     fn is_complete(&self) -> bool {
-        self.handed_out()
-            && self.shown()
+        self.handed_out() && self.shown()
     }
 
     fn track_completion(&mut self, now: Instant) {
@@ -4259,6 +4387,9 @@ impl CubeLod {
         is_loaded: impl Fn(SectionPos) -> bool,
     ) -> Vec<(CubeKey, SectionMesh)> {
         self.camera = camera;
+        // Holes this near go first ([`hole_order`]): the loaded box and a
+        // cube beyond it, where the near ground meets the far nodes.
+        self.near_reach = f64::from(loaded.horizontal.max(0).saturating_add(2)) * 16.0;
         let now = Instant::now();
         let cube = cube_of(camera);
         self.face(Look::of(view));
@@ -4908,19 +5039,9 @@ impl CubeLod {
         self.look.unwrap_or_default()
     }
 
-    /// A job's score ([`far_priority`]) for the camera and the look now.
-    fn score(&self, key: CubeKey) -> f64 {
-        job_score(self.camera, self.look_now(), key)
-    }
-
-    /// `keys` by score, highest first, then the bigger on-screen error.
+    /// `keys` in [`hole_order`] for the camera and the look now.
     fn by_score(&self, keys: impl IntoIterator<Item = CubeKey>) -> Vec<CubeKey> {
-        let mut scored: Vec<(f64, f64, CubeKey)> = keys
-            .into_iter()
-            .map(|k| (-self.score(k), -screen_error(self.camera, k), k))
-            .collect();
-        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
-        scored.into_iter().map(|e| e.2).collect()
+        hole_order(self.camera, self.look_now(), self.near_reach, keys)
     }
 
     /// Whether `key` lies inside a far node drawn over loaded near ground
@@ -9140,6 +9261,422 @@ mod waste_tests {
             // They are leaves of the plan (the budget did not bind).
             assert!(held.iter().all(|k| plan.leaves.contains(k)));
             plan = plan_of(&plan.leaves);
+        }
+    }
+}
+
+/// The whole world's plan (LOD Distance World): its roots, its pixel-error
+/// bound, its budget's order, the octree's math at the top level, and the
+/// order holes are taken in.
+#[cfg(test)]
+mod world_plan_tests {
+    use super::*;
+
+    const NONE: LoadedBox = LoadedBox {
+        horizontal: 0,
+        vertical: 0,
+    };
+    const GROUND: [f64; 3] = [0.5, 2200.5, 0.5];
+    const HIGH: [f64; 3] = [0.5, 1.0e7, 0.5];
+
+    /// Lyle's view: Cubic Far Detail at its finest (1 px), a window 1440
+    /// pixels tall, 70 degrees.
+    fn lyle() -> FarView {
+        FarView {
+            height_px: 1440.0,
+            aspect: 2560.0 / 1440.0,
+            ..FarView::standard(1.0)
+        }
+    }
+
+    /// A flat world: air above y = 200, rock below y = 0, the surface
+    /// between.
+    fn flat(key: CubeKey) -> NodeClass {
+        let lo = i64::from(key.y) * i64::from(key.size());
+        let hi = lo + i64::from(key.size());
+        if lo >= 200 {
+            NodeClass::Air
+        } else if hi <= 0 {
+            NodeClass::Rock
+        } else {
+            NodeClass::Mixed
+        }
+    }
+
+    fn plan_at(camera: [f64; 3], chunks: u32, budget: usize) -> (Plan, Duration) {
+        plan_with(lyle(), camera, chunks, budget)
+    }
+
+    fn plan_with(view: FarView, camera: [f64; 3], chunks: u32, budget: usize) -> (Plan, Duration) {
+        let rule = view.rule(budget);
+        let start = Instant::now();
+        let plan = plan_classified(
+            camera,
+            f64::from(chunks) * 16.0,
+            &rule,
+            NONE,
+            &|_| false,
+            &[],
+            &flat,
+        );
+        (plan, start.elapsed())
+    }
+
+    /// How many times the target a node's voxels are on screen.
+    fn over(camera: [f64; 3], key: CubeKey) -> f64 {
+        lyle().rule(usize::MAX).factor(camera, key) * f64::from(key.size())
+            / key.distance(camera).max(1e-9)
+    }
+
+    const WORLD: u32 = crate::lod::MAX_CHUNKS;
+
+    fn assert_disjoint(leaves: &[CubeKey]) {
+        let set: FxHashSet<CubeKey> = leaves.iter().copied().collect();
+        assert_eq!(set.len(), leaves.len(), "no node twice");
+        for &leaf in leaves {
+            let mut up = leaf;
+            while up.level < MAX_CUBE_LEVEL {
+                up = up.parent();
+                assert!(!set.contains(&up), "{leaf:?} inside {up:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn world_roots_are_the_top_level_nodes_holding_the_world() {
+        let roots = world_roots();
+        assert_eq!(roots.len(), 8);
+        assert!(
+            roots
+                .iter()
+                .all(|&r| r.level == MAX_CUBE_LEVEL && in_world(r))
+        );
+        let lo = |a: usize| {
+            roots
+                .iter()
+                .map(|r| i64::from(r.origin()[a]))
+                .min()
+                .unwrap()
+        };
+        let hi = |a: usize| {
+            (roots.iter())
+                .map(|r| i64::from(r.origin()[a]) + i64::from(r.size()))
+                .max()
+                .unwrap()
+        };
+        for a in [0, 2] {
+            assert!(lo(a) <= -WORLD_BORDER && hi(a) >= WORLD_BORDER, "axis {a}");
+        }
+        assert!(lo(1) <= i64::from(horizon_world::cubic::MIN_Y));
+        assert!(hi(1) > i64::from(horizon_world::cubic::MAX_Y));
+        // The same wherever the camera is, at the World distance or past it.
+        for camera in [GROUND, HIGH, [29_999_999.0, -8_000_000.0, -29_999_999.0]] {
+            for reach in [WORLD_REACH, 1e12, f64::INFINITY] {
+                assert_eq!(root_nodes(camera, reach), roots);
+            }
+        }
+        // Nonsense distances and cameras do not overflow.
+        for reach in [f64::NAN, -5.0, 0.0, WORLD_REACH - 1.0] {
+            let _ = root_nodes([1e300, f64::NAN, -1e300], reach);
+        }
+        // A Custom Cubic world is drawn to the border: a World plan from the
+        // origin has leaves there.
+        let (plan, _) = plan_at(GROUND, WORLD, usize::MAX / 2);
+        assert!(!plan.limited);
+        let edge = leaf_at(&plan.leaves, [29_999_990.5, 100.5, -29_999_990.5]);
+        assert!(in_world(edge));
+        assert!(plan.leaves.iter().all(|&k| in_world(k)));
+    }
+
+    fn leaf_at(leaves: &[CubeKey], p: [f64; 3]) -> CubeKey {
+        let cube = cube_of(p);
+        *leaves
+            .iter()
+            .find(|k| k.contains_cube(cube))
+            .unwrap_or_else(|| panic!("nothing holds {p:?}"))
+    }
+
+    #[test]
+    fn the_first_world_plan_is_the_eight_roots_then_one_level_at_a_time() {
+        let rule = lyle().rule(NODE_BUDGET);
+        let mut drawn = FxHashSet::default();
+        let first = plan_far(&PlanInput {
+            camera: GROUND,
+            max_distance: WORLD_REACH,
+            rule: &rule,
+            loaded: NONE,
+            is_loaded: &|_| false,
+            previous: &[],
+            class: &flat,
+            surface: None,
+            refined: Some(&drawn),
+        });
+        // The top nodes over the surface wait to be drawn, the ones under it
+        // are rock: the whole world in the 8 roots, but for the nodes round
+        // the camera's own cube (the loaded box always holds it), split down
+        // to it at once: 7 a level.
+        assert!(
+            first.leaves.len() <= 8 + 7 * usize::from(MAX_CUBE_LEVEL),
+            "{}",
+            first.leaves.len()
+        );
+        assert_disjoint(&first.leaves);
+        for p in [
+            [20e6, 100.5, -20e6],
+            [-29e6, -5e6, 29e6],
+            // (The camera is in the +x +z root.)
+            [-25e6, 100.5, 25e6],
+        ] {
+            assert_eq!(leaf_at(&first.leaves, p).level, MAX_CUBE_LEVEL, "{p:?}");
+        }
+        drawn = refined_set(&first.leaves);
+        let second = plan_far(&PlanInput {
+            camera: GROUND,
+            max_distance: WORLD_REACH,
+            rule: &rule,
+            loaded: NONE,
+            is_loaded: &|_| false,
+            previous: &first.leaves,
+            class: &flat,
+            surface: None,
+            refined: Some(&drawn),
+        });
+        assert_disjoint(&second.leaves);
+        assert_eq!(
+            leaf_at(&second.leaves, [20e6, 100.5, -20e6]).level,
+            MAX_CUBE_LEVEL - 1
+        );
+        // Rock stays whole.
+        assert_eq!(
+            leaf_at(&second.leaves, [20e6, -5e6, -20e6]).level,
+            MAX_CUBE_LEVEL
+        );
+    }
+
+    #[test]
+    fn unlimited_world_plan_meets_the_target_and_grows_by_the_octave() {
+        let mut counts = Vec::new();
+        for chunks in [4096, 32_768, 262_144, WORLD] {
+            let (plan, _) = plan_at(GROUND, chunks, usize::MAX / 2);
+            assert!(!plan.limited);
+            for &leaf in plan.leaves.iter().filter(|k| k.level > 0) {
+                if flat(leaf) == NodeClass::Mixed {
+                    assert!(over(GROUND, leaf) <= 1.0 + 1e-9, "{leaf:?} at {chunks}");
+                }
+            }
+            counts.push(plan.leaves.len() as f64);
+        }
+        // Leaves an added octave of distance takes: about the same for each,
+        // not 4 times as many (as a surface's area would be at one size).
+        let far = (WORLD_BORDER as f64 * 2f64.sqrt()).log2();
+        let octaves = [3.0, 3.0, far - (262_144.0 * 16.0f64).log2()];
+        let per: Vec<f64> = (0..3)
+            .map(|i| (counts[i + 1] - counts[i]) / octaves[i])
+            .collect();
+        let (lo, hi) = per
+            .iter()
+            .fold((f64::MAX, 0.0f64), |(l, h), &v| (l.min(v), h.max(v)));
+        assert!(hi / lo < 2.0, "per octave {per:?}, counts {counts:?}");
+    }
+
+    #[test]
+    fn the_budget_holds_at_any_distance_and_coarsens_the_far_end_first() {
+        for camera in [GROUND, HIGH] {
+            for chunks in [1024, 4096, 262_144, WORLD] {
+                let (plan, _) = plan_at(camera, chunks, NODE_BUDGET);
+                assert!(
+                    plan.leaves.len() <= NODE_BUDGET,
+                    "{chunks}: {}",
+                    plan.leaves.len()
+                );
+                assert_disjoint(&plan.leaves);
+                if !plan.limited {
+                    continue;
+                }
+                // What stays whole is what the order weighs least: the voxels'
+                // size on screen times the distance's weight.
+                let order = |k: CubeKey| over(camera, k) * budget_weight(k.distance(camera));
+                let roots = root_nodes(camera, f64::from(chunks) * 16.0);
+                for &leaf in plan.leaves.iter().filter(|k| k.level > 0) {
+                    if flat(leaf) != NodeClass::Mixed || roots.contains(&leaf) {
+                        continue;
+                    }
+                    assert!(order(leaf) <= plan.coarsened + 1e-9, "{leaf:?}");
+                    assert!(order(leaf.parent()) >= plan.coarsened - 1e-9, "{leaf:?}");
+                }
+            }
+        }
+        // A budget that binds but holds the near land (a 4 px target: some
+        // 40,000 leaves within FAR_BUDGET_NEAR_BLOCKS, 2,500 an octave past
+        // it, and 3/4 of the whole as the budget): within
+        // FAR_BUDGET_NEAR_BLOCKS every voxel meets the target, and the
+        // farther the coarser.
+        let four = FarView {
+            height_px: 1440.0,
+            aspect: 2560.0 / 1440.0,
+            ..FarView::standard(4.0)
+        };
+        let over4 = |k: CubeKey| {
+            four.rule(usize::MAX).factor(GROUND, k) * f64::from(k.size())
+                / k.distance(GROUND).max(1e-9)
+        };
+        let (whole, _) = plan_with(four, GROUND, WORLD, usize::MAX / 2);
+        let (plan, _) = plan_with(four, GROUND, WORLD, whole.leaves.len() * 3 / 4);
+        assert!(plan.limited && plan.coarsened < 1.0, "{}", plan.coarsened);
+        let mut worst = [0.0f64; 32];
+        for &leaf in plan.leaves.iter().filter(|k| k.level > 0) {
+            if flat(leaf) != NodeClass::Mixed {
+                continue;
+            }
+            let d = leaf.distance(GROUND);
+            if d <= FAR_BUDGET_NEAR_BLOCKS {
+                assert!(over4(leaf) <= 1.0 + 1e-9, "{leaf:?}");
+            }
+            let octave = (d.max(1.0).log2() as usize).min(31);
+            worst[octave] = worst[octave].max(over4(leaf));
+        }
+        // Past the near blocks, the coarsest voxel of an octave grows.
+        let from = (FAR_BUDGET_NEAR_BLOCKS * 2.0).log2() as usize;
+        let past: Vec<f64> = worst[from..].iter().copied().filter(|&w| w > 0.0).collect();
+        assert!(past.len() >= 8, "{past:?}");
+        assert!(past.windows(2).all(|w| w[1] >= w[0] * 0.9), "{past:?}");
+        assert!(past.last().unwrap() > &(past[0] * 4.0), "{past:?}");
+        // At Lyle's 1 px the near land alone is over the default budget:
+        // World then costs the near land next to nothing against 4096 chunks.
+        let (world, _) = plan_at(GROUND, WORLD, NODE_BUDGET);
+        let (near_only, _) = plan_at(GROUND, 4096, NODE_BUDGET);
+        let near = |p: &Plan| {
+            (p.leaves.iter())
+                .filter(|k| k.distance(GROUND) <= 4096.0)
+                .count()
+        };
+        assert!(
+            near(&world) as f64 >= near(&near_only) as f64 * 0.95,
+            "{} {}",
+            near(&world),
+            near(&near_only)
+        );
+    }
+
+    #[test]
+    fn cube_keys_at_the_top_level_and_the_border() {
+        let top = CubeKey::new(MAX_CUBE_LEVEL, -1, -1, -1);
+        assert_eq!(top.size(), 67_108_864);
+        assert_eq!(top.origin(), [-67_108_864; 3]);
+        let edge = CubeKey::new(0, -1_875_000, 524_287, 1_874_999);
+        assert_eq!(edge.origin(), [-30_000_000, 8_388_592, 29_999_984]);
+        let mut up = edge;
+        while up.level < MAX_CUBE_LEVEL {
+            let parent = up.parent();
+            assert!(parent.contains(up) && parent.children().contains(&up));
+            up = parent;
+        }
+        assert_eq!(up, CubeKey::new(MAX_CUBE_LEVEL, -1, 0, 0));
+        assert!(up.contains(edge) && !top.contains(edge));
+        assert!(up.contains_cube(SectionPos::new(-1_875_000, 524_287, 1_874_999)));
+        assert_eq!(
+            CubeKey::containing(MAX_CUBE_LEVEL, SectionPos::new(-1_875_000, 0, 0)),
+            up
+        );
+        for child in top.children() {
+            assert_eq!(child.parent(), top);
+            assert!(top.contains(child) && !child.contains(top));
+        }
+        // Distances across the whole world, exact in f64.
+        assert_eq!(top.distance([-1.0, -1.0, -1.0]), 0.0);
+        let far = CubeKey::new(0, 1_874_999, 0, 1_874_999);
+        let d = far.distance([-29_999_999.5, 0.0, -29_999_999.5]);
+        assert!((d - 59_999_983.5 * 2f64.sqrt()).abs() < 1.0, "{d}");
+        assert_eq!(CubeKey::of_box(top.origin(), [-1; 3]), Some(top));
+        assert!(in_world(CubeKey::new(MAX_CUBE_LEVEL, 0, -1, -1)));
+        assert!(!in_world(CubeKey::new(MAX_CUBE_LEVEL, 1, 0, 0)));
+    }
+
+    #[test]
+    fn near_holes_go_before_thousands_of_far_ones_in_view() {
+        // A coarse World plan from just over the ground: thousands of nodes,
+        // most far away.
+        let camera = [0.5, 210.5, 0.5];
+        let (plan, _) = plan_at(camera, WORLD, 20_000);
+        let far: Vec<CubeKey> = (plan.leaves.iter().copied())
+            .filter(|k| k.distance(camera) > 4096.0)
+            .collect();
+        assert!(far.len() > 1000, "{}", far.len());
+        // Holes beside the loaded ground (a 32-chunk box), behind the camera,
+        // where the far ones are in the crosshair.
+        let near: Vec<CubeKey> = (0..16).map(|i| CubeKey::new(1, i - 8, 6, -12)).collect();
+        let reach = f64::from(32 * 16);
+        assert!(near.iter().all(|k| k.distance(camera) <= reach));
+        let look = Look {
+            forward: [0.0, 0.0, 1.0],
+            edge: lyle().half_diagonal(),
+        };
+        // Without the near tier, far nodes in view would come first.
+        let plain = hole_order(camera, look, 0.0, far.iter().chain(&near).copied());
+        assert!(plain.iter().position(|k| near.contains(k)).unwrap() > 100);
+        let order = hole_order(camera, look, reach, far.iter().chain(&near).copied());
+        let last_near = order.iter().rposition(|k| near.contains(k)).unwrap();
+        assert_eq!(last_near, near.len() - 1, "every near hole first");
+        // Among the far ones, the crosshair first.
+        let first_far = order[near.len()];
+        let last = *order.last().unwrap();
+        assert!(job_score(camera, look, first_far) >= job_score(camera, look, last));
+    }
+
+    /// The numbers behind the constants (`cargo test ... world_plan_numbers
+    /// -- --ignored --nocapture`): leaves by level, the budget's effect and
+    /// the plan's time at Lyle's settings.
+    #[test]
+    #[ignore]
+    fn world_plan_numbers() {
+        for budget in [60_000, 120_000, 200_000, 300_000, 500_000] {
+            let (plan, time) = plan_at(GROUND, WORLD, budget);
+            let mut worst = [0.0f64; 28];
+            for &k in (plan.leaves.iter()).filter(|k| k.level > 0 && flat(**k) == NodeClass::Mixed)
+            {
+                let o = (k.distance(GROUND).max(1.0).log2() as usize).min(27);
+                worst[o] = worst[o].max(over(GROUND, k));
+            }
+            println!(
+                "ground World budget {budget}: {} leaves, coarsened {:.3}, {time:?}\n  worst px by octave {:?}",
+                plan.leaves.len(),
+                plan.coarsened,
+                worst.map(|w| (w * 100.0).round() / 100.0),
+            );
+        }
+        for (name, camera) in [("ground", GROUND), ("1e7 up", HIGH)] {
+            for chunks in [4096, WORLD] {
+                for budget in [usize::MAX / 2, NODE_BUDGET] {
+                    let (plan, time) = plan_at(camera, chunks, budget);
+                    let mut levels = [0usize; MAX_CUBE_LEVEL as usize + 1];
+                    for k in &plan.leaves {
+                        levels[usize::from(k.level)] += 1;
+                    }
+                    let mut octaves = [0usize; 28];
+                    for k in &plan.leaves {
+                        octaves[(k.distance(camera).max(1.0).log2() as usize).min(27)] += 1;
+                    }
+                    println!(
+                        "{name} {} budget {}: {} leaves, limited {} coarsened {:.3}, {:?}\n  by level {:?}\n  by octave {:?}",
+                        if chunks == WORLD {
+                            "World".to_string()
+                        } else {
+                            chunks.to_string()
+                        },
+                        if budget == NODE_BUDGET {
+                            budget.to_string()
+                        } else {
+                            "none".into()
+                        },
+                        plan.leaves.len(),
+                        plan.limited,
+                        plan.coarsened,
+                        time,
+                        levels,
+                        octaves,
+                    );
+                }
+            }
         }
     }
 }

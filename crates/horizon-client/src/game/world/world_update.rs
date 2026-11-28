@@ -472,6 +472,8 @@ impl Game<'_> {
             }
             if let (Some(cube_lod), Some(player)) = (&mut self.cube_lod, &self.player) {
                 // Upstream dropped the integrated-GPU cap (#19678): the distance as set.
+                // World (Auto's choice in a cubic level) is `MAX_CHUNKS`: `WORLD_REACH`
+                // blocks below, which the planner takes as the whole world.
                 let lod_distance = far_distance.min(horizon_client::lod::MAX_CHUNKS);
                 let camera = [player.position.x, player.position.y, player.position.z];
                 let world = &self.world;
