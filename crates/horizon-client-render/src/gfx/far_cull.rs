@@ -179,6 +179,12 @@ impl Record {
             tile.bounds_box(),
         )
         .facing(&s.sides)
+        .voxel(1 << key.level)
+    }
+    /// The record with its voxel size (blocks): `far_raster`'s switch reads it from `a[3]`.
+    fn voxel(mut self, blocks: u32) -> Self {
+        self.a[3] = blocks;
+        self
     }
     pub fn page(&self) -> u32 {
         self.origin[3] as u32
@@ -1135,6 +1141,20 @@ impl FarCull {
                 (u64::from(STATS) + phase * u64::from(self.pass_pages) + u64::from(page)) * 4,
                 size,
             );
+        }
+    }
+
+    /// What `far_raster` reads of this frame's lists: their buffers and pages, with the
+    /// world pass's `globals`.
+    pub fn raster_inputs<'a>(&'a self, globals: &'a wgpu::Buffer) -> super::far_raster::Inputs<'a> {
+        super::far_raster::Inputs {
+            globals,
+            params: &self.params,
+            records: &self.table.buffer,
+            instances: &self.instances.buffer,
+            draws: &self.draws.buffer,
+            counts: &self.counts.buffer,
+            pages: &self.pages,
         }
     }
 

@@ -16,7 +16,8 @@
 //! without its pipelines (a device that rejects them) draws forward after the resolve.
 //!
 //! The flat frames' visibility buffer (`visbuffer.rs`, `HORIZON_VISBUFFER=1`) stays as it was;
-//! [`frame_uses`] decides per frame, `HORIZON_VISBUFFER=0` turns this path off, and
+//! [`frame_uses`] decides per frame. Default off ([`DEFAULT_ON`]: measured slower on Pascal),
+//! `HORIZON_VISBUFFER=1` on, `0` off (no pipelines either), and
 //! `HORIZON_VISBUFFER_TOGGLE=<file>` flips it within a session ([`Toggle`]).
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -27,7 +28,7 @@ use super::pack_timing::{self, CountedPass, PassTiming};
 pub const IDS: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 /// How often the toggle file is read again.
 pub const TOGGLE_INTERVAL: Duration = Duration::from_secs(1);
-/// The env knob turning the path off (`0`); `1` also asks for the flat frames' visbuffer.
+/// The env knob: `1` turns the path on (and the flat frames' visbuffer), `0` off.
 pub const ENV: &str = "HORIZON_VISBUFFER";
 /// The env knob naming the toggle file ([`Toggle`]).
 pub const TOGGLE_ENV: &str = "HORIZON_VISBUFFER_TOGGLE";
@@ -141,7 +142,7 @@ pub struct Facts {
     /// The renderer made the path's pipelines (`HORIZON_VISBUFFER` is not `0`, the device
     /// took them).
     pub built: bool,
-    /// The toggle file's choice, else on.
+    /// The toggle file's choice, else `env_default`.
     pub wanted: bool,
     /// The frame draws flat or through mesh shaders (the flat visbuffer's frames).
     pub flat_frame: bool,
@@ -183,9 +184,24 @@ pub fn frame_uses(f: &Facts) -> bool {
         && f.pages <= id::MAX_PAGES
 }
 
-/// `HORIZON_VISBUFFER` leaves the path on (anything but `0`).
+/// `HORIZON_VISBUFFER` leaves the path's pipelines built (anything but `0`).
 pub fn env_allows() -> bool {
     std::env::var(ENV).as_deref() != Ok("0")
+}
+
+/// Whether frames take this path when neither `HORIZON_VISBUFFER` nor the toggle file says.
+/// Off: on the GTX 1070 Ti at Lyle's settings the ID pass costs what the forward solid pass did
+/// (the frame is bound by vertices and tiny triangles, not by shading), so the resolve was a net
+/// +0.85 to 0.9 ms GPU (horizon-farworld-bc-notes.md "B built"). Flip it where shading binds.
+pub const DEFAULT_ON: bool = false;
+
+/// The path's default for this run: `HORIZON_VISBUFFER=1` on, `0` off, else [`DEFAULT_ON`].
+pub fn env_default() -> bool {
+    match std::env::var(ENV).as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => DEFAULT_ON,
+    }
 }
 
 /// The dev knob for same-session A/B checks: `HORIZON_VISBUFFER_TOGGLE=<file>`, read again
@@ -235,8 +251,7 @@ impl Toggle {
         self.vis
     }
 
-    /// The file's choice of part C's compute raster, if it makes one.
-    #[allow(dead_code)] // Part C's.
+    /// The file's choice of part C's compute raster (`far_raster`), if it makes one.
     pub fn raster(&self) -> Option<bool> {
         self.raster
     }

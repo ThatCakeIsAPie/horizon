@@ -562,6 +562,8 @@ pub use frame_export::{ExportFrame, FRAME_EXPORT_STALL_TIMEOUT};
 pub(crate) mod frame_targets;
 mod frustum;
 mod far_cull;
+/// Earth's sub-pixel far tiles rasterized in compute into the terrain visibility buffer.
+mod far_raster;
 mod gpu_culling;
 mod hdr;
 mod hdr_icc;
@@ -1693,6 +1695,10 @@ pub struct Renderer {
     /// same-session A/B knob.
     vis_terrain: Option<vis_terrain::VisTerrain>,
     vis_toggle: vis_terrain::Toggle,
+    /// The terrain visibility buffer's default (`vis_terrain::env_default`).
+    vis_default: bool,
+    /// The far tiles' compute raster into the terrain visibility buffer (`far_raster`).
+    far_raster: Option<far_raster::FarRaster>,
     /// Hardware task+mesh solid terrain (`mesh_shader`, `HORIZON_MESH_SHADER=1`).
     mesh_terrain: Option<surface_setup::mesh_shader::MeshTerrain>,
     /// Reusable per-frame scratch of `(page, solid_base, fading)` for visible Phase 1 mesh sections.
@@ -4860,6 +4866,8 @@ impl Renderer {
         );
         let views = world_views::Kept::new(flipped, translucent_flipped, entity_pipeline_with);
         bound.kept = true;
+        // Earth's sub-pixel far tiles in compute, with the terrain visibility buffer.
+        let far_raster = vis_terrain.as_ref().and_then(|_| far_raster::FarRaster::new(&device));
         Ok(Self {
             msaa,
             display: None,
@@ -4922,6 +4930,8 @@ impl Renderer {
             visbuf,
             vis_terrain,
             vis_toggle: vis_terrain::Toggle::from_env(),
+            vis_default: vis_terrain::env_default(),
+            far_raster,
             mesh_terrain,
             mesh_visible_scratch: Vec::new(),
             sky,
@@ -11116,7 +11126,7 @@ impl Renderer {
         self.vis_toggle.poll(Instant::now());
         let vis_terrain_frame = vis_terrain::frame_uses(&vis_terrain::Facts {
             built: self.vis_terrain.is_some(),
-            wanted: self.vis_toggle.vis().unwrap_or(true),
+            wanted: self.vis_toggle.vis().unwrap_or(self.vis_default),
             flat_frame: flat_frame || mesh_frame,
             pulled: self.flat.is_some(),
             msaa: msaa_on,
@@ -11618,8 +11628,31 @@ impl Renderer {
                         }
                         None => passes,
                     };
+                    // Earth's sub-pixel far tiles in compute (`far_raster`), on the frames
+                    // with the terrain visibility buffer and far_cull's lists: phase 1's
+                    // before its ID pass, phase 2's after far_cull's test.
+                    let mut raster_frame = false;
                     if let Some(vis) = vis {
                         drop(pass);
+                        if far_gpu_frame
+                            && self.vis_toggle.raster().unwrap_or(true)
+                            && let (Some(raster), Some(far)) = (&mut self.far_raster, self.far_cull.as_ref())
+                        {
+                            let depth = world_depth.texture();
+                            let arena = &self.arena;
+                            raster_frame = raster.prepare(
+                                &self.device,
+                                &self.queue,
+                                &mut encoder,
+                                &far.raster_inputs(&self.globals),
+                                [depth.width(), depth.height()],
+                                arena.page_vertices(),
+                                |page| arena.buffer(page),
+                            );
+                            if raster_frame {
+                                raster.dispatch(&mut encoder, 0, self.own_timing.as_mut());
+                            }
+                        }
                         pass = vis.id_pass(
                             &mut encoder,
                             world_depth,
@@ -11628,6 +11661,7 @@ impl Renderer {
                         );
                         pass.set_bind_group(0, &self.group, &[]);
                     }
+                    let raster = self.far_raster.as_ref().filter(|_| raster_frame);
                     // The solid pipelines, a native material's too, read the page themselves.
                     let pulled = self.flat.is_some();
                     pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -11668,6 +11702,12 @@ impl Renderer {
                                         0,
                                         self.look_groups.as_ref(),
                                     );
+                                    // Their sub-pixel tiles' compute raster (`far_raster`): what it left to the ID
+                                    // pipeline, then its plots merged.
+                                    if let Some(raster) = raster {
+                                        raster.ids(&mut pass, 0, far_group, far.instance_buffer());
+                                        pass.set_bind_group(0, &self.group, &[]);
+                                    }
                                     pass.set_vertex_buffer(1, self.instances.slice(..));
                                 }
                             }
@@ -11690,6 +11730,9 @@ impl Renderer {
                             }
                             if let (Some(far), Some(hiz)) = (far_test, cull.hiz_read_group()) {
                                 far.test(&mut encoder, hiz, self.own_timing.as_mut());
+                                if let Some(raster) = raster {
+                                    raster.dispatch(&mut encoder, 1, self.own_timing.as_mut());
+                                }
                             }
                             pass = match &surface {
                                 Some(surface) => terrain_pass(&mut encoder, surface, false),
@@ -11738,6 +11781,12 @@ impl Renderer {
                                         1,
                                         self.look_groups.as_ref(),
                                     );
+                                    // Their sub-pixel tiles' compute raster (`far_raster`): what it left to the ID
+                                    // pipeline, then its plots merged.
+                                    if let Some(raster) = raster {
+                                        raster.ids(&mut pass, 1, far_group, far.instance_buffer());
+                                        pass.set_bind_group(0, &self.group, &[]);
+                                    }
                                     pass.set_vertex_buffer(1, self.instances.slice(..));
                                 }
                             }
@@ -11784,6 +11833,12 @@ impl Renderer {
                                         0,
                                         self.look_groups.as_ref(),
                                     );
+                                    // Their sub-pixel tiles' compute raster (`far_raster`): what it left to the ID
+                                    // pipeline, then its plots merged.
+                                    if let Some(raster) = raster {
+                                        raster.ids(&mut pass, 0, far_group, far.instance_buffer());
+                                        pass.set_bind_group(0, &self.group, &[]);
+                                    }
                                     pass.set_vertex_buffer(1, self.instances.slice(..));
                                 }
                             }
@@ -11803,6 +11858,9 @@ impl Renderer {
                                             );
                                             if let Some(far) = far_test {
                                                 far.test(&mut encoder, hiz, self.own_timing.as_mut());
+                                                if let Some(raster) = raster {
+                                                    raster.dispatch(&mut encoder, 1, self.own_timing.as_mut());
+                                                }
                                             }
                                         }
                                     }
@@ -11871,6 +11929,12 @@ impl Renderer {
                                             1,
                                             self.look_groups.as_ref(),
                                         );
+                                        // Their sub-pixel tiles' compute raster (`far_raster`): what it left to the ID
+                                        // pipeline, then its plots merged.
+                                        if let Some(raster) = raster {
+                                            raster.ids(&mut pass, 1, far_group, far.instance_buffer());
+                                            pass.set_bind_group(0, &self.group, &[]);
+                                        }
                                         pass.set_vertex_buffer(1, self.instances.slice(..));
                                     }
                                 }
@@ -11883,6 +11947,9 @@ impl Renderer {
                                     cull.build_hiz(&mut encoder, self.own_timing.as_mut());
                                     if let Some(hiz) = cull.hiz_read_group() {
                                         far.test(&mut encoder, hiz, self.own_timing.as_mut());
+                                        if let Some(raster) = raster {
+                                            raster.dispatch(&mut encoder, 1, self.own_timing.as_mut());
+                                        }
                                     }
                                 }
                                 pass = match &surface {
@@ -11921,6 +11988,12 @@ impl Renderer {
                                         1,
                                         self.look_groups.as_ref(),
                                     );
+                                    // Their sub-pixel tiles' compute raster (`far_raster`): what it left to the ID
+                                    // pipeline, then its plots merged.
+                                    if let Some(raster) = raster {
+                                        raster.ids(&mut pass, 1, far_group, far.instance_buffer());
+                                        pass.set_bind_group(0, &self.group, &[]);
+                                    }
                                     pass.set_vertex_buffer(1, self.instances.slice(..));
                                 }
                             }
