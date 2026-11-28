@@ -82,13 +82,15 @@ const BLOCK: u32 = 64u;
 const RUNS: u32 = 4u;
 const RUN_WORDS: u32 = 9u;
 // Statistics words: records seen by the frustum, boxes the test did not see, draws and
-// triangles per phase, boxes tested, a spare.
+// triangles per phase, boxes tested, and the triangles of every solid quad of the records
+// drawn (every face direction: what the facing runs leave out, geometry_stats).
 const STATS: u32 = 8u;
 const VISIBLE: u32 = 0u;
 const OCCLUDED: u32 = 1u;
 const DRAWS: u32 = 2u;
 const TRIANGLES: u32 = 4u;
 const TESTED: u32 = 6u;
+const ALL_TRIANGLES: u32 = 7u;
 // In `params.flags`: solid quads facing away from the eye are left out; the frame occludes.
 const EYE: u32 = 1u;
 const OCCLUDE: u32 = 2u;
@@ -288,6 +290,7 @@ fn drawn_in(id: u32, phase: u32) -> u32 {
 
 var<workgroup> held: array<u32, 64>;
 var<workgroup> held_tris: array<u32, 64>;
+var<workgroup> held_all: array<u32, 64>;
 
 // One workgroup per block of ids: each page's draws in the block, written where the
 // block's count of the page goes (stored once, by the first id of that page in it).
@@ -301,6 +304,10 @@ fn count_block(block: u32, lane: u32, phase: u32) {
         tris += runs[id * RUN_WORDS + 2u + 2u * k] * 2u;
     }
     held_tris[lane] = tris;
+    held_all[lane] = 0u;
+    if n > 0u {
+        held_all[lane] = records[id].a.y * 2u;
+    }
     workgroupBarrier();
     if n > 0u {
         let page = w >> PAGE_SHIFT;
@@ -322,12 +329,15 @@ fn count_block(block: u32, lane: u32, phase: u32) {
     if lane == 0u {
         var draws_here = 0u;
         var tris_here = 0u;
+        var all_here = 0u;
         for (var other = 0u; other < BLOCK; other++) {
             draws_here += held[other] & N_MASK;
             tris_here += held_tris[other];
+            all_here += held_all[other];
         }
         if draws_here > 0u {
             atomicAdd(&counts[TRIANGLES + phase], tris_here);
+            atomicAdd(&counts[ALL_TRIANGLES], all_here);
         }
     }
 }

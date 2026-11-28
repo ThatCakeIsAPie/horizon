@@ -52,6 +52,7 @@ pub mod fluid_render;
 pub mod fog;
 pub mod font;
 pub mod fusion;
+pub mod geometry_stats;
 pub mod gfx;
 pub mod graphics;
 pub mod graphics_style;

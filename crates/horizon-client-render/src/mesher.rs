@@ -8,6 +8,7 @@ pub use crate::render_geometry::Vertex;
 pub use block_layers::BlockLayerTable;
 pub use mod_api::client::mesher::TintSource;
 mod fluid;
+mod greedy;
 mod leaf_culling;
 mod lighting;
 pub mod meshlet;
@@ -574,6 +575,17 @@ impl QuadLook {
         let rgb = (tint >> 16 & 255) | (tint & 0xFF00) | (tint & 255) << 16;
         Self([self.0[0] & !0xFF_FFFF | rgb, self.0[1]])
     }
+}
+
+/// What a full greedy merge of `mesh`'s solid quads (model order) would leave: (the quads
+/// that could merge at all, the quads after), for `geometry_stats` (`greedy`).
+pub(crate) fn greedy_count(mesh: &SectionMesh) -> (usize, usize) {
+    greedy::count(
+        &mesh.solid,
+        &mesh.solid_tints,
+        &mesh.solid_sources,
+        &mesh.solid_looks,
+    )
 }
 
 pub struct SectionMesh {

@@ -8813,6 +8813,11 @@ impl Renderer {
         if let Some(far) = &mut self.far_cull
             && let Some(stats) = far.collect(&self.device)
         {
+            if crate::geometry_stats::on() {
+                use crate::geometry_stats as g;
+                g::FRAME_FAR_TRIANGLES.set(u64::from(stats.triangles[0] + stats.triangles[1]));
+                g::FRAME_FAR_ALL_TRIANGLES.set(u64::from(stats.all_triangles));
+            }
             self.far_stats = Some(stats);
         }
         // The walk reads the graph GPU culling is given (checked after it).
@@ -9298,6 +9303,9 @@ impl Renderer {
         // Listed sections whose solid quads the pass draws: it counts them among the
         // sections it kept.
         let mut gpu_solid = 0;
+        // `geometry_stats`: the near solid triangles listed, and with every face direction.
+        let stats = crate::geometry_stats::on();
+        let (mut near_triangles, mut near_all_triangles) = (0u64, 0u64);
         for (i, v) in visible.iter().enumerate() {
             let s = self.sections.get(v.slot);
             if gpu_frame
@@ -9345,6 +9353,10 @@ impl Renderer {
                 });
                 *run = (group, start, draws.len() - start);
             }
+            if stats {
+                near_triangles += u64::from(indices) / 3;
+                near_all_triangles += u64::from(s.solid) * 2;
+            }
             let runs = &runs[..parts.len()];
             if first_phase {
                 for &(group, start, len) in runs {
@@ -9382,6 +9394,10 @@ impl Renderer {
                     }
                 }
             }
+        }
+        if stats {
+            crate::geometry_stats::FRAME_NEAR_TRIANGLES.set(near_triangles);
+            crate::geometry_stats::FRAME_NEAR_ALL_TRIANGLES.set(near_all_triangles);
         }
         // Distant terrain tiles are occlusion tested as sections are, with their meshes'
         // bounds, but for those fading or with a stand-in (`lod::Tile::cull_bounds`).
