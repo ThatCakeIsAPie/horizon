@@ -9535,9 +9535,12 @@ mod world_plan_tests {
             let octave = (d.max(1.0).log2() as usize).min(31);
             worst[octave] = worst[octave].max(over4(leaf));
         }
-        // Past the near blocks, the coarsest voxel of an octave grows.
+        // Past the near blocks, the coarsest voxel of an octave grows. The
+        // last octave reaches the world's edge, where nodes can't grow past
+        // the top level: its worst voxel is capped there, so it is left out.
         let from = (FAR_BUDGET_NEAR_BLOCKS * 2.0).log2() as usize;
-        let past: Vec<f64> = worst[from..].iter().copied().filter(|&w| w > 0.0).collect();
+        let mut past: Vec<f64> = worst[from..].iter().copied().filter(|&w| w > 0.0).collect();
+        past.pop();
         assert!(past.len() >= 8, "{past:?}");
         assert!(past.windows(2).all(|w| w[1] >= w[0] * 0.9), "{past:?}");
         assert!(past.last().unwrap() > &(past[0] * 4.0), "{past:?}");
